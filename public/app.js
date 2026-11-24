@@ -3703,6 +3703,7 @@ async function saveProjectJSON(downloadFile = true) {
   let localOk = false;
   try { localStorage.setItem(AUTOSAVE_KEY, jsonStr); localOk = true; } catch {}
   let serverOk = false;
+  let serverErr = '';
   try {
     const r = await fetch('/api/projects', {
       method: 'POST',
@@ -3712,12 +3713,10 @@ async function saveProjectJSON(downloadFile = true) {
     serverOk = r.ok;
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      showToast(localOk
-        ? `Server backup warning: ${d.error || r.status} — saved locally`
-        : `Save failed (server error ${d.error || r.status} & local storage unavailable)`);
+      serverErr = d.error || `HTTP ${r.status}`;
     }
   } catch {
-    showToast(localOk ? 'Server backup unreachable — saved locally' : 'Save failed (local storage & server unavailable)');
+    serverErr = 'unreachable';
   }
   if (serverOk || localOk) state.hasUnsavedChanges = false;
   setSaveStatus(serverOk && localOk ? 'Saved' : (serverOk ? 'Server Only' : (localOk ? 'Local Only' : 'Save Failed')), (!serverOk && !localOk) ? 'error' : '');
@@ -3729,11 +3728,15 @@ async function saveProjectJSON(downloadFile = true) {
     a.download = `${state.title || 'motioncut'}.mcut.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    showToast(serverOk
-      ? 'Project exported (.mcut.json + server backup)'
-      : (localOk ? 'Project exported (.mcut.json + local autosave)' : 'Project exported (.mcut.json only — storage & server unavailable)'));
-  } else if (serverOk) {
-    showToast(localOk ? 'Project saved to server & local autosave (⌘S)' : 'Project saved to server (local autosave unavailable)');
+    if (serverOk && localOk) showToast('Project exported (.mcut.json + local autosave + server backup)');
+    else if (serverOk && !localOk) showToast('Project exported (.mcut.json + server backup · local storage full)');
+    else if (!serverOk && localOk) showToast(`Project exported (.mcut.json + local autosave · server backup failed: ${serverErr})`);
+    else showToast(`Project exported (.mcut.json only · local storage & server backup failed: ${serverErr})`);
+  } else {
+    if (serverOk && localOk) showToast('Project saved to server & local autosave (⌘S)');
+    else if (serverOk && !localOk) showToast('Project saved to server (local autosave unavailable)');
+    else if (!serverOk && localOk) showToast(`Saved locally (server backup failed: ${serverErr})`);
+    else showToast(`Save failed (local storage & server unavailable: ${serverErr})`);
   }
 }
 
@@ -4237,7 +4240,7 @@ function setupUIEvents() {
       hdr.className = 'drawer-tip';
       hdr.style.marginTop = '10px';
       hdr.style.fontWeight = '700';
-      hdr.textContent = 'Local Recovery Backups (auto-saved before New / Demo)';
+      hdr.textContent = 'Local Recovery Backups (auto-saved before New / Demo / Open / Restore)';
       const wrap = document.createElement('div');
       wrap.appendChild(hdr);
       container.appendChild(wrap);
@@ -4247,16 +4250,26 @@ function setupUIEvents() {
         row.className = 'relink-row';
         row.innerHTML = `<div><strong>${escHtml(bk.title)}</strong>${when ? `<div class="media-sub">Recovery · ${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-restore>Restore</button><button class="btn-mini" data-del-rec title="Delete recovery backup">✕</button></div>`;
         row.querySelector('[data-restore]').onclick = () => {
-          if (projectHasContent() && typeof window.confirm === 'function') {
+          const hadContent = projectHasContent();
+          if (hadContent && typeof window.confirm === 'function') {
             if (!window.confirm(`Restore "${bk.title}"? Your current edit will be backed up to Local Recovery.`)) return;
           }
-          backupProjectForRecovery();
+          const bkRes = backupProjectForRecovery();
+          if (hadContent && !bkRes.ok) {
+            if (typeof window.confirm === 'function') {
+              if (!window.confirm('Could not save a local recovery backup (browser storage full). Discard current project and restore anyway?')) return;
+            } else {
+              return showToast('Restore aborted: could not back up current project (storage full)');
+            }
+          }
           try {
             applySnapshot(bk.raw, true);
             snapshotHistory();
             state.hasUnsavedChanges = false;
             $('#projectsModal').classList.add('hidden');
-            showToast(`Restored recovery backup: ${bk.title}`);
+            showToast(hadContent && !bkRes.ok
+              ? `Restored "${bk.title}" (previous edit was not backed up — storage full)`
+              : `Restored recovery backup: ${bk.title}`);
           } catch (err) {
             showToast(`Failed to restore backup: ${err.message}`);
           }
@@ -4278,11 +4291,16 @@ function setupUIEvents() {
       const d = await r.json();
       const details = d.details || (d.projects || []).map(f => ({ fileName: f, updatedAt: null }));
       listEl.innerHTML = '';
-      if (!details.length) {
+      const serverWrap = document.createElement('div');
+      listEl.appendChild(serverWrap);
+      const showServerEmpty = () => {
         const empty = document.createElement('div');
         empty.className = 'drawer-tip';
         empty.textContent = 'No server backups yet. Click Save (⌘S) to create one, or browse a local .mcut.json file below.';
-        listEl.appendChild(empty);
+        serverWrap.appendChild(empty);
+      };
+      if (!details.length) {
+        showServerEmpty();
       } else {
         details.forEach(item => {
           const fname = item.fileName;
@@ -4291,10 +4309,18 @@ function setupUIEvents() {
           row.className = 'relink-row';
           row.innerHTML = `<div><strong>${escHtml(fname)}</strong>${when ? `<div class="media-sub">${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-open>Open</button><button class="btn-mini" data-del title="Delete backup">✕</button></div>`;
           row.querySelector('[data-open]').onclick = async () => {
-            if (projectHasContent() && typeof window.confirm === 'function') {
+            const hadContent = projectHasContent();
+            if (hadContent && typeof window.confirm === 'function') {
               if (!window.confirm(`Open "${fname}"? Your current edit will be backed up to Local Recovery.`)) return;
             }
-            backupProjectForRecovery();
+            const bkRes = backupProjectForRecovery();
+            if (hadContent && !bkRes.ok) {
+              if (typeof window.confirm === 'function') {
+                if (!window.confirm('Could not save a local recovery backup (browser storage full). Discard current project and open anyway?')) return;
+              } else {
+                return showToast('Open aborted: could not back up current project (storage full)');
+              }
+            }
             try {
               const pr = await fetch(`/api/projects/${encodeURIComponent(fname)}`);
               const pd = await pr.json();
@@ -4303,18 +4329,25 @@ function setupUIEvents() {
               snapshotHistory();
               state.hasUnsavedChanges = false;
               $('#projectsModal').classList.add('hidden');
-              showToast(`Loaded ${fname}`);
+              showToast(hadContent && !bkRes.ok
+                ? `Loaded ${fname} (previous edit was not backed up — storage full)`
+                : `Loaded ${fname}`);
             } catch (err) {
               showToast(`Failed to open project: ${err.message}`);
             }
           };
           row.querySelector('[data-del]').onclick = async () => {
+            if (typeof window.confirm === 'function' && !window.confirm(`Delete server backup "${fname}"?`)) return;
             try {
               const dr = await fetch(`/api/projects/${encodeURIComponent(fname)}`, { method: 'DELETE', headers: apiHeaders() });
-              if (dr.ok) { row.remove(); showToast(`Deleted ${fname}`); }
+              if (dr.ok) {
+                row.remove();
+                if (!serverWrap.querySelector('.relink-row')) showServerEmpty();
+                showToast(`Deleted ${fname}`);
+              }
             } catch {}
           };
-          listEl.appendChild(row);
+          serverWrap.appendChild(row);
         });
       }
       renderRecoverySection(listEl);
@@ -4429,22 +4462,34 @@ function setupUIEvents() {
         };
         const lg = f.clip.linkGroupId;
         trimOneLeft(f.clip);
-        let unlinked = 0;
+        let unlinkedRange = 0;
+        let unlinkedLocked = 0;
+        let remainingPartners = 0;
         if (lg && state.linkedSelection) {
           for (const tr of state.tracks) {
-            if (tr.id === f.track.id || tr.locked) continue;
+            if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
               if (p.linkGroupId === lg) {
-                if (state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) trimOneLeft(p);
-                else { p.linkGroupId = null; unlinked++; }
+                if (tr.locked) {
+                  p.linkGroupId = null;
+                  unlinkedLocked++;
+                } else if (state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) {
+                  trimOneLeft(p);
+                  remainingPartners++;
+                } else {
+                  p.linkGroupId = null;
+                  unlinkedRange++;
+                }
               }
             }
           }
+          if ((unlinkedLocked > 0 || unlinkedRange > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        showToast(unlinked > 0
-          ? `Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`
-          : 'Trimmed clip start to playhead (Q)');
+        if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
+        else if (unlinkedLocked > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked partner)`);
+        else if (unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedRange} out-of-range partner)`);
+        else showToast('Trimmed clip start to playhead (Q)');
       }
     }
     else if (k === 'w' && !cmd) {
@@ -4472,22 +4517,34 @@ function setupUIEvents() {
         };
         const lg = f.clip.linkGroupId;
         trimOneRight(f.clip);
-        let unlinked = 0;
+        let unlinkedRange = 0;
+        let unlinkedLocked = 0;
+        let remainingPartners = 0;
         if (lg && state.linkedSelection) {
           for (const tr of state.tracks) {
-            if (tr.id === f.track.id || tr.locked) continue;
+            if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
               if (p.linkGroupId === lg) {
-                if (state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) trimOneRight(p);
-                else { p.linkGroupId = null; unlinked++; }
+                if (tr.locked) {
+                  p.linkGroupId = null;
+                  unlinkedLocked++;
+                } else if (state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) {
+                  trimOneRight(p);
+                  remainingPartners++;
+                } else {
+                  p.linkGroupId = null;
+                  unlinkedRange++;
+                }
               }
             }
           }
+          if ((unlinkedLocked > 0 || unlinkedRange > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        showToast(unlinked > 0
-          ? `Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`
-          : 'Trimmed clip end to playhead (W)');
+        if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
+        else if (unlinkedLocked > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked partner)`);
+        else if (unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedRange} out-of-range partner)`);
+        else showToast('Trimmed clip end to playhead (W)');
       }
     }
     else if (cmd && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }

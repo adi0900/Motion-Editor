@@ -125,12 +125,13 @@ async function probeFile(filePath) {
     const [n, d] = vStream.r_frame_rate.split('/').map(Number);
     if (d > 0 && n > 0 && n / d <= 240) fps = Math.round((n / d) * 100) / 100;
   }
+  const parsedNb = Number(vStream?.nb_frames);
   return {
     duration: Number.isFinite(dur) && dur > 0 ? dur : 0,
     width: vStream?.width || 0,
     height: vStream?.height || 0,
     fps,
-    nbFrames: vStream?.nb_frames ? Number(vStream.nb_frames) : 0,
+    nbFrames: Number.isFinite(parsedNb) && parsedNb > 0 ? parsedNb : 0,
     hasVideo: Boolean(vStream),
     hasAudio: Boolean(aStream),
   };
@@ -458,10 +459,11 @@ function isValidJpegBuffer(buf) {
   let end = buf.length - 1;
   while (end > 2 && buf[end] === 0x00) end--;
   if (buf[end - 1] !== 0xFF || buf[end] !== 0xD9) return false;
-  // Walk JPEG segment headers until SOS (FF DA) and verify a valid SOF header exists
+  // Walk JPEG segment headers until SOS (FF DA) and verify SOF + scan integrity
   let pos = 2;
   let hasSof = false;
   let hasSos = false;
+  let scanStart = -1;
   while (pos + 1 < end) {
     if (buf[pos] !== 0xFF) return false;
     while (pos < end && buf[pos] === 0xFF) pos++;
@@ -482,16 +484,30 @@ function isValidJpegBuffer(buf) {
     }
     if (marker === 0xDA) {
       hasSos = true;
+      scanStart = pos + segLen;
       break;
     }
     pos += segLen;
   }
-  return hasSof && hasSos;
+  if (!hasSof || !hasSos || scanStart < 0 || end - scanStart < 16) return false;
+  // Verify entropy scan has no unstuffed invalid markers before EOI
+  for (let i = scanStart; i < end - 1; i++) {
+    if (buf[i] === 0xFF) {
+      const next = buf[i + 1];
+      if (next === 0x00 || next === 0xFF || (next >= 0xD0 && next <= 0xD7)) {
+        i++;
+        continue;
+      }
+      if (next === 0xD9) return i === end - 1;
+      return false;
+    }
+  }
+  return true;
 }
 
-const reservedExportPaths = new Set();
+const reservedExportPaths = new Map(); // fullPath -> ownerId
 
-function uniqueExportPath(baseName) {
+function uniqueExportPath(baseName, ownerId = crypto.randomBytes(6).toString('hex')) {
   const clean = (baseName || `motioncut_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.mp4$/i, '');
   let candidate = `${clean}.mp4`;
   let fullPath = path.join(EXPORTS_DIR, candidate);
@@ -500,8 +516,8 @@ function uniqueExportPath(baseName) {
     candidate = `${clean}_${n++}.mp4`;
     fullPath = path.join(EXPORTS_DIR, candidate);
   }
-  reservedExportPaths.add(fullPath);
-  return { fileName: candidate, fullPath };
+  reservedExportPaths.set(fullPath, ownerId);
+  return { fileName: candidate, fullPath, ownerId };
 }
 
 // Speed ramp curve definitions matching engine.js identically
@@ -788,6 +804,7 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   const job = exportJobs.get(jobId);
   if (!job) return false;
   if (markCancelled) job.cancelled = true;
+  job.cleanupScheduled = true;
   exportJobs.delete(jobId);
   if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
     try { job.proc.stdin.destroy(); } catch {}
@@ -798,9 +815,11 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   }
   setTimeout(() => {
     try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
-    try { if (markCancelled && fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
-    // Release filename reservation ONLY after delayed unlink finishes so a new same-name job can never be deleted!
-    if (job.finalPath) reservedExportPaths.delete(job.finalPath);
+    // Only unlink & release reservation if this job still owns the path!
+    if (job.finalPath && reservedExportPaths.get(job.finalPath) === jobId) {
+      try { if (markCancelled && fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+      reservedExportPaths.delete(job.finalPath);
+    }
   }, 400);
   return true;
 }
@@ -903,7 +922,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '11.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '12.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1125,13 +1144,13 @@ const server = http.createServer(async (req, res) => {
       const expectedFrames = Math.max(1, Math.round(totalDuration * fps));
 
       const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
-      const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`);
+      const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`, jobId);
       const videoOnlyPath = path.join(EXPORTS_DIR, `_vid_${jobId}.mp4`);
 
       const proc = spawn('ffmpeg', [
         '-y', '-v', 'error',
         '-f', 'image2pipe', '-vcodec', 'mjpeg', '-framerate', String(fps), '-i', '-',
-        '-vf', `scale=${width}:${height}:flags=lanczos:in_range=full:out_range=tv,setsar=1,format=yuv420p`,
+        '-vf', `scale=${width}:${height}:flags=lanczos:in_range=full:out_range=tv,setsar=1,format=yuv420p,setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709`,
         '-r', String(fps),
         '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
         '-crf', String(crf), '-pix_fmt', 'yuv420p',
@@ -1153,6 +1172,8 @@ const server = http.createServer(async (req, res) => {
         failed: false,
         failError: null,
         cancelled: false,
+        cleanupScheduled: false,
+        getStderr: () => stderr,
         donePromise: null,
       };
 
@@ -1277,6 +1298,11 @@ const server = http.createServer(async (req, res) => {
           cleanupExportJob(jobId, true);
           return sendJSON(res, 409, { error: 'Export cancelled' });
         }
+        const encErr = job.getStderr ? job.getStderr() : '';
+        if (/overread|corrupt|truncated|invalid data|mjpeg.*error/i.test(encErr)) {
+          try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
+          return sendJSON(res, 400, { error: `Corrupt or truncated JPEG frame detected: ${encErr.trim().slice(0, 140)}` });
+        }
         await muxAudioWithVideo(job.videoOnlyPath, job.finalPath, job.totalDuration, job.audioClips, job);
         if (job.cancelled) {
           cleanupExportJob(jobId, true);
@@ -1286,12 +1312,17 @@ const server = http.createServer(async (req, res) => {
         const wasCancelled = Boolean(job.cancelled);
         cleanupExportJob(jobId, true, wasCancelled);
         try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
-        try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+        if (reservedExportPaths.get(job.finalPath) === jobId) {
+          try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+        }
         return sendJSON(res, wasCancelled ? 409 : 500, { error: String(err.message || err) });
       } finally {
         clearInterval(heartbeat);
         exportJobs.delete(jobId);
-        reservedExportPaths.delete(job.finalPath);
+        // Never release reservation early if a delayed cancel cleanup is still pending!
+        if (!job.cleanupScheduled && reservedExportPaths.get(job.finalPath) === jobId) {
+          reservedExportPaths.delete(job.finalPath);
+        }
       }
       const stat = fs.statSync(job.finalPath);
       const meta = await probeFile(job.finalPath);
@@ -1372,22 +1403,24 @@ const server = http.createServer(async (req, res) => {
       if (Math.abs(speed - 1) > 0.01) vPre += `setpts=(PTS-STARTPTS)/${speed.toFixed(4)},`;
       vPre += `fps=${fps},`;
 
-      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
+      const quickId = 'quick_' + crypto.randomBytes(6).toString('hex');
+      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`, quickId);
 
       // Compute exact source read duration = timeline dur * speed (clamped to available source)
       const srcSpan = Math.max(0.05, Math.min(Math.max(0.05, item.duration - start), dur * speed));
       const outDur = srcSpan / speed;
 
+      const bt709Tail = ',format=yuv420p,setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
       let vfGraph = '';
       if (mode === 'cover') {
-        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1[v]`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1${bt709Tail}[v]`;
       } else if (mode === 'contain') {
-        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v]`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1${bt709Tail}[v]`;
       } else if (mode === 'stretch') {
-        vfGraph = `[0:v]${vPre}scale=${w}:${h}:flags=lanczos,setsar=1[v]`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:flags=lanczos,setsar=1${bt709Tail}[v]`;
       } else {
         // Blur mode preserves crop, speed, and reverse BEFORE splitting bg/fg!
-        vfGraph = `[0:v]${vPre}split[bg][fg];[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:4[b];[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[f];[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1[v]`;
+        vfGraph = `[0:v]${vPre}split[bg][fg];[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:4[b];[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[f];[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1${bt709Tail}[v]`;
       }
 
       const ffArgs = ['-y', '-v', 'error', '-ss', start.toFixed(4), '-t', srcSpan.toFixed(4), '-i', item.filePath];
@@ -1425,7 +1458,7 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, quickJob.cancelled ? 499 : 500, { error: String(err.message || err) });
       } finally {
         res.off('close', onClose);
-        reservedExportPaths.delete(outMp4);
+        if (reservedExportPaths.get(outMp4) === quickId) reservedExportPaths.delete(outMp4);
       }
 
       const stat = fs.statSync(outMp4);
