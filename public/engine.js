@@ -623,7 +623,7 @@ export class VideoEngine {
               }
             }
           } else {
-            const desiredRate = Math.max(0.25, Math.min(4, speed * shuttleSpeed));
+            const desiredRate = Math.max(0.25, Math.min(8, speed * shuttleSpeed));
             if (Math.abs(el.playbackRate - desiredRate) > 0.01) el.playbackRate = desiredRate;
             if (Math.abs((el.currentTime || 0) - target) > 0.08) {
               try { el.currentTime = target; } catch {}
@@ -787,7 +787,7 @@ export class VideoEngine {
 
     // Backdrop CapCut Blur from active main video
     if (!isolateClipId && snap.bgMode === 'blur') {
-      const mainTr = snap.tracks.find(tr => tr.type === 'video' && !tr.hidden);
+      const mainTr = snap.tracks.find(tr => tr.id === snap.mainTrackId && !tr.hidden) || snap.tracks.find(tr => tr.type === 'video' && !tr.hidden);
       const mainClip = mainTr?.clips.find(c => t >= c.start && t < c.start + c.duration);
       if (mainClip) {
         const el = this.getOrCreateElement(mainClip, snap);
@@ -1078,6 +1078,8 @@ export class VideoEngine {
       else if (clip.transOut === 'dip-black') dipOverlay = Math.max(dipOverlay, 1 - e);
       else if (clip.transOut === 'flash') flashOverlay = Math.max(flashOverlay, 1 - e);
       else if (clip.transOut === 'slide-left') x -= (1 - e) * W;
+      else if (clip.transOut === 'slide-up') y -= (1 - e) * H;
+      else if (clip.transOut === 'wipe-left') wipeProgress = e;
       else if (clip.transOut === 'zoom-in') scale *= (1 + (1 - e) * 0.35);
       else if (clip.transOut === 'blur-dissolve') { opacity *= e; transFilterExtra = ` blur(${((1 - e) * 18).toFixed(1)}px)`; }
     }
@@ -1649,6 +1651,8 @@ export class VideoEngine {
 
     const sel = this.findSelectedClip();
     if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return;
+    const selTrack = this.state.tracks.find(tr => tr.clips.some(c => c.id === sel.id));
+    if (selTrack?.locked || selTrack?.hidden) return;
     const box = this.getClipBoundingBox(sel, t);
     const { corners, rotHandle, hw, hh } = this.getHandlePoints(box);
 

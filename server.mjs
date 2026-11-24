@@ -856,7 +856,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '7.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '8.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1239,30 +1239,53 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(start) || start < 0) return sendJSON(res, 400, { error: 'Invalid trimStart' });
       if (!Number.isFinite(dur) || dur <= 0) return sendJSON(res, 400, { error: 'Invalid duration' });
       if (!Number.isFinite(speed) || speed < 0.25 || speed > 8) return sendJSON(res, 400, { error: 'Invalid speed (0.25..8)' });
+      if (body.speedCurve && body.speedCurve !== 'none') {
+        return sendJSON(res, 400, { error: 'Quick Reframe does not support speed ramp curves — use Full Timeline Export' });
+      }
       const mode = ['cover', 'contain', 'stretch', 'blur'].includes(body.fitMode) ? body.fitMode : 'cover';
       const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
 
-      let vf = '';
+      // Compute exact source read duration = timeline dur * speed (clamped to available source)
+      const srcSpan = Math.max(0.05, Math.min(Math.max(0.05, item.duration - start), dur * speed));
+      const outDur = srcSpan / speed;
+
+      let vPre = '';
       if (body.cropRect) {
         const c = body.cropRect;
         if (!Number.isFinite(Number(c.w)) || !Number.isFinite(Number(c.h)) || !Number.isFinite(Number(c.x)) || !Number.isFinite(Number(c.y)) || Number(c.w) <= 0 || Number(c.h) <= 0) {
           return sendJSON(res, 400, { error: 'Invalid cropRect dimensions' });
         }
-        vf += `crop=${Math.round(Number(c.w))}:${Math.round(Number(c.h))}:${Math.round(Number(c.x))}:${Math.round(Number(c.y))},`;
+        vPre += `crop=${Math.round(Number(c.w))}:${Math.round(Number(c.h))}:${Math.round(Number(c.x))}:${Math.round(Number(c.y))},`;
       }
-      if (Math.abs(speed - 1) > 0.01) vf += `setpts=PTS/${speed.toFixed(4)},`;
-      if (body.reverse) vf += 'reverse,';
+      if (Math.abs(speed - 1) > 0.01) vPre += `setpts=(PTS-STARTPTS)/${speed.toFixed(4)},`;
+      if (body.reverse) vPre += 'reverse,setpts=PTS-STARTPTS,';
+
+      let vfGraph = '';
       if (mode === 'cover') {
-        vf += `scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1[v]`;
       } else if (mode === 'contain') {
-        vf += `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v]`;
       } else if (mode === 'stretch') {
-        vf += `scale=${w}:${h}:flags=lanczos,setsar=1`;
+        vfGraph = `[0:v]${vPre}scale=${w}:${h}:flags=lanczos,setsar=1[v]`;
       } else {
-        const prefix = (body.cropRect && body.cropRect.w > 0)
-          ? `crop=${Math.round(body.cropRect.w)}:${Math.round(body.cropRect.h)}:${Math.round(body.cropRect.x)}:${Math.round(body.cropRect.y)},` : '';
-        vf = `${prefix}split[bg][fg];[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:4[b];[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[f];[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+        // Blur mode preserves crop, speed, and reverse BEFORE splitting bg/fg!
+        vfGraph = `[0:v]${vPre}split[bg][fg];[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:4[b];[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[f];[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1[v]`;
       }
+
+      const ffArgs = ['-y', '-v', 'error', '-ss', start.toFixed(4), '-t', srcSpan.toFixed(4), '-i', item.filePath];
+      if (item.hasAudio) {
+        const aChain = ['aformat=sample_rates=48000:channel_layouts=stereo', 'asetpts=PTS-STARTPTS', ...buildAtempoChain(speed)];
+        if (body.reverse) aChain.push('areverse', 'asetpts=PTS-STARTPTS');
+        aChain.push(`atrim=start=0:duration=${outDur.toFixed(4)}`, 'asetpts=PTS-STARTPTS');
+        ffArgs.push('-filter_complex', `${vfGraph};[0:a]${aChain.join(',')}[a]`, '-map', '[v]', '-map', '[a]', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000');
+      } else {
+        ffArgs.push('-filter_complex', vfGraph, '-map', '[v]');
+      }
+      ffArgs.push(
+        '-r', String(fps), '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
+        '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+        '-t', outDur.toFixed(4), outMp4,
+      );
 
       const quickJob = { cancelled: false, muxProc: null };
       const onClose = () => {
@@ -1276,13 +1299,7 @@ const server = http.createServer(async (req, res) => {
       // Listen on res.close (req.close already fired when readJsonBody consumed the body!)
       res.on('close', onClose);
       try {
-        await spawnFfmpegCancellable([
-          '-y', '-v', 'error', '-ss', String(start), '-t', String(dur), '-i', item.filePath,
-          '-filter_complex', `[0:v]${vf}[v]`, '-map', '[v]', '-map', '0:a?',
-          '-r', String(fps), '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
-          '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
-          '-c:a', 'aac', '-b:a', '192k', outMp4,
-        ], quickJob);
+        await spawnFfmpegCancellable(ffArgs, quickJob);
       } catch (err) {
         try { if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4); } catch {}
         return sendJSON(res, quickJob.cancelled ? 499 : 500, { error: String(err.message || err) });
@@ -1356,6 +1373,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v7 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v8 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });
