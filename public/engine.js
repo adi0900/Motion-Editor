@@ -191,7 +191,7 @@ export class VideoEngine {
     this.masterGain = null;
     this.analyserL = null;
     this.analyserR = null;
-    this.clipAudioNodes = new Map();
+    this.clipAudioNodes = new WeakMap(); // HTMLMediaElement -> WebAudio node bundle
 
     // Reusable offscreen scratch canvases
     this.layerCanvas = document.createElement('canvas');
@@ -202,6 +202,8 @@ export class VideoEngine {
     this.maskCtx = this.maskCanvas.getContext('2d');
     this.chromaCanvas = document.createElement('canvas');
     this.chromaCtx = this.chromaCanvas.getContext('2d', { willReadFrequently: true });
+    this.fxCanvas = document.createElement('canvas');
+    this.fxCtx = this.fxCanvas.getContext('2d');
 
     this.isExporting = false;
     this.activeExportJobId = null;
@@ -293,9 +295,10 @@ export class VideoEngine {
   }
 
   connectClipAudio(clipId, el) {
-    if (this.clipAudioNodes.has(clipId)) return this.clipAudioNodes.get(clipId);
+    if (this.clipAudioNodes.has(el)) return this.clipAudioNodes.get(el);
     const ac = this.ensureAudioCtx();
     try {
+      el.volume = 1; // GainNode is the single volume control once connected
       const src = ac.createMediaElementSource(el);
       const low = ac.createBiquadFilter(); low.type = 'lowshelf'; low.frequency.value = 180;
       const high = ac.createBiquadFilter(); high.type = 'highshelf'; high.frequency.value = 4200;
@@ -320,7 +323,7 @@ export class VideoEngine {
       gain.connect(this.masterGain);
 
       const bundle = { src, low, high, band, fxTone, delay, delayFb, delayWet, gain };
-      this.clipAudioNodes.set(clipId, bundle);
+      this.clipAudioNodes.set(el, bundle);
       return bundle;
     } catch {
       return null;
@@ -347,7 +350,6 @@ export class VideoEngine {
           try { el.pause(); el.removeAttribute('src'); el.load(); } catch {}
         }
         this.mediaElements.delete(key);
-        this.clipAudioNodes.delete(cid);
       }
     }
   }
@@ -425,6 +427,7 @@ export class VideoEngine {
         if (isPlaying && this.audioCtx) {
           const nodes = this.connectClipAudio(clip.id, el);
           if (nodes) {
+            if (el.volume !== 1) el.volume = 1; // Prevent double volume attenuation
             nodes.gain.gain.setTargetAtTime(Math.max(0, Math.min(2, vol)), this.audioCtx.currentTime, 0.015);
             nodes.low.gain.value = clip.eqBass || 0;
             nodes.high.gain.value = clip.eqTreble || 0;
@@ -452,7 +455,7 @@ export class VideoEngine {
               nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
             }
           }
-        } else {
+        } else if (!this.clipAudioNodes.has(el)) {
           el.volume = Math.max(0, Math.min(1, vol));
         }
 
@@ -638,11 +641,9 @@ export class VideoEngine {
       }
     }
 
-    // Track draw order: bottom-up visual layers (video -> overlay -> text -> graphic)
-    const videoTracks = snap.tracks.filter(tr => tr.type === 'video' && !tr.hidden);
-    const overlayTracks = snap.tracks.filter(tr => tr.type === 'overlay' && !tr.hidden);
-    const textTracks = snap.tracks.filter(tr => (tr.type === 'text' || tr.type === 'graphic') && !tr.hidden);
-    const ordered = [...videoTracks, ...overlayTracks, ...textTracks];
+    // Track draw order: strictly bottom-to-top matching the visual timeline stack
+    // (state.tracks is top-to-bottom: Text -> Overlay -> Main Video -> Audio)
+    const ordered = [...snap.tracks].reverse().filter(tr => !tr.hidden && tr.type !== 'audio');
 
     for (const track of ordered) {
       for (const clip of track.clips) {
@@ -705,7 +706,8 @@ export class VideoEngine {
 
     ctx.save();
     if (kind === 'crossfade') {
-      ctx.globalAlpha = 1 - ease;
+      // Draw outgoing at full opacity and crossfade incoming over it so midpoint has 0% background bleed
+      ctx.globalAlpha = 1;
       ctx.drawImage(this.layerCanvas, 0, 0);
       ctx.globalAlpha = ease;
       ctx.drawImage(this.layerCanvasB, 0, 0);
@@ -769,11 +771,11 @@ export class VideoEngine {
     if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   }
 
-  applyFeatheredMask(targetCtx, clip, localT, W, H) {
+  applyFeatheredMask(targetCtx, clip, localT, W, H, clipX = 0, clipY = 0, clipScale = 1, clipRot = 0) {
     const mask = clip.mask;
     if (!mask || mask.type === 'none') return;
-    const mx = evalKeyframe(clip, 'maskX', localT, mask.x ?? 0.5) * W;
-    const my = evalKeyframe(clip, 'maskY', localT, mask.y ?? 0.5) * H;
+    const mx = (evalKeyframe(clip, 'maskX', localT, mask.x ?? 0.5) - 0.5) * W;
+    const my = (evalKeyframe(clip, 'maskY', localT, mask.y ?? 0.5) - 0.5) * H;
     const ms = evalKeyframe(clip, 'maskScale', localT, mask.scale ?? 0.48);
     const rot = ((mask.rotation || 0) * Math.PI) / 180;
     const feather = Math.max(0, Number(mask.feather || 0));
@@ -786,29 +788,29 @@ export class VideoEngine {
     if (feather > 0.5) mctx.filter = `blur(${feather.toFixed(1)}px)`;
 
     const drawShape = () => {
+      mctx.save();
+      // Anchor mask in clip-local transform space so moving/scaling/rotating a PiP moves its mask with it
+      mctx.translate(W / 2 + clipX, H / 2 + clipY);
+      mctx.rotate((clipRot * Math.PI) / 180);
+      mctx.scale(clipScale, clipScale);
       mctx.beginPath();
       if (mask.type === 'circle') {
         const r = Math.min(W, H) * ms * 0.55;
         mctx.ellipse(mx, my, r, r, rot, 0, Math.PI * 2);
       } else if (mask.type === 'rect') {
         const rw = W * ms, rh = H * ms;
-        mctx.save();
         mctx.translate(mx, my); mctx.rotate(rot);
         mctx.roundRect(-rw / 2, -rh / 2, rw, rh, 18);
-        mctx.restore();
       } else if (mask.type === 'split') {
-        mctx.save();
         mctx.translate(mx, my); mctx.rotate(rot);
         mctx.rect(-W * 2, -H * 2, W * 2, H * 4);
-        mctx.restore();
       } else if (mask.type === 'mirror') {
         const halfH = H * ms * 0.45;
-        mctx.save();
         mctx.translate(mx, my); mctx.rotate(rot);
         mctx.rect(-W * 2, -halfH, W * 4, halfH * 2);
-        mctx.restore();
       }
       mctx.fill();
+      mctx.restore();
     };
 
     if (mask.invert) {
@@ -978,11 +980,13 @@ export class VideoEngine {
       const pxScale = Math.max(0.03, 0.25 - k * 0.2);
       const pw = Math.max(16, Math.round(drawW * pxScale));
       const ph = Math.max(16, Math.round(drawH * pxScale));
-      this._ensureCanvasSize(this.chromaCanvas, pw, ph);
-      this.chromaCtx.imageSmoothingEnabled = false;
-      this.chromaCtx.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, 0, 0, pw, ph);
+      // Use dedicated fxCanvas so Chroma Key (chromaCanvas) + Pixelate never collide
+      this._ensureCanvasSize(this.fxCanvas, pw, ph);
+      this.fxCtx.clearRect(0, 0, pw, ph);
+      this.fxCtx.imageSmoothingEnabled = false;
+      this.fxCtx.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, 0, 0, pw, ph);
       drawTarget.imageSmoothingEnabled = false;
-      drawTarget.drawImage(this.chromaCanvas, 0, 0, pw, ph, -drawW / 2, -drawH / 2, drawW, drawH);
+      drawTarget.drawImage(this.fxCanvas, 0, 0, pw, ph, -drawW / 2, -drawH / 2, drawW, drawH);
       drawTarget.imageSmoothingEnabled = true;
     } else if (fxList.includes('mirror-h')) {
       drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, (sw / 2) * sRatioX, sh * sRatioY, -drawW / 2, -drawH / 2, drawW / 2, drawH);
@@ -1009,7 +1013,7 @@ export class VideoEngine {
       this.applyClipVFX(drawTarget, fxList, fxInt, localT, W, H);
     }
     if (clip.mask && clip.mask.type !== 'none') {
-      this.applyFeatheredMask(drawTarget, clip, localT, W, H);
+      this.applyFeatheredMask(drawTarget, clip, localT, W, H, x, y, scale, rot);
     }
     if (flashOverlay > 0.01) {
       drawTarget.save();
@@ -1366,14 +1370,43 @@ export class VideoEngine {
     let bw = W * 0.42, bh = H * 0.2;
     if (clip.type === 'text') {
       const fs = clip.fontSize || 76;
-      const lines = (clip.text || 'Text').split('\n');
-      bw = Math.max(220, Math.min(W * 0.88, Math.max(...lines.map(l => l.length)) * fs * 0.62));
-      bh = Math.max(fs * 1.4, lines.length * fs * 1.26);
+      const weight = clip.fontWeight || '900';
+      const fontFamily = clip.fontFamily || 'Inter, -apple-system, sans-serif';
+      const maxWrapW = clip.maxWidth > 0 ? clip.maxWidth : W * 0.86;
+      const ctx = this.ctx;
+      ctx.save();
+      ctx.font = `${weight} ${fs}px ${fontFamily}`;
+      if ('letterSpacing' in ctx) ctx.letterSpacing = `${Number(clip.spacing || 0)}px`;
+      const lines = this._wrapTextLines(ctx, clip.text || 'Text', maxWrapW);
+      const measuredMax = Math.max(80, ...lines.map(l => ctx.measureText(l).width));
+      ctx.restore();
+      const padX = clip.bgColor && clip.bgColor !== 'transparent' ? 44 : 28;
+      const padY = clip.bgColor && clip.bgColor !== 'transparent' ? 28 : 18;
+      const lineH = fs * 1.18;
+      bw = Math.min(W * 0.94, measuredMax + padX);
+      bh = Math.max(fs * 1.25, lines.length * lineH + padY);
     } else if (clip.type === 'graphic') {
-      bw = clip.graphicKind === 'lower-third' ? 580 : (clip.graphicKind === 'rec-badge' ? 280 : W * 0.85);
-      bh = clip.graphicKind === 'lower-third' ? 120 : (clip.graphicKind === 'rec-badge' ? 84 : H * 0.25);
+      bw = clip.graphicKind === 'lower-third' ? 580 : (clip.graphicKind === 'rec-badge' ? 280 : (clip.graphicKind === 'arrow-callout' ? 240 : W * 0.85));
+      bh = clip.graphicKind === 'lower-third' ? 120 : (clip.graphicKind === 'rec-badge' ? 84 : (clip.graphicKind === 'arrow-callout' ? 140 : H * 0.35));
     } else {
-      bw = W * 0.96; bh = H * 0.96;
+      // Compute actual drawn rectangle from media dimensions, cropRect, and fitMode
+      const media = clip.mediaId ? this.getMediaById(clip.mediaId) : null;
+      const el = clip.mediaId ? this.mediaElements.get(`${clip.id}::${clip.mediaId}::${media?.url || ''}`) : null;
+      const dims = this._mediaDims(el);
+      const rawW = dims.w || media?.width || W;
+      const rawH = dims.h || media?.height || H;
+      const sw = clip.cropRect?.w > 0 ? clip.cropRect.w : rawW;
+      const sh = clip.cropRect?.h > 0 ? clip.cropRect.h : rawH;
+      const fit = clip.fitMode || 'contain';
+      const srcAR = sw / Math.max(1, sh);
+      const dstAR = W / H;
+      if (fit === 'cover') {
+        if (srcAR > dstAR) { bh = H; bw = H * srcAR; } else { bw = W; bh = W / srcAR; }
+      } else if (fit === 'stretch') {
+        bw = W; bh = H;
+      } else {
+        if (srcAR > dstAR) { bw = W; bh = W / srcAR; } else { bh = H; bw = H * srcAR; }
+      }
     }
     return { cx: W / 2 + x, cy: H / 2 + y, w: bw * sc, h: bh * sc, rot };
   }
@@ -1500,12 +1533,20 @@ export class VideoEngine {
   }
 
   hitTestAnyClip(px, py, t) {
-    const layers = [...this.state.tracks].filter(tr => !tr.hidden && tr.type !== 'audio').reverse();
+    // state.tracks is ordered top-to-bottom (Text -> Overlay -> Main Video), exact reverse of draw order
+    const layers = this.state.tracks.filter(tr => !tr.hidden && tr.type !== 'audio');
     for (const tr of layers) {
-      for (const clip of tr.clips) {
+      for (let i = tr.clips.length - 1; i >= 0; i--) {
+        const clip = tr.clips[i];
         if (t < clip.start || t >= clip.start + clip.duration) continue;
         const box = this.getClipBoundingBox(clip, t);
-        if (Math.abs(px - box.cx) <= box.w / 2 && Math.abs(py - box.cy) <= box.h / 2) return clip;
+        // Rotation-aware hit test in clip-local space
+        const dx = px - box.cx;
+        const dy = py - box.cy;
+        const rad = (-box.rot * Math.PI) / 180;
+        const lx = dx * Math.cos(rad) - dy * Math.sin(rad);
+        const ly = dx * Math.sin(rad) + dy * Math.cos(rad);
+        if (Math.abs(lx) <= box.w / 2 && Math.abs(ly) <= box.h / 2) return clip;
       }
     }
     return null;
@@ -1590,6 +1631,23 @@ export class VideoEngine {
       library: this.state.library,
     });
 
+    // Preflight: block export if any active timeline clip references offline/missing media
+    const missingClips = [];
+    for (const tr of snap.tracks) {
+      if (tr.hidden && tr.muted) continue;
+      for (const c of tr.clips) {
+        if (!c.mediaId) continue;
+        const m = snap.library.find(x => x.id === c.mediaId);
+        if (!m || m.missing || this.erroredMedia.has(c.mediaId)) {
+          missingClips.push(c.name || c.mediaId);
+        }
+      }
+    }
+    if (missingClips.length > 0) {
+      this.isExporting = false;
+      throw new Error(`Cannot export: ${missingClips.length} offline clip(s) need relinking (${missingClips.slice(0, 3).join(', ')})`);
+    }
+
     const rawDur = getSnapshotDuration(snap);
     const totalDur = Math.max(1 / fps, rawDur);
     const totalFrames = Math.max(1, Math.round(totalDur * fps));
@@ -1607,21 +1665,26 @@ export class VideoEngine {
         if (!c.mediaId || c.muted) continue;
         const m = snap.library.find(x => x.id === c.mediaId);
         if (!m || !m.hasAudio) continue;
-        // Include A->B crossfade durations into fadeIn / fadeOut if adjacent on track
+        // Include A->B overlap crossfade matching preview: extend outgoing clip A's tail by transDur
         let fadeIn = c.fadeIn || 0;
         let fadeOut = c.fadeOut || 0;
+        let expDuration = c.duration;
         if ((tr.type === 'video' || tr.type === 'overlay') && c.transIn && c.transIn !== 'none') {
           const prev = tr.clips.find(p => p.id !== c.id && Math.abs((p.start + p.duration) - c.start) <= 0.06);
           if (prev) fadeIn = Math.max(fadeIn, Math.min(c.transInDur || 0.5, c.duration * 0.5));
         }
         if (tr.type === 'video' || tr.type === 'overlay') {
           const next = tr.clips.find(n => n.id !== c.id && n.transIn && n.transIn !== 'none' && Math.abs((c.start + c.duration) - n.start) <= 0.06);
-          if (next) fadeOut = Math.max(fadeOut, Math.min(next.transInDur || 0.5, next.duration * 0.5));
+          if (next) {
+            const td = Math.min(next.transInDur || 0.5, next.duration * 0.5);
+            expDuration = c.duration + td;
+            fadeOut = Math.max(fadeOut, td);
+          }
         }
         audioClips.push({
           mediaId: c.mediaId,
           start: c.start,
-          duration: c.duration,
+          duration: expDuration,
           trimStart: c.trimStart || 0,
           speed: c.speed || 1,
           speedCurve: c.speedCurve || 'none',
