@@ -623,7 +623,7 @@ function layoutMainTrackLinked(main, orderedClips) {
       if (!unlocked.length) c.linkGroupId = null;
     }
 
-    cursor = quantize(c.start + c.duration);
+    cursor = quantizeCeil(c.start + c.duration);
   }
 
   if (unlinkedLockedCount > 0) {
@@ -1763,8 +1763,10 @@ function partitionKeyframesAtCut(clip, cutLocal) {
     const lList = sorted.filter(k => k.t <= cutLocal + 0.001).map(k => ({ ...k }));
     const rList = sorted.filter(k => k.t >= cutLocal - 0.001).map(k => ({ ...k, t: quantize(Math.max(0, k.t - cutLocal)) }));
 
-    if (hasBefore && hasAfter && !hasExact) {
+    if (hasAfter && !hasExact) {
       lList.push({ t: quantize(cutLocal), v: cutVal, ease: 'linear' });
+    }
+    if (hasBefore && !hasExact) {
       rList.unshift({ t: 0, v: cutVal, ease: 'linear' });
     }
     if (lList.length) leftKf[prop] = lList;
@@ -1887,12 +1889,14 @@ function duplicateSelectedClip() {
 
   const origLink = f.clip.linkGroupId;
   const unlockedPartners = [];
+  let skippedLockedPartners = 0;
   if (origLink && state.linkedSelection) {
     for (const tr of state.tracks) {
-      if (tr.id === f.track.id || tr.locked) continue;
+      if (tr.id === f.track.id) continue;
       for (const p of tr.clips) {
         if (p.linkGroupId === origLink) {
-          unlockedPartners.push({ track: tr, clip: p, offset: p.start - f.clip.start });
+          if (tr.locked) skippedLockedPartners++;
+          else unlockedPartners.push({ track: tr, clip: p, offset: p.start - f.clip.start });
         }
       }
     }
@@ -1956,7 +1960,9 @@ function duplicateSelectedClip() {
   renderTimeline();
   renderInspector();
   renderNow();
-  showToast('Duplicated clip');
+  showToast(skippedLockedPartners > 0
+    ? `Duplicated clip (skipped ${skippedLockedPartners} locked partner track)`
+    : 'Duplicated clip');
 }
 
 function copySelectedClips() {
@@ -1984,8 +1990,42 @@ function pasteCopiedClips() {
   }
   const linkRemap = new Map();
   const mainTr = getMainTrack();
+  // Track already-planned pasted intervals per track so simultaneous clips NEVER stack on one lane!
+  const plannedOnTrack = new Map(); // track.id -> [{ start, duration }]
+  const overlapsPlanned = (trId, start, dur) => {
+    const list = plannedOnTrack.get(trId) || [];
+    const end = start + dur;
+    return list.some(iv => start < iv.start + iv.duration - 0.002 && end > iv.start + 0.002);
+  };
+  const reservePlanned = (trId, start, dur) => {
+    if (!plannedOnTrack.has(trId)) plannedOnTrack.set(trId, []);
+    plannedOnTrack.get(trId).push({ start, duration: dur });
+  };
+  const findFreeTrackForPaste = (preferredType, start, duration) => {
+    if (preferredType === 'video' && mainTr && !mainTr.locked && !hasOverlap(mainTr, start, duration) && !overlapsPlanned(mainTr.id, start, duration)) {
+      return mainTr;
+    }
+    const effectiveType = preferredType === 'video' ? 'overlay' : preferredType;
+    const candidates = state.tracks.filter(t => (t.type === preferredType || t.type === effectiveType) && !t.locked);
+    for (const tr of candidates) {
+      if (!hasOverlap(tr, start, duration) && !overlapsPlanned(tr.id, start, duration)) return tr;
+    }
+    const count = state.tracks.filter(t => t.type === effectiveType).length + 1;
+    const colors = { video: '#3898d4', overlay: '#7c5dfa', text: '#f09b3a', audio: '#1fc496' };
+    const labels = { overlay: `Overlay V${count + 1}`, text: `Text T${count}`, audio: `Audio A${count}` };
+    const newTr = {
+      id: uid('tr'),
+      name: labels[effectiveType] || `Track ${count}`,
+      type: effectiveType,
+      color: colors[effectiveType] || '#7c5dfa',
+      muted: false, hidden: false, locked: false, clips: [],
+    };
+    if (effectiveType === 'audio') state.tracks.push(newTr);
+    else state.tracks.unshift(newTr);
+    return newTr;
+  };
 
-  // Assign target tracks up front (preferring Main Track for video clips!)
+  // Assign non-overlapping target tracks up front (respecting both existing AND already-planned pasted clips)
   const planned = state.copiedClips.map(item => {
     const c = structuredClone(item.clip);
     c.id = uid('clip');
@@ -1996,12 +2036,8 @@ function pasteCopiedClips() {
       c.linkGroupId = null;
     }
     const desiredStart = quantize(state.currentTime + item.relStart);
-    let tr = null;
-    if (item.trackType === 'video' && mainTr && !mainTr.locked && !hasOverlap(mainTr, desiredStart, c.duration)) {
-      tr = mainTr;
-    } else {
-      tr = findOrCreateFreeTrack(item.trackType, desiredStart, c.duration);
-    }
+    const tr = findFreeTrackForPaste(item.trackType, desiredStart, c.duration);
+    reservePlanned(tr.id, desiredStart, c.duration);
     return { item, clip: c, track: tr };
   });
 
@@ -3689,36 +3725,86 @@ async function saveProjectJSON(downloadFile = true) {
     a.download = `${state.title || 'motioncut'}.mcut.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    showToast('Project exported (.mcut.json + server backup)');
+    showToast(serverOk
+      ? 'Project exported (.mcut.json + server backup)'
+      : (localOk ? 'Project exported (.mcut.json + local autosave)' : 'Project exported (.mcut.json only — storage & server unavailable)'));
   } else if (serverOk) {
     showToast('Project saved to server & local autosave (⌘S)');
   }
 }
 
-function backupProjectForRecovery() {
-  try {
-    const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
-    if (!hasContent) return;
-    localStorage.setItem(`motioncut_backup_${state.projectId}`, JSON.stringify(buildProjectPayload()));
-  } catch {}
+function projectHasContent() {
+  return state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0 || state.markers.length > 0;
 }
 
-function startNewProject(fromUser = false) {
-  const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
-  if (fromUser && hasContent && typeof window.confirm === 'function') {
-    if (!window.confirm('Start a new empty project? Your current edit will be backed up in local recovery storage.')) return;
+function listLocalRecoveryBackups() {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('motioncut_backup_')) continue;
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        out.push({ key: k, title: parsed.title || 'Untitled_Project', savedAt: parsed.savedAt || '', raw });
+      } catch {}
+    }
+  } catch {}
+  return out.sort((a, b) => String(b.savedAt).localeCompare(String(a.savedAt)));
+}
+
+function backupProjectForRecovery() {
+  if (!projectHasContent()) return { ok: true, key: null };
+  const key = `motioncut_backup_${state.projectId}`;
+  const payload = JSON.stringify({ ...buildProjectPayload(), savedAt: new Date().toISOString() });
+  try {
+    // Keep at most 5 recovery backups so localStorage never fills up
+    const existing = listLocalRecoveryBackups().filter(b => b.key !== key);
+    for (const old of existing.slice(4)) {
+      try { localStorage.removeItem(old.key); } catch {}
+    }
+    localStorage.setItem(key, payload);
+    return { ok: true, key };
+  } catch {
+    return { ok: false, key: null };
   }
-  backupProjectForRecovery();
-  if (state.playing) togglePlay(false);
-  projectEpoch++;
-  state.projectId = uid('proj');
-  state.mainTrackId = 't_vid1';
-  state.title = 'Untitled_Project';
+}
+
+function resetProjectUiDefaults() {
   state.aspect = '16:9';
   state.canvasWidth = 1920;
   state.canvasHeight = 1080;
   state.fps = 30;
   state.bgMode = 'black';
+  state.captionStyle = 'hormozi';
+  state.captionYPos = 80;
+  state.captionFontSize = 56;
+  setActiveTool('select');
+  $('#projectTitle').value = state.title;
+  $('#fpsSelect').value = '30';
+  $('#capYPos').value = '80';
+  $('#capFontSize').value = '56';
+  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
+  $$('#captionStyleRow button').forEach(b => b.classList.toggle('active', b.dataset.cstyle === 'hormozi'));
+  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === 'black'));
+  updateCanvasResBadge();
+}
+
+function startNewProject(fromUser = false) {
+  const hasContent = projectHasContent();
+  if (fromUser && hasContent && typeof window.confirm === 'function') {
+    if (!window.confirm('Start a new empty project? Your current edit will be backed up to Local Recovery (accessible via Open).')) return;
+  }
+  const backup = backupProjectForRecovery();
+  if (fromUser && hasContent && !backup.ok && typeof window.confirm === 'function') {
+    if (!window.confirm('Could not save a local recovery backup (browser storage full). Discard current project anyway?')) return;
+  }
+  if (state.playing) togglePlay(false);
+  projectEpoch++;
+  state.projectId = uid('proj');
+  state.mainTrackId = 't_vid1';
+  state.title = 'Untitled_Project';
   state.currentTime = 0;
   state.tracks = makeEmptyTracks();
   state.captions = [];
@@ -3729,11 +3815,7 @@ function startNewProject(fromUser = false) {
   state.selectedClipId = null;
   state.selectedClipIds.clear();
   state.selectedCaptionId = null;
-  $('#projectTitle').value = state.title;
-  $('#fpsSelect').value = '30';
-  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
-  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === 'black'));
-  updateCanvasResBadge();
+  resetProjectUiDefaults();
   engine.pruneUnusedElements();
   snapshotHistory();
   state.hasUnsavedChanges = false;
@@ -3742,25 +3824,25 @@ function startNewProject(fromUser = false) {
   renderInspector();
   syncEffectsDrawer();
   renderNow();
-  showToast('Started new clean project (previous edit backed up)');
+  showToast(hasContent
+    ? (backup.ok ? 'Started new clean project (previous edit backed up)' : 'Started new clean project (recovery backup unavailable — storage full)')
+    : 'Started new clean project');
 }
 
 function loadStarterDemo(fromUser = false) {
-  const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
+  const hasContent = projectHasContent();
   if (fromUser && hasContent && typeof window.confirm === 'function') {
-    if (!window.confirm('Load the starter demo project? Your current edit will be backed up in local recovery storage.')) return;
+    if (!window.confirm('Load the starter demo project? Your current edit will be backed up to Local Recovery (accessible via Open).')) return;
   }
-  backupProjectForRecovery();
+  const backup = backupProjectForRecovery();
+  if (fromUser && hasContent && !backup.ok && typeof window.confirm === 'function') {
+    if (!window.confirm('Could not save a local recovery backup (browser storage full). Discard current project anyway?')) return;
+  }
   if (state.playing) togglePlay(false);
   projectEpoch++;
   state.projectId = uid('proj');
   state.mainTrackId = 't_vid1';
   state.title = 'Scanner_16x9_Edit';
-  state.aspect = '16:9';
-  state.canvasWidth = 1920;
-  state.canvasHeight = 1080;
-  state.fps = 30;
-  state.bgMode = 'black';
   state.tracks = makeEmptyTracks();
   state.captions = [];
   state.markers = [];
@@ -3771,11 +3853,7 @@ function loadStarterDemo(fromUser = false) {
   state.historyIdx = -1;
   state.hasUnsavedChanges = false;
   state.currentTime = 0;
-  $('#projectTitle').value = state.title;
-  $('#fpsSelect').value = '30';
-  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
-  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === 'black'));
-  updateCanvasResBadge();
+  resetProjectUiDefaults();
   engine.pruneUnusedElements();
   const starter = state.library.find(m => m.name.includes('16:9')) || state.library.find(m => m.type === 'video');
   if (starter) {
@@ -3786,7 +3864,9 @@ function loadStarterDemo(fromUser = false) {
     renderInspector();
     syncEffectsDrawer();
     renderNow();
-    showToast(`Loaded demo: ${starter.name}`);
+    showToast(hasContent && !backup.ok
+      ? `Loaded demo: ${starter.name} (recovery backup unavailable — storage full)`
+      : `Loaded demo: ${starter.name}`);
   } else {
     snapshotHistory();
     state.hasUnsavedChanges = false;
@@ -4143,46 +4223,83 @@ function setupUIEvents() {
   $('#btnOpenLocalProjFile').onclick = () => { $('#projectsModal').classList.add('hidden'); $('#projFileInput').click(); };
   $('#btnLoadProj').onclick = async () => {
     const listEl = $('#serverProjectsList');
-    listEl.innerHTML = '<div class="drawer-tip">Loading saved server projects…</div>';
+    listEl.innerHTML = '<div class="drawer-tip">Loading saved projects & local recovery backups…</div>';
     $('#projectsModal').classList.remove('hidden');
+
+    const renderRecoverySection = (container) => {
+      const backups = listLocalRecoveryBackups();
+      if (!backups.length) return;
+      const hdr = document.createElement('div');
+      hdr.className = 'drawer-tip';
+      hdr.style.marginTop = '10px';
+      hdr.style.fontWeight = '700';
+      hdr.textContent = 'Local Recovery Backups (auto-saved before New / Demo)';
+      container.appendChild(hdr);
+      backups.forEach(bk => {
+        const when = bk.savedAt ? new Date(bk.savedAt).toLocaleString() : '';
+        const row = document.createElement('div');
+        row.className = 'relink-row';
+        row.innerHTML = `<div><strong>${escHtml(bk.title)}</strong>${when ? `<div class="media-sub">Recovery · ${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-restore>Restore</button><button class="btn-mini" data-del-rec title="Delete recovery backup">✕</button></div>`;
+        row.querySelector('[data-restore]').onclick = () => {
+          try {
+            applySnapshot(bk.raw, true);
+            snapshotHistory();
+            $('#projectsModal').classList.add('hidden');
+            showToast(`Restored recovery backup: ${bk.title}`);
+          } catch (err) {
+            showToast(`Failed to restore backup: ${err.message}`);
+          }
+        };
+        row.querySelector('[data-del-rec]').onclick = () => {
+          try { localStorage.removeItem(bk.key); row.remove(); showToast(`Deleted recovery backup: ${bk.title}`); } catch {}
+        };
+        container.appendChild(row);
+      });
+    };
+
     try {
       const r = await fetch('/api/projects');
       const d = await r.json();
       const details = d.details || (d.projects || []).map(f => ({ fileName: f, updatedAt: null }));
-      if (!details.length) {
-        listEl.innerHTML = '<div class="drawer-tip">No server backups yet. Click Save (⌘S) to create one, or browse a local .mcut.json file below.</div>';
-        return;
-      }
       listEl.innerHTML = '';
-      details.forEach(item => {
-        const fname = item.fileName;
-        const when = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '';
-        const row = document.createElement('div');
-        row.className = 'relink-row';
-        row.innerHTML = `<div><strong>${escHtml(fname)}</strong>${when ? `<div class="media-sub">${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-open>Open</button><button class="btn-mini" data-del title="Delete backup">✕</button></div>`;
-        row.querySelector('[data-open]').onclick = async () => {
-          try {
-            const pr = await fetch(`/api/projects/${encodeURIComponent(fname)}`);
-            const pd = await pr.json();
-            if (!pr.ok || !pd.project) return showToast(pd.error || 'Failed to load project');
-            applySnapshot(JSON.stringify(pd.project), true);
-            snapshotHistory();
-            $('#projectsModal').classList.add('hidden');
-            showToast(`Loaded ${fname}`);
-          } catch (err) {
-            showToast(`Failed to open project: ${err.message}`);
-          }
-        };
-        row.querySelector('[data-del]').onclick = async () => {
-          try {
-            const dr = await fetch(`/api/projects/${encodeURIComponent(fname)}`, { method: 'DELETE', headers: apiHeaders() });
-            if (dr.ok) { row.remove(); showToast(`Deleted ${fname}`); }
-          } catch {}
-        };
-        listEl.appendChild(row);
-      });
+      if (!details.length) {
+        const empty = document.createElement('div');
+        empty.className = 'drawer-tip';
+        empty.textContent = 'No server backups yet. Click Save (⌘S) to create one, or browse a local .mcut.json file below.';
+        listEl.appendChild(empty);
+      } else {
+        details.forEach(item => {
+          const fname = item.fileName;
+          const when = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '';
+          const row = document.createElement('div');
+          row.className = 'relink-row';
+          row.innerHTML = `<div><strong>${escHtml(fname)}</strong>${when ? `<div class="media-sub">${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-open>Open</button><button class="btn-mini" data-del title="Delete backup">✕</button></div>`;
+          row.querySelector('[data-open]').onclick = async () => {
+            try {
+              const pr = await fetch(`/api/projects/${encodeURIComponent(fname)}`);
+              const pd = await pr.json();
+              if (!pr.ok || !pd.project) return showToast(pd.error || 'Failed to load project');
+              applySnapshot(JSON.stringify(pd.project), true);
+              snapshotHistory();
+              $('#projectsModal').classList.add('hidden');
+              showToast(`Loaded ${fname}`);
+            } catch (err) {
+              showToast(`Failed to open project: ${err.message}`);
+            }
+          };
+          row.querySelector('[data-del]').onclick = async () => {
+            try {
+              const dr = await fetch(`/api/projects/${encodeURIComponent(fname)}`, { method: 'DELETE', headers: apiHeaders() });
+              if (dr.ok) { row.remove(); showToast(`Deleted ${fname}`); }
+            } catch {}
+          };
+          listEl.appendChild(row);
+        });
+      }
+      renderRecoverySection(listEl);
     } catch {
       listEl.innerHTML = '<div class="drawer-tip">Could not list server backups. Use Browse Local .mcut.json below.</div>';
+      renderRecoverySection(listEl);
     }
   };
   $('#projFileInput').onchange = async (e) => {

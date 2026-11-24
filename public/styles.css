@@ -456,7 +456,13 @@ input, select, textarea { font: inherit; color: var(--text-0); }
   .topbar { flex-wrap: wrap; row-gap: 4px; padding: 4px 8px; }
   .project-title { width: 120px; }
   .timeline-toolbar { flex-wrap: wrap; row-gap: 4px; padding: 4px 8px; }
+  .tl-tools-left, .tl-tools-right { flex-wrap: wrap; }
   .zoom-slider { width: 58px; }
+}
+@media (max-width: 1000px) {
+  .left-panel { flex: 0 0 210px; width: 210px; }
+  .inspector-panel { flex: 0 0 210px; width: 210px; }
+  .preview-stage { min-width: 220px; }
 }
 .tl-btn {
   padding: 4px 8px; border-radius: 5px; background: var(--bg-3); border: 1px solid var(--border);

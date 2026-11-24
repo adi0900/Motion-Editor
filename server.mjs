@@ -130,6 +130,7 @@ async function probeFile(filePath) {
     width: vStream?.width || 0,
     height: vStream?.height || 0,
     fps,
+    nbFrames: vStream?.nb_frames ? Number(vStream.nb_frames) : 0,
     hasVideo: Boolean(vStream),
     hasAudio: Boolean(aStream),
   };
@@ -863,7 +864,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '9.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '10.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1091,10 +1092,12 @@ const server = http.createServer(async (req, res) => {
       const proc = spawn('ffmpeg', [
         '-y', '-v', 'error',
         '-f', 'image2pipe', '-vcodec', 'mjpeg', '-framerate', String(fps), '-i', '-',
-        '-vf', `scale=${width}:${height}:flags=lanczos,setsar=1,format=yuv420p`,
+        '-vf', `scale=${width}:${height}:flags=lanczos:in_range=full:out_range=tv,setsar=1,format=yuv420p`,
         '-r', String(fps),
         '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
-        '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+        '-crf', String(crf), '-pix_fmt', 'yuv420p',
+        '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+        '-movflags', '+faststart',
         videoOnlyPath,
       ], { stdio: ['pipe', 'ignore', 'pipe'] });
 
@@ -1154,9 +1157,13 @@ const server = http.createServer(async (req, res) => {
         cleanupExportJob(jobId, true);
         return sendJSON(res, 500, { error: msg });
       }
+      if (job.expectedFrames && job.framesWritten >= job.expectedFrames) {
+        return sendJSON(res, 400, { error: `Export already received all ${job.expectedFrames} expected frames` });
+      }
       job.lastActivity = Date.now();
       const buf = await readBodyBuffer(req, 32 * 1024 * 1024);
-      if (buf.length < 100) return sendJSON(res, 400, { error: 'Empty or corrupt frame buffer' });
+      const isJpeg = buf.length >= 128 && buf[0] === 0xFF && buf[1] === 0xD8 && buf.includes(Buffer.from([0xFF, 0xD9]));
+      if (!isJpeg) return sendJSON(res, 400, { error: 'Invalid or corrupt JPEG frame buffer' });
 
       try {
         const ok = job.proc.stdin.write(buf);
@@ -1242,6 +1249,10 @@ const server = http.createServer(async (req, res) => {
         try { fs.unlinkSync(job.finalPath); } catch {}
         return sendJSON(res, 500, { error: 'Export produced an empty or unreadable video file' });
       }
+      if (job.expectedFrames && meta.nbFrames > 0 && meta.nbFrames !== job.expectedFrames) {
+        try { fs.unlinkSync(job.finalPath); } catch {}
+        return sendJSON(res, 400, { error: `Decoded frame count (${meta.nbFrames}) does not match expected (${job.expectedFrames})` });
+      }
       await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
         ok: true,
@@ -1276,7 +1287,7 @@ const server = http.createServer(async (req, res) => {
       const start = body.trimStart === undefined ? 0 : Number(body.trimStart);
       const dur = body.duration === undefined ? item.duration : Number(body.duration);
       const speed = body.speed === undefined ? 1 : Number(body.speed);
-      if (!Number.isFinite(start) || start < 0 || start >= item.duration - 0.05) {
+      if (!Number.isFinite(start) || start < 0 || start >= item.duration || (item.duration - start < 0.01)) {
         return sendJSON(res, 400, { error: `Invalid trimStart (must be >= 0 and < clip duration ${item.duration.toFixed(2)}s)` });
       }
       if (!Number.isFinite(dur) || dur <= 0) return sendJSON(res, 400, { error: 'Invalid duration' });
@@ -1421,6 +1432,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v8 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v10 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });
