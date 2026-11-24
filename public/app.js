@@ -152,7 +152,7 @@ function validateProjectObject(d) {
   const seenTrackIds = new Set();
   const seenClipIds = new Set();
   const validClipTypes = new Set(['video', 'audio', 'image', 'text', 'graphic']);
-  const validFitModes = new Set(['contain', 'cover', 'stretch']);
+  const validFitModes = new Set(['contain', 'cover', 'stretch', 'blur']);
   const validCurves = new Set(Object.keys(SPEED_CURVES));
   const tracks = Array.isArray(d.tracks) ? d.tracks.filter(tr => tr && typeof tr === 'object' && validTrackTypes.has(tr.type)).map(tr => {
     let tid = safeStr(tr.id, uid('tr'));
@@ -1361,8 +1361,9 @@ function attachClipInteractions(el, clip, track, hL, hR) {
       return;
     }
 
-    if (!state.selectedClipIds.has(clip.id)) {
-      selectSingleClip(clip.id);
+    if (!state.selectedClipIds.has(clip.id) || state.selectedClipId !== clip.id) {
+      if (!state.selectedClipIds.has(clip.id)) selectSingleClip(clip.id);
+      else state.selectedClipId = clip.id;
       $$('.tl-clip').forEach(node => node.classList.toggle('selected', state.selectedClipIds.has(node.dataset.clipId)));
       renderInspector();
       syncEffectsDrawer();
@@ -2529,6 +2530,7 @@ function renderInspector() {
           <select id="selFitMode" class="prop-select" ${dis}>
             <option value="cover" ${clip.fitMode === 'cover' ? 'selected' : ''}>Cover (Fill Frame)</option>
             <option value="contain" ${clip.fitMode === 'contain' ? 'selected' : ''}>Contain (Fit Full)</option>
+            <option value="blur" ${clip.fitMode === 'blur' ? 'selected' : ''}>Blur Backdrop</option>
             <option value="stretch" ${clip.fitMode === 'stretch' ? 'selected' : ''}>Stretch</option>
           </select>
         </div>` : ''}
@@ -3581,7 +3583,7 @@ async function runExport() {
         headers: apiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           mediaId: vidClip.mediaId, width, height, fps, crf, name,
-          fitMode: vidClip.fitMode || 'cover',
+          fitMode: vidClip.fitMode === 'blur' || state.bgMode === 'blur' ? 'blur' : (vidClip.fitMode || 'cover'),
           trimStart: vidClip.trimStart || 0,
           duration: vidClip.duration,
           speed: vidClip.speed || 1,
@@ -3710,7 +3712,9 @@ async function saveProjectJSON(downloadFile = true) {
     serverOk = r.ok;
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      showToast(`Server backup warning: ${d.error || r.status}`);
+      showToast(localOk
+        ? `Server backup warning: ${d.error || r.status} — saved locally`
+        : `Save failed (server error ${d.error || r.status} & local storage unavailable)`);
     }
   } catch {
     showToast(localOk ? 'Server backup unreachable — saved locally' : 'Save failed (local storage & server unavailable)');
@@ -3729,7 +3733,7 @@ async function saveProjectJSON(downloadFile = true) {
       ? 'Project exported (.mcut.json + server backup)'
       : (localOk ? 'Project exported (.mcut.json + local autosave)' : 'Project exported (.mcut.json only — storage & server unavailable)'));
   } else if (serverOk) {
-    showToast('Project saved to server & local autosave (⌘S)');
+    showToast(localOk ? 'Project saved to server & local autosave (⌘S)' : 'Project saved to server (local autosave unavailable)');
   }
 }
 
@@ -3759,12 +3763,12 @@ function backupProjectForRecovery() {
   const key = `motioncut_backup_${state.projectId}`;
   const payload = JSON.stringify({ ...buildProjectPayload(), savedAt: new Date().toISOString() });
   try {
-    // Keep at most 5 recovery backups so localStorage never fills up
+    // Write new backup FIRST so a storage-full failure NEVER deletes existing older backups!
+    localStorage.setItem(key, payload);
     const existing = listLocalRecoveryBackups().filter(b => b.key !== key);
     for (const old of existing.slice(4)) {
       try { localStorage.removeItem(old.key); } catch {}
     }
-    localStorage.setItem(key, payload);
     return { ok: true, key };
   } catch {
     return { ok: false, key: null };
@@ -4234,16 +4238,23 @@ function setupUIEvents() {
       hdr.style.marginTop = '10px';
       hdr.style.fontWeight = '700';
       hdr.textContent = 'Local Recovery Backups (auto-saved before New / Demo)';
-      container.appendChild(hdr);
+      const wrap = document.createElement('div');
+      wrap.appendChild(hdr);
+      container.appendChild(wrap);
       backups.forEach(bk => {
         const when = bk.savedAt ? new Date(bk.savedAt).toLocaleString() : '';
         const row = document.createElement('div');
         row.className = 'relink-row';
         row.innerHTML = `<div><strong>${escHtml(bk.title)}</strong>${when ? `<div class="media-sub">Recovery · ${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-restore>Restore</button><button class="btn-mini" data-del-rec title="Delete recovery backup">✕</button></div>`;
         row.querySelector('[data-restore]').onclick = () => {
+          if (projectHasContent() && typeof window.confirm === 'function') {
+            if (!window.confirm(`Restore "${bk.title}"? Your current edit will be backed up to Local Recovery.`)) return;
+          }
+          backupProjectForRecovery();
           try {
             applySnapshot(bk.raw, true);
             snapshotHistory();
+            state.hasUnsavedChanges = false;
             $('#projectsModal').classList.add('hidden');
             showToast(`Restored recovery backup: ${bk.title}`);
           } catch (err) {
@@ -4251,9 +4262,14 @@ function setupUIEvents() {
           }
         };
         row.querySelector('[data-del-rec]').onclick = () => {
-          try { localStorage.removeItem(bk.key); row.remove(); showToast(`Deleted recovery backup: ${bk.title}`); } catch {}
+          try {
+            localStorage.removeItem(bk.key);
+            row.remove();
+            if (!wrap.querySelector('.relink-row')) wrap.remove();
+            showToast(`Deleted recovery backup: ${bk.title}`);
+          } catch {}
         };
-        container.appendChild(row);
+        wrap.appendChild(row);
       });
     };
 
@@ -4275,12 +4291,17 @@ function setupUIEvents() {
           row.className = 'relink-row';
           row.innerHTML = `<div><strong>${escHtml(fname)}</strong>${when ? `<div class="media-sub">${escHtml(when)}</div>` : ''}</div><div style="display:flex;gap:6px"><button class="btn-mini" data-open>Open</button><button class="btn-mini" data-del title="Delete backup">✕</button></div>`;
           row.querySelector('[data-open]').onclick = async () => {
+            if (projectHasContent() && typeof window.confirm === 'function') {
+              if (!window.confirm(`Open "${fname}"? Your current edit will be backed up to Local Recovery.`)) return;
+            }
+            backupProjectForRecovery();
             try {
               const pr = await fetch(`/api/projects/${encodeURIComponent(fname)}`);
               const pd = await pr.json();
               if (!pr.ok || !pd.project) return showToast(pd.error || 'Failed to load project');
               applySnapshot(JSON.stringify(pd.project), true);
               snapshotHistory();
+              state.hasUnsavedChanges = false;
               $('#projectsModal').classList.add('hidden');
               showToast(`Loaded ${fname}`);
             } catch (err) {
@@ -4408,8 +4429,8 @@ function setupUIEvents() {
         };
         const lg = f.clip.linkGroupId;
         trimOneLeft(f.clip);
+        let unlinked = 0;
         if (lg && state.linkedSelection) {
-          let unlinked = 0;
           for (const tr of state.tracks) {
             if (tr.id === f.track.id || tr.locked) continue;
             for (const p of tr.clips) {
@@ -4419,10 +4440,11 @@ function setupUIEvents() {
               }
             }
           }
-          if (unlinked > 0) showToast(`Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`);
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        showToast('Trimmed clip start to playhead (Q)');
+        showToast(unlinked > 0
+          ? `Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`
+          : 'Trimmed clip start to playhead (Q)');
       }
     }
     else if (k === 'w' && !cmd) {
@@ -4450,8 +4472,8 @@ function setupUIEvents() {
         };
         const lg = f.clip.linkGroupId;
         trimOneRight(f.clip);
+        let unlinked = 0;
         if (lg && state.linkedSelection) {
-          let unlinked = 0;
           for (const tr of state.tracks) {
             if (tr.id === f.track.id || tr.locked) continue;
             for (const p of tr.clips) {
@@ -4461,10 +4483,11 @@ function setupUIEvents() {
               }
             }
           }
-          if (unlinked > 0) showToast(`Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`);
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        showToast('Trimmed clip end to playhead (W)');
+        showToast(unlinked > 0
+          ? `Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`
+          : 'Trimmed clip end to playhead (W)');
       }
     }
     else if (cmd && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }

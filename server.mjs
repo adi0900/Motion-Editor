@@ -451,6 +451,44 @@ async function detectCrop(filePath) {
   return { w: Number(last[1]), h: Number(last[2]), x: Number(last[3]), y: Number(last[4]) };
 }
 
+function isValidJpegBuffer(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 128) return false;
+  if (buf[0] !== 0xFF || buf[1] !== 0xD8) return false;
+  // Require EOI (FF D9) near the end (allow trailing zero padding)
+  let end = buf.length - 1;
+  while (end > 2 && buf[end] === 0x00) end--;
+  if (buf[end - 1] !== 0xFF || buf[end] !== 0xD9) return false;
+  // Walk JPEG segment headers until SOS (FF DA) and verify a valid SOF header exists
+  let pos = 2;
+  let hasSof = false;
+  let hasSos = false;
+  while (pos + 1 < end) {
+    if (buf[pos] !== 0xFF) return false;
+    while (pos < end && buf[pos] === 0xFF) pos++;
+    if (pos >= end) return false;
+    const marker = buf[pos++];
+    if (marker === 0xD8 || marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+    if (marker === 0xD9) break;
+    if (pos + 2 > end) return false;
+    const segLen = buf.readUInt16BE(pos);
+    if (segLen < 2 || pos + segLen > end) return false;
+    // SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15
+    if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) || (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+      if (segLen < 8) return false;
+      const h = buf.readUInt16BE(pos + 3);
+      const w = buf.readUInt16BE(pos + 5);
+      if (w <= 0 || h <= 0) return false;
+      hasSof = true;
+    }
+    if (marker === 0xDA) {
+      hasSos = true;
+      break;
+    }
+    pos += segLen;
+  }
+  return hasSof && hasSos;
+}
+
 const reservedExportPaths = new Set();
 
 function uniqueExportPath(baseName) {
@@ -751,7 +789,6 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   if (!job) return false;
   if (markCancelled) job.cancelled = true;
   exportJobs.delete(jobId);
-  if (job.finalPath) reservedExportPaths.delete(job.finalPath);
   if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
     try { job.proc.stdin.destroy(); } catch {}
     try { job.proc.kill('SIGKILL'); } catch {}
@@ -762,6 +799,8 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   setTimeout(() => {
     try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
     try { if (markCancelled && fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+    // Release filename reservation ONLY after delayed unlink finishes so a new same-name job can never be deleted!
+    if (job.finalPath) reservedExportPaths.delete(job.finalPath);
   }, 400);
   return true;
 }
@@ -864,7 +903,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '10.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '11.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1109,6 +1148,7 @@ const server = http.createServer(async (req, res) => {
         expectedFrames,
         audioClips,
         framesWritten: 0,
+        framesReserved: 0,
         lastActivity: Date.now(),
         failed: false,
         failError: null,
@@ -1157,13 +1197,23 @@ const server = http.createServer(async (req, res) => {
         cleanupExportJob(jobId, true);
         return sendJSON(res, 500, { error: msg });
       }
-      if (job.expectedFrames && job.framesWritten >= job.expectedFrames) {
+      if (job.expectedFrames && job.framesReserved >= job.expectedFrames) {
         return sendJSON(res, 400, { error: `Export already received all ${job.expectedFrames} expected frames` });
       }
+      // Reserve frame slot synchronously BEFORE awaiting body so concurrent pushes never bypass expectedFrames!
+      job.framesReserved++;
       job.lastActivity = Date.now();
-      const buf = await readBodyBuffer(req, 32 * 1024 * 1024);
-      const isJpeg = buf.length >= 128 && buf[0] === 0xFF && buf[1] === 0xD8 && buf.includes(Buffer.from([0xFF, 0xD9]));
-      if (!isJpeg) return sendJSON(res, 400, { error: 'Invalid or corrupt JPEG frame buffer' });
+      let buf;
+      try {
+        buf = await readBodyBuffer(req, 32 * 1024 * 1024);
+      } catch (err) {
+        job.framesReserved = Math.max(0, job.framesReserved - 1);
+        throw err;
+      }
+      if (!isValidJpegBuffer(buf)) {
+        job.framesReserved = Math.max(0, job.framesReserved - 1);
+        return sendJSON(res, 400, { error: 'Invalid or corrupt JPEG frame buffer' });
+      }
 
       try {
         const ok = job.proc.stdin.write(buf);
@@ -1249,9 +1299,21 @@ const server = http.createServer(async (req, res) => {
         try { fs.unlinkSync(job.finalPath); } catch {}
         return sendJSON(res, 500, { error: 'Export produced an empty or unreadable video file' });
       }
-      if (job.expectedFrames && meta.nbFrames > 0 && meta.nbFrames !== job.expectedFrames) {
-        try { fs.unlinkSync(job.finalPath); } catch {}
-        return sendJSON(res, 400, { error: `Decoded frame count (${meta.nbFrames}) does not match expected (${job.expectedFrames})` });
+      if (job.expectedFrames) {
+        let actualFrames = meta.nbFrames;
+        if (actualFrames <= 0) {
+          try {
+            const { stdout } = await execFileAsync('ffprobe', [
+              '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+              '-show_entries', 'stream=nb_read_frames', '-of', 'default=nk=1:nw=1', job.finalPath,
+            ]);
+            actualFrames = Number(stdout.trim()) || 0;
+          } catch {}
+        }
+        if (actualFrames !== job.expectedFrames) {
+          try { fs.unlinkSync(job.finalPath); } catch {}
+          return sendJSON(res, 400, { error: `Decoded frame count (${actualFrames}) does not match expected (${job.expectedFrames})` });
+        }
       }
       await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
@@ -1305,8 +1367,10 @@ const server = http.createServer(async (req, res) => {
         }
         vPre += `crop=${Math.round(Number(c.w))}:${Math.round(Number(c.h))}:${Math.round(Number(c.x))}:${Math.round(Number(c.y))},`;
       }
-      if (Math.abs(speed - 1) > 0.01) vPre += `setpts=(PTS-STARTPTS)/${speed.toFixed(4)},`;
+      // Apply reverse BEFORE speed scaling + explicit fps filter inside graph for exact symmetric cut timing!
       if (body.reverse) vPre += 'reverse,setpts=PTS-STARTPTS,';
+      if (Math.abs(speed - 1) > 0.01) vPre += `setpts=(PTS-STARTPTS)/${speed.toFixed(4)},`;
+      vPre += `fps=${fps},`;
 
       const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
 
@@ -1337,7 +1401,9 @@ const server = http.createServer(async (req, res) => {
       }
       ffArgs.push(
         '-r', String(fps), '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
-        '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+        '-crf', String(crf), '-pix_fmt', 'yuv420p',
+        '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+        '-movflags', '+faststart',
         '-t', outDur.toFixed(4), outMp4,
       );
 
@@ -1432,6 +1498,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v10 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v11 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });
