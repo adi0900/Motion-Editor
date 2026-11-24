@@ -705,18 +705,20 @@ input, select, textarea { font: inherit; color: var(--text-0); }
   .media-grid, .preset-grid { grid-template-columns: 1fr; }
   .audio-row { flex-direction: column; align-items: stretch; gap: 5px; padding: 7px; }
   .audio-row > div { width: 100%; }
+  .audio-row-name { white-space: normal; word-break: break-word; overflow: visible; text-overflow: clip; line-height: 1.25; }
   .audio-row button { width: 100%; }
   .caption-global-ctrls { grid-template-columns: 1fr; }
   .caption-top { flex-wrap: wrap; }
   .cap-time-in { width: 48px; }
   .inspector-panel { flex: 0 0 218px; width: 218px; }
-  .player-panel { min-width: 0; overflow-x: hidden; }
-  .transport-bar { flex-wrap: wrap; height: auto; min-height: 40px; padding: 4px 6px; row-gap: 4px; }
+  .player-panel { min-width: 0; overflow-x: hidden; overflow-y: hidden; }
+  .viewport-stage { min-height: 80px; padding: 6px; }
+  .transport-bar { flex: 0 0 auto; flex-wrap: wrap; height: auto; min-height: 36px; padding: 4px 6px; row-gap: 4px; justify-content: center; }
   .transport-left, .transport-center, .transport-right { gap: 3px; flex-wrap: wrap; }
   .inspector-tabs { flex-wrap: wrap; padding: 0 2px; }
   .insp-tab { font-size: 10px; padding: 6px 2px; min-width: 0; }
   .inspector-body { overflow-x: hidden; overflow-y: auto; padding: 6px; }
-  .insp-section { padding: 7px; min-width: 0; flex-shrink: 0; overflow-x: hidden; overflow-y: visible; }
+  .insp-section { padding: 7px; min-width: 0; flex-shrink: 0; overflow-x: clip; overflow-y: visible; }
   .prop-row { min-width: 0; }
   .prop-head { flex-wrap: wrap; gap: 3px; }
   .prop-val-group { flex-wrap: wrap; min-width: 0; gap: 2px; }

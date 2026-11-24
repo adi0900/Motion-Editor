@@ -803,6 +803,7 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
 function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   const job = exportJobs.get(jobId);
   if (!job) return false;
+  if (markCancelled && job.committed) return false;
   if (markCancelled) job.cancelled = true;
   job.cleanupScheduled = true;
   exportJobs.delete(jobId);
@@ -922,7 +923,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '13.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '14.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1144,7 +1145,7 @@ const server = http.createServer(async (req, res) => {
       const expectedFrames = Math.max(1, Math.round(totalDuration * fps));
 
       const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
-      const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`, jobId);
+      const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || body.fileName || `motioncut_${Date.now()}`, jobId);
       const videoOnlyPath = path.join(EXPORTS_DIR, `_vid_${jobId}.mp4`);
 
       const proc = spawn('ffmpeg', [
@@ -1342,6 +1343,9 @@ const server = http.createServer(async (req, res) => {
           cleanupExportJob(jobId, true);
           return sendJSON(res, 409, { error: 'Export cancelled' });
         }
+        // Atomic commit point: once committed, cancel cannot delete finalPath or leave a stale catalog entry
+        job.committed = true;
+        exportJobs.delete(jobId);
         await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
         return sendJSON(res, 200, {
           ok: true,
@@ -1363,7 +1367,9 @@ const server = http.createServer(async (req, res) => {
         if (reservedExportPaths.get(job.finalPath) === jobId) {
           try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
         }
-        return sendJSON(res, wasCancelled ? 409 : (isCorruptInput ? 400 : 500), { error: errMsg });
+        return sendJSON(res, wasCancelled ? 409 : (isCorruptInput ? 400 : 500), {
+          error: isCorruptInput ? `Corrupt or truncated JPEG frame detected: ${(encErr || errMsg).trim().slice(0, 140)}` : errMsg,
+        });
       } finally {
         clearInterval(heartbeat);
         exportJobs.delete(jobId);
@@ -1419,7 +1425,7 @@ const server = http.createServer(async (req, res) => {
       vPre += `fps=${fps},`;
 
       const quickId = 'quick_' + crypto.randomBytes(6).toString('hex');
-      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`, quickId);
+      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || body.fileName || `${path.parse(item.name).name}_${w}x${h}`, quickId);
 
       // Compute exact source read duration = timeline dur * speed (clamped to available source)
       const srcSpan = Math.max(0.05, Math.min(Math.max(0.05, item.duration - start), dur * speed));
@@ -1546,6 +1552,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v13 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v14 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

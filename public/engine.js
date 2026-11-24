@@ -1782,10 +1782,17 @@ export class VideoEngine {
   }
 
   async cancelExport() {
-    let serverCancelled = true;
-    if (this.activeExportJobId) {
-      const jid = this.activeExportJobId;
-      this.activeExportJobId = null;
+    if (this.cancelInFlight) return this.cancelInFlight;
+    const jid = this.activeExportJobId;
+    if (!jid) {
+      if (this.lastCancelResult && this.lastCancelResult.cancelled === false) {
+        return this.lastCancelResult;
+      }
+      if (this.exportAbortCtrl) this.exportAbortCtrl.abort();
+      return { cancelled: true };
+    }
+    this.cancelInFlight = (async () => {
+      let serverCancelled = true;
       try {
         const r = await fetch(`/api/export-frames/cancel/${jid}`, {
           method: 'POST',
@@ -1794,11 +1801,18 @@ export class VideoEngine {
         const d = await r.json().catch(() => ({}));
         if (r.ok && d.cancelled === false) serverCancelled = false;
       } catch {}
+      this.activeExportJobId = null;
+      this.lastCancelResult = { cancelled: serverCancelled };
+      if (serverCancelled && this.exportAbortCtrl) {
+        this.exportAbortCtrl.abort();
+      }
+      return this.lastCancelResult;
+    })();
+    try {
+      return await this.cancelInFlight;
+    } finally {
+      this.cancelInFlight = null;
     }
-    if (serverCancelled && this.exportAbortCtrl) {
-      this.exportAbortCtrl.abort();
-    }
-    return { cancelled: serverCancelled };
   }
 
   /**
@@ -1810,6 +1824,8 @@ export class VideoEngine {
   async exportDeterministicMP4({ width, height, fps, crf, name, onProgress }) {
     this.pauseAllMedia();
     this.isExporting = true;
+    this.cancelInFlight = null;
+    this.lastCancelResult = null;
     this.exportAbortCtrl = new AbortController();
     const signal = this.exportAbortCtrl.signal;
 

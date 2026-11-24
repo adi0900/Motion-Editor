@@ -4361,8 +4361,13 @@ function setupUIEvents() {
     if (!file) return;
     try {
       const txt = await file.text();
-      // Validate JSON before prompting or discarding current edit
-      JSON.parse(txt);
+      // Validate BOTH JSON syntax AND MotionCut project schema BEFORE prompting or backing up!
+      const parsed = JSON.parse(txt);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Array.isArray(parsed.tracks)) {
+        showToast('Invalid MotionCut project file (missing tracks)');
+        e.target.value = '';
+        return;
+      }
       const hadContent = projectHasContent();
       if (hadContent && typeof window.confirm === 'function') {
         if (!window.confirm(`Open "${file.name}"? Your current edit will be backed up to Local Recovery.`)) {
@@ -4493,8 +4498,8 @@ function setupUIEvents() {
         let remainingPartners = 0;
         if (lg) {
           for (const tr of state.tracks) {
-            if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
+              if (p.id === f.clip.id) continue;
               if (p.linkGroupId === lg) {
                 if (!state.linkedSelection) {
                   p.linkGroupId = null;
@@ -4556,8 +4561,8 @@ function setupUIEvents() {
         let remainingPartners = 0;
         if (lg) {
           for (const tr of state.tracks) {
-            if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
+              if (p.id === f.clip.id) continue;
               if (p.linkGroupId === lg) {
                 if (!state.linkedSelection) {
                   p.linkGroupId = null;
