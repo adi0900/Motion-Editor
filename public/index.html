@@ -400,6 +400,7 @@
               <option value="9:16">9:16 Vertical</option>
               <option value="1:1">1:1 Square</option>
               <option value="4:5">4:5 Portrait</option>
+              <option value="21:9">21:9 Cinema</option>
             </select>
           </div>
           <div class="form-row">
@@ -459,6 +460,24 @@
     </div>
   </div>
 
+  <!-- SERVER PROJECTS MODAL -->
+  <div id="projectsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="projectsModalTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="projectsModalTitle">Open Project</h2>
+        <button id="btnProjectsClose" class="icon-btn" aria-label="Close projects modal">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="drawer-tip">Open a server-saved backup or load a local <code>.mcut.json</code> project file.</p>
+        <div id="serverProjectsList" class="relink-list"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="btnOpenLocalProjFile" class="btn-ghost">Browse Local .mcut.json…</button>
+        <button id="btnProjectsCancel" class="btn-export">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- KEYBOARD SHORTCUTS MODAL -->
   <div id="shortcutsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="shortcutsModalTitle">
     <div class="modal-card">
@@ -468,18 +487,19 @@
       </div>
       <div class="modal-body shortcuts-grid">
         <div class="sc-item"><span>Play / Pause</span><kbd>Space</kbd></div>
-        <div class="sc-item"><span>Select / Marquee Tool</span><kbd>V</kbd></div>
-        <div class="sc-item"><span>Razor Blade Tool</span><kbd>B</kbd></div>
+        <div class="sc-item"><span>Shuttle Rev / Pause / Fwd</span><kbd>J</kbd> / <kbd>K</kbd> / <kbd>L</kbd></div>
+        <div class="sc-item"><span>Select / Razor Tool</span><kbd>V</kbd> / <kbd>B</kbd></div>
         <div class="sc-item"><span>Split at Playhead</span><kbd>S</kbd> / <kbd>⌘B</kbd></div>
-        <div class="sc-item"><span>Save Project</span><kbd>⌘S</kbd></div>
-        <div class="sc-item"><span>Copy / Paste Clips</span><kbd>⌘C</kbd> / <kbd>⌘V</kbd></div>
-        <div class="sc-item"><span>Select All Clips</span><kbd>⌘A</kbd></div>
+        <div class="sc-item"><span>Trim Start / End to Playhead</span><kbd>Q</kbd> / <kbd>W</kbd></div>
+        <div class="sc-item"><span>Jump Prev / Next Cut</span><kbd>↑</kbd> / <kbd>↓</kbd></div>
+        <div class="sc-item"><span>Step 1 / 10 Frames</span><kbd>←/→</kbd> / <kbd>⇧←/→</kbd></div>
         <div class="sc-item"><span>Jump Start / End</span><kbd>Home</kbd> / <kbd>End</kbd></div>
-        <div class="sc-item"><span>Step Frame Back / Fwd</span><kbd>←</kbd> / <kbd>→</kbd></div>
-        <div class="sc-item"><span>Undo / Redo</span><kbd>⌘Z</kbd> / <kbd>⌘⇧Z</kbd></div>
-        <div class="sc-item"><span>Duplicate Clip</span><kbd>⌘D</kbd></div>
+        <div class="sc-item"><span>Save Project</span><kbd>⌘S</kbd></div>
+        <div class="sc-item"><span>Undo / Redo</span><kbd>⌘Z</kbd> / <kbd>⌘⇧Z</kbd> / <kbd>⌘Y</kbd></div>
+        <div class="sc-item"><span>Copy / Paste / Duplicate</span><kbd>⌘C</kbd> / <kbd>⌘V</kbd> / <kbd>⌘D</kbd></div>
+        <div class="sc-item"><span>Select All Clips</span><kbd>⌘A</kbd></div>
         <div class="sc-item"><span>Delete / Ripple Delete</span><kbd>⌫</kbd> / <kbd>⇧⌫</kbd></div>
-        <div class="sc-item"><span>Add Beat Marker</span><kbd>M</kbd></div>
+        <div class="sc-item"><span>Add Marker / Panels / Help</span><kbd>M</kbd> / <kbd>[ ]</kbd> / <kbd>?</kbd></div>
         <div class="sc-item"><span>Zoom Timeline</span><kbd>-</kbd> / <kbd>=</kbd> / <kbd>⌘Wheel</kbd></div>
       </div>
     </div>

@@ -532,10 +532,21 @@ function buildVolumeExpr(baseVol, kfs) {
     const v1 = Math.max(0, Math.min(2, Number(b.v)));
     const dt = Math.max(0.001, t1 - t0);
     const p = `min(1,max(0,(t-${t0.toFixed(3)})/${dt.toFixed(3)}))`;
-    let eased = p;
-    if (a.ease === 'easeIn') eased = `pow(${p},2)`;
-    else if (a.ease === 'easeOut') eased = `(1-pow(1-${p},2))`;
-    else if (a.ease === 'easeInOut') eased = `if(lt(${p},0.5),2*pow(${p},2),1-pow(-2*${p}+2,2)/2)`;
+    // Match engine.js identically: read b.ease || a.ease || 'easeInOut', cubic exponents + bounce
+    const easeKind = b.ease || a.ease || 'easeInOut';
+    let eased;
+    if (easeKind === 'linear') {
+      eased = p;
+    } else if (easeKind === 'easeIn') {
+      eased = `pow(${p},3)`;
+    } else if (easeKind === 'easeOut') {
+      eased = `(1-pow(1-${p},3))`;
+    } else if (easeKind === 'bounce') {
+      eased = `if(lt(${p},0.363636),7.5625*pow(${p},2),if(lt(${p},0.727273),7.5625*pow(${p}-0.545455,2)+0.75,if(lt(${p},0.909091),7.5625*pow(${p}-0.818182,2)+0.9375,7.5625*pow(${p}-0.954545,2)+0.984375)))`;
+    } else {
+      // easeInOut cubic (default)
+      eased = `if(lt(${p},0.5),4*pow(${p},3),1-pow(-2*${p}+2,3)/2)`;
+    }
     const seg = `(${v0.toFixed(3)}+(${(v1 - v0).toFixed(3)})*${eased})`;
     expr = `if(lt(t,${t1.toFixed(3)}),${seg},${expr})`;
   }
@@ -604,13 +615,15 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     postChain.push(`atrim=start=0:duration=${dur.toFixed(3)}`, 'asetpts=PTS-STARTPTS', 'aresample=48000:first_pts=0', 'aformat=sample_rates=48000:channel_layouts=stereo');
 
     if (curve !== 'none') {
-      // 20-segment piecewise speed-ramp audio matching engine.js 20-step integral
-      const N = 20;
+      // Adaptive piecewise speed-ramp audio (each segment >= 0.14s, exact padded duration -> 0ms tail loss)
+      const cU0 = Math.max(0, Math.min(1, Number(c.curveStartU ?? 0)));
+      const cU1 = Math.max(cU0 + 0.001, Math.min(1, Number(c.curveEndU ?? 1)));
+      const N = Math.max(4, Math.min(16, Math.round(dur / 0.14)));
       const segOutDur = dur / N;
       const segSpeeds = [];
       let totalSpan = 0;
       for (let k = 0; k < N; k++) {
-        const uMid = (k + 0.5) / N;
+        const uMid = cU0 + ((k + 0.5) / N) * (cU1 - cU0);
         const s = Math.max(0.25, Math.min(8, baseSpeed * evalRampSpeed(curve, uMid)));
         segSpeeds.push(s);
         totalSpan += segOutDur * s;
@@ -618,9 +631,6 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
       const clampedSpan = Math.max(0.04, Math.min(mediaDur - trimStart, totalSpan));
       const scaleFactor = totalSpan > 0 ? Math.min(1, clampedSpan / totalSpan) : 1;
 
-      // Trim span first; if reverse, reverse the trimmed span BEFORE applying the forward speed ramp
-      // so the audio speed curve matches engine.js (which maps u -> trimStart + span - integral(u)).
-      const prepLabel = `prep${idx}`;
       const prepFilters = [
         'aformat=sample_rates=48000:channel_layouts=stereo',
         `atrim=start=${trimStart.toFixed(4)}:duration=${clampedSpan.toFixed(4)}`,
@@ -635,14 +645,16 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
       const concatInputs = [];
       for (let k = 0; k < N; k++) {
         const segSpeed = segSpeeds[k];
-        const segSrcDur = Math.max(0.015, segOutDur * segSpeed * scaleFactor);
+        const segSrcDur = Math.max(0.02, segOutDur * segSpeed * scaleFactor);
         const effSpeed = Math.max(0.25, Math.min(8, segSrcDur / segOutDur));
-        const segStart = Math.min(Math.max(0, clampedSpan - 0.015), srcCursor);
-        const segDur = Math.max(0.015, Math.min(clampedSpan - segStart, segSrcDur));
+        const segStart = Math.min(Math.max(0, clampedSpan - 0.02), srcCursor);
+        const segDur = Math.max(0.02, Math.min(clampedSpan - segStart, segSrcDur));
         const segChain = [
           `atrim=start=${segStart.toFixed(4)}:duration=${segDur.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
           ...buildAtempoChain(effSpeed),
+          `apad=whole_dur=${segOutDur.toFixed(4)}`,
+          `atrim=start=0:duration=${segOutDur.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
         ];
         filterParts.push(`[s${idx}_${k}]${segChain.join(',')}[r${idx}_${k}]`);
@@ -695,10 +707,10 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
   try { fs.unlinkSync(videoOnlyPath); } catch {}
 }
 
-function cleanupExportJob(jobId, killProc = true) {
+function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   const job = exportJobs.get(jobId);
   if (!job) return false;
-  job.cancelled = true;
+  if (markCancelled) job.cancelled = true;
   exportJobs.delete(jobId);
   if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
     try { job.proc.stdin.destroy(); } catch {}
@@ -709,7 +721,7 @@ function cleanupExportJob(jobId, killProc = true) {
   }
   setTimeout(() => {
     try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
-    try { if (job.cancelled && fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+    try { if (markCancelled && fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
   }, 400);
   return true;
 }
@@ -751,13 +763,14 @@ async function readJsonBody(req, maxBytes = 262144) {
   const raw = (await readBodyBuffer(req, maxBytes)).toString('utf8');
   try {
     const parsed = JSON.parse(raw || '{}');
-    if (parsed === null || typeof parsed !== 'object') {
-      const err = new Error('JSON body must be an object');
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      const err = new Error('JSON body must be a plain object');
       err.statusCode = 400;
       throw err;
     }
     return parsed;
   } catch (e) {
+    if (e.statusCode) throw e;
     const err = new Error(`Invalid JSON body: ${e.message}`);
     err.statusCode = 400;
     throw err;
@@ -795,7 +808,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '3.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '4.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -871,15 +884,28 @@ const server = http.createServer(async (req, res) => {
       if (!fp.startsWith(PROJECTS_DIR + path.sep) || !fs.existsSync(fp)) {
         return sendJSON(res, 404, { error: 'Project not found' });
       }
-      const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      let data;
+      try {
+        data = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.tracks)) {
+          return sendJSON(res, 422, { error: 'Project file is corrupt or has an invalid schema' });
+        }
+      } catch {
+        return sendJSON(res, 422, { error: 'Project file contains corrupt JSON' });
+      }
       return sendJSON(res, 200, { fileName: fname, project: data });
     }
     if (p === '/api/projects' && req.method === 'POST') {
       if (!checkCsrfToken(req, res)) return;
       const body = await readJsonBody(req, 8 * 1024 * 1024);
+      if (!Array.isArray(body.tracks)) {
+        return sendJSON(res, 422, { error: 'Invalid project payload: tracks array is required' });
+      }
       const safe = String(body.title || 'project').replace(/[^a-zA-Z0-9._-]/g, '_');
       const fp = path.join(PROJECTS_DIR, `${safe}.mcut.json`);
-      fs.writeFileSync(fp, JSON.stringify(body, null, 2));
+      const tmp = `${fp}.tmp_${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
+      fs.renameSync(tmp, fp);
       return sendJSON(res, 200, { ok: true, fileName: path.basename(fp) });
     }
 
@@ -945,8 +971,13 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/export-frames/start' && req.method === 'POST') {
       if (!checkCsrfToken(req, res)) return;
       const body = await readJsonBody(req, 512 * 1024);
-      const width = Math.max(160, Math.min(4096, Math.round(Number(body.width ?? 1920) / 2) * 2));
-      const height = Math.max(160, Math.min(4096, Math.round(Number(body.height ?? 1080) / 2) * 2));
+      const rawW = Number(body.width ?? 1920);
+      const rawH = Number(body.height ?? 1080);
+      if (!Number.isFinite(rawW) || !Number.isFinite(rawH) || rawW < 160 || rawH < 160 || rawW > 5120 || rawH > 5120) {
+        return sendJSON(res, 400, { error: 'Invalid dimensions (160..5120)' });
+      }
+      const width = Math.round(rawW / 2) * 2;
+      const height = Math.round(rawH / 2) * 2;
       const fps = body.fps === undefined ? 30 : Number(body.fps);
       const crf = body.crf === undefined ? 17 : Number(body.crf);
       if (!Number.isFinite(fps) || fps < 1 || fps > 120) return sendJSON(res, 400, { error: 'Invalid FPS (1..120)' });
@@ -1084,10 +1115,11 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 409, { error: 'Export cancelled' });
         }
       } catch (err) {
-        cleanupExportJob(jobId, true);
+        const wasCancelled = Boolean(job.cancelled);
+        cleanupExportJob(jobId, true, wasCancelled);
         try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
         try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
-        return sendJSON(res, job.cancelled ? 409 : 500, { error: String(err.message || err) });
+        return sendJSON(res, wasCancelled ? 409 : 500, { error: String(err.message || err) });
       } finally {
         exportJobs.delete(jobId);
       }
@@ -1112,8 +1144,13 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req, 262144);
       const item = mediaMap.get(body.mediaId);
       if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Clip not found' });
-      const w = Math.max(160, Math.min(4096, Math.round(Number(body.width ?? 1920) / 2) * 2));
-      const h = Math.max(160, Math.min(4096, Math.round(Number(body.height ?? 1080) / 2) * 2));
+      const rawW = Number(body.width ?? 1920);
+      const rawH = Number(body.height ?? 1080);
+      if (!Number.isFinite(rawW) || !Number.isFinite(rawH) || rawW < 160 || rawH < 160 || rawW > 5120 || rawH > 5120) {
+        return sendJSON(res, 400, { error: 'Invalid dimensions (160..5120)' });
+      }
+      const w = Math.round(rawW / 2) * 2;
+      const h = Math.round(rawH / 2) * 2;
       const fps = body.fps === undefined ? 30 : Number(body.fps);
       const crf = body.crf === undefined ? 15 : Number(body.crf);
       if (!Number.isFinite(fps) || fps < 1 || fps > 120) return sendJSON(res, 400, { error: 'Invalid FPS (1..120)' });
@@ -1149,7 +1186,8 @@ const server = http.createServer(async (req, res) => {
           }
         }
       };
-      req.on('close', onClose);
+      // Listen on res.close (req.close already fired when readJsonBody consumed the body!)
+      res.on('close', onClose);
       try {
         await spawnFfmpegCancellable([
           '-y', '-v', 'error', '-ss', String(start), '-t', String(dur), '-i', item.filePath,
@@ -1162,7 +1200,7 @@ const server = http.createServer(async (req, res) => {
         try { if (fs.existsSync(outMp4)) fs.unlinkSync(outMp4); } catch {}
         return sendJSON(res, quickJob.cancelled ? 499 : 500, { error: String(err.message || err) });
       } finally {
-        req.off('close', onClose);
+        res.off('close', onClose);
       }
 
       const stat = fs.statSync(outMp4);

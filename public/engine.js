@@ -124,11 +124,14 @@ export function getSourceTime(clip, localTime, mediaDuration) {
   const dur = Math.max(0.04, Number(clip.duration) || 1);
   let srcOffset = 0;
   if (clip.speedCurve && clip.speedCurve !== 'none' && SPEED_CURVES[clip.speedCurve]?.pts) {
+    const u0 = Math.max(0, Math.min(1, Number(clip.curveStartU ?? 0)));
+    const u1 = Math.max(u0 + 0.0001, Math.min(1, Number(clip.curveEndU ?? 1)));
     const steps = 20;
     const clampedLocal = Math.max(0, Math.min(dur, localTime));
     const dt = clampedLocal / steps;
     for (let i = 0; i < steps; i++) {
-      const u = ((i + 0.5) * dt) / dur;
+      const frac = ((i + 0.5) * dt) / dur;
+      const u = u0 + frac * (u1 - u0);
       srcOffset += dt * baseSpeed * evalSpeedCurve(clip.speedCurve, u);
     }
   } else {
@@ -147,11 +150,14 @@ export function getClipSourceSpan(clip) {
   const baseSpeed = Math.max(0.1, Number(clip.speed) || 1);
   const dur = Math.max(0.04, Number(clip.duration) || 1);
   if (clip.speedCurve && clip.speedCurve !== 'none' && SPEED_CURVES[clip.speedCurve]?.pts) {
+    const u0 = Math.max(0, Math.min(1, Number(clip.curveStartU ?? 0)));
+    const u1 = Math.max(u0 + 0.0001, Math.min(1, Number(clip.curveEndU ?? 1)));
     const steps = 20;
     const dt = dur / steps;
     let total = 0;
     for (let i = 0; i < steps; i++) {
-      total += dt * baseSpeed * evalSpeedCurve(clip.speedCurve, (i + 0.5) / steps);
+      const u = u0 + ((i + 0.5) / steps) * (u1 - u0);
+      total += dt * baseSpeed * evalSpeedCurve(clip.speedCurve, u);
     }
     return total;
   }
@@ -192,6 +198,9 @@ export class VideoEngine {
     this.analyserL = null;
     this.analyserR = null;
     this.clipAudioNodes = new WeakMap(); // HTMLMediaElement -> WebAudio node bundle
+    this.decodedBuffers = new Map();     // mediaUrl -> AudioBuffer (or Promise)
+    this.reversedBuffers = new Map();    // mediaUrl -> reversed AudioBuffer
+    this.complexSources = new Map();     // clipId -> { src, gain, startedAt }
 
     // Reusable offscreen scratch canvases
     this.layerCanvas = document.createElement('canvas');
@@ -330,7 +339,47 @@ export class VideoEngine {
     }
   }
 
+  _stopComplexAudio(clipId) {
+    const entry = this.complexSources.get(clipId);
+    if (!entry) return;
+    try { entry.src.stop(); } catch {}
+    try { entry.src.disconnect(); entry.gain.disconnect(); } catch {}
+    this.complexSources.delete(clipId);
+  }
+
+  _stopAllComplexAudio() {
+    for (const id of [...this.complexSources.keys()]) this._stopComplexAudio(id);
+  }
+
+  _ensureDecodedBuffer(media, reverse = false) {
+    if (!this.audioCtx || !media?.url) return null;
+    const cacheKey = media.url;
+    const existing = this.decodedBuffers.get(cacheKey);
+    if (existing instanceof AudioBuffer) {
+      if (!reverse) return existing;
+      if (this.reversedBuffers.has(cacheKey)) return this.reversedBuffers.get(cacheKey);
+      const rev = this.audioCtx.createBuffer(existing.numberOfChannels, existing.length, existing.sampleRate);
+      for (let ch = 0; ch < existing.numberOfChannels; ch++) {
+        const s = existing.getChannelData(ch);
+        const d = rev.getChannelData(ch);
+        for (let i = 0, n = s.length; i < n; i++) d[i] = s[n - 1 - i];
+      }
+      this.reversedBuffers.set(cacheKey, rev);
+      return rev;
+    }
+    if (!existing) {
+      const p = fetch(media.url)
+        .then(r => r.arrayBuffer())
+        .then(ab => this.audioCtx.decodeAudioData(ab))
+        .then(buf => { this.decodedBuffers.set(cacheKey, buf); })
+        .catch(() => { this.decodedBuffers.delete(cacheKey); });
+      this.decodedBuffers.set(cacheKey, p);
+    }
+    return null;
+  }
+
   pauseAllMedia() {
+    this._stopAllComplexAudio();
     for (const el of this.mediaElements.values()) {
       if (el instanceof HTMLMediaElement && !el.paused) {
         try { el.pause(); } catch {}
@@ -339,13 +388,16 @@ export class VideoEngine {
   }
 
   pruneUnusedElements() {
-    const activeIds = new Set();
+    const activeKeys = new Set();
     for (const tr of this.state.tracks) {
-      for (const c of tr.clips) activeIds.add(c.id);
+      for (const c of tr.clips) {
+        if (!c.mediaId) continue;
+        const m = this.getMediaById(c.mediaId);
+        if (m) activeKeys.add(`${c.id}::${m.id}::${m.url}`);
+      }
     }
     for (const [key, el] of this.mediaElements.entries()) {
-      const cid = key.split('::')[0];
-      if (!activeIds.has(cid)) {
+      if (!activeKeys.has(key)) {
         if (el instanceof HTMLMediaElement) {
           try { el.pause(); el.removeAttribute('src'); el.load(); } catch {}
         }
@@ -373,10 +425,11 @@ export class VideoEngine {
     return { clipA: prev, prog, dur: td };
   }
 
-  syncMediaForTime(t, isPlaying) {
+  syncMediaForTime(t, isPlaying, shuttleSpeed = 1) {
     if (this.isExporting) return;
     if (isPlaying) this.ensureAudioCtx();
     const activeKeys = new Set();
+    const activeComplexIds = new Set();
 
     for (const track of this.state.tracks) {
       for (const clip of track.clips) {
@@ -460,13 +513,49 @@ export class VideoEngine {
         }
 
         if (isPlaying) {
-          if (isComplex) {
+          if (shuttleSpeed < 0) {
+            // Reverse shuttle (J): pause media element, mute audio, scrub frame cleanly
             if (!el.paused) el.pause();
             if (Math.abs((el.currentTime || 0) - target) > 0.025) {
               try { el.currentTime = target; } catch {}
             }
+          } else if (isComplex) {
+            // Reversed or speed-ramped clip: scrub video frame + play real WebAudio AudioBuffer!
+            if (!el.paused) el.pause();
+            if (Math.abs((el.currentTime || 0) - target) > 0.025) {
+              try { el.currentTime = target; } catch {}
+            }
+            if (media.hasAudio && vol > 0.001 && this.audioCtx) {
+              activeComplexIds.add(clip.id);
+              const buf = this._ensureDecodedBuffer(media, Boolean(clip.reverse));
+              if (buf) {
+                const u0 = Math.max(0, Math.min(1, Number(clip.curveStartU ?? 0)));
+                const u1 = Math.max(u0 + 0.0001, Math.min(1, Number(clip.curveEndU ?? 1)));
+                const u = u0 + Math.max(0, Math.min(1, localT / Math.max(0.04, clip.duration))) * (u1 - u0);
+                const liveRate = Math.max(0.25, Math.min(4, speed * (hasCurve ? evalSpeedCurve(clip.speedCurve, u) : 1) * shuttleSpeed));
+                let entry = this.complexSources.get(clip.id);
+                if (!entry) {
+                  const bufOffset = clip.reverse
+                    ? Math.max(0, Math.min(buf.duration - 0.02, buf.duration - target))
+                    : Math.max(0, Math.min(buf.duration - 0.02, target));
+                  const src = this.audioCtx.createBufferSource();
+                  src.buffer = buf;
+                  src.playbackRate.value = liveRate;
+                  const g = this.audioCtx.createGain();
+                  g.gain.value = Math.max(0, Math.min(2, vol));
+                  src.connect(g);
+                  g.connect(this.masterGain);
+                  try { src.start(0, bufOffset); } catch {}
+                  entry = { src, gain: g };
+                  this.complexSources.set(clip.id, entry);
+                } else {
+                  entry.src.playbackRate.setTargetAtTime(liveRate, this.audioCtx.currentTime, 0.02);
+                  entry.gain.gain.setTargetAtTime(Math.max(0, Math.min(2, vol)), this.audioCtx.currentTime, 0.02);
+                }
+              }
+            }
           } else {
-            const desiredRate = Math.max(0.25, Math.min(4, speed));
+            const desiredRate = Math.max(0.25, Math.min(4, speed * shuttleSpeed));
             if (Math.abs(el.playbackRate - desiredRate) > 0.01) el.playbackRate = desiredRate;
             if (Math.abs((el.currentTime || 0) - target) > 0.08) {
               try { el.currentTime = target; } catch {}
@@ -480,6 +569,10 @@ export class VideoEngine {
           }
         }
       }
+    }
+
+    for (const id of [...this.complexSources.keys()]) {
+      if (!isPlaying || !activeComplexIds.has(id)) this._stopComplexAudio(id);
     }
 
     for (const [key, el] of this.mediaElements.entries()) {
@@ -700,9 +793,9 @@ export class VideoEngine {
     this.layerCtx.clearRect(0, 0, baseW, baseH);
     this.layerCtxB.clearRect(0, 0, baseW, baseH);
 
-    // Outgoing clipA evaluated cleanly at t - clipA.start (uses handle if available or holds last frame)
-    this.drawMediaClip(this.layerCtx, clipA, t - clipA.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true);
-    this.drawMediaClip(this.layerCtxB, clipB, t - clipB.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true);
+    // Outgoing clipA evaluated cleanly at t - clipA.start (skipTransOut=true so transOut never blanks A!)
+    this.drawMediaClip(this.layerCtx, clipA, t - clipA.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true, true);
+    this.drawMediaClip(this.layerCtxB, clipB, t - clipB.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true, false);
 
     ctx.save();
     if (kind === 'crossfade') {
@@ -728,7 +821,7 @@ export class VideoEngine {
     } else if (kind === 'zoom-in') {
       const sA = 1 + ease * 0.28;
       ctx.save();
-      ctx.globalAlpha = 1 - ease;
+      ctx.globalAlpha = 1;
       ctx.translate(baseW / 2, baseH / 2); ctx.scale(sA, sA);
       ctx.drawImage(this.layerCanvas, -baseW / 2, -baseH / 2);
       ctx.restore();
@@ -742,7 +835,7 @@ export class VideoEngine {
       const bAmt = Math.sin(ease * Math.PI) * 18;
       ctx.save();
       ctx.filter = `blur(${bAmt.toFixed(1)}px)`;
-      ctx.globalAlpha = 1 - ease;
+      ctx.globalAlpha = 1;
       ctx.drawImage(this.layerCanvas, 0, 0);
       ctx.globalAlpha = ease;
       ctx.drawImage(this.layerCanvasB, 0, 0);
@@ -792,7 +885,7 @@ export class VideoEngine {
       // Anchor mask in clip-local transform space so moving/scaling/rotating a PiP moves its mask with it
       mctx.translate(W / 2 + clipX, H / 2 + clipY);
       mctx.rotate((clipRot * Math.PI) / 180);
-      mctx.scale(clipScale, clipScale);
+      mctx.scale(clipScale * (clip.flipH ? -1 : 1), clipScale * (clip.flipV ? -1 : 1));
       mctx.beginPath();
       if (mask.type === 'circle') {
         const r = Math.min(W, H) * ms * 0.55;
@@ -859,11 +952,12 @@ export class VideoEngine {
     return this.chromaCanvas;
   }
 
-  drawMediaClip(ctx, clip, localT, W, H, snap, isExport, extraAlpha = 1, extraX = 0, extraY = 0, extraScale = 1, skipTransIn = false) {
+  drawMediaClip(ctx, clip, localT, W, H, snap, isExport, extraAlpha = 1, extraX = 0, extraY = 0, extraScale = 1, skipTransIn = false, skipTransOut = false) {
+    const media = clip.mediaId ? this.getMediaById(clip.mediaId, snap) : null;
     const el = this.getOrCreateElement(clip, snap);
     const dims = this._mediaDims(el);
     if (!el || dims.w === 0 || dims.h === 0) {
-      if (clip.mediaId && this.erroredMedia.has(clip.mediaId)) {
+      if (clip.mediaId && (!media || media.missing || this.erroredMedia.has(clip.mediaId))) {
         ctx.save();
         ctx.fillStyle = '#2a1218';
         ctx.fillRect(0, 0, W, H);
@@ -901,7 +995,7 @@ export class VideoEngine {
       else if (clip.transIn === 'blur-dissolve') { opacity *= e; transFilterExtra = ` blur(${((1 - e) * 18).toFixed(1)}px)`; }
     }
     const rem = clip.duration - localT;
-    if (clip.transOut && clip.transOut !== 'none' && rem < (clip.transOutDur || 0.5)) {
+    if (!skipTransOut && clip.transOut && clip.transOut !== 'none' && rem < (clip.transOutDur || 0.5)) {
       const p = Math.max(0, Math.min(1, rem / Math.max(0.05, clip.transOutDur || 0.5)));
       const e = evalEasing('easeInOut', p);
       if (clip.transOut === 'crossfade') opacity *= e;
@@ -1380,8 +1474,9 @@ export class VideoEngine {
       const lines = this._wrapTextLines(ctx, clip.text || 'Text', maxWrapW);
       const measuredMax = Math.max(80, ...lines.map(l => ctx.measureText(l).width));
       ctx.restore();
-      const padX = clip.bgColor && clip.bgColor !== 'transparent' ? 44 : 28;
-      const padY = clip.bgColor && clip.bgColor !== 'transparent' ? 28 : 18;
+      const hasBg = (clip.bgAlpha || 0) > 0.01;
+      const padX = hasBg ? fs * 0.42 * 2 : 28;
+      const padY = hasBg ? fs * 0.24 * 2 : 18;
       const lineH = fs * 1.18;
       bw = Math.min(W * 0.94, measuredMax + padX);
       bh = Math.max(fs * 1.25, lines.length * lineH + padY);
@@ -1514,16 +1609,24 @@ export class VideoEngine {
     octx.restore();
   }
 
-  hitTestGizmo(px, py, t) {
+  hitTestGizmoHandles(px, py, t) {
     const sel = this.findSelectedClip();
     if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return null;
     const box = this.getClipBoundingBox(sel, t);
     const { corners, rotHandle } = this.getHandlePoints(box);
-
     if (Math.hypot(px - rotHandle.x, py - rotHandle.y) < 30) return { mode: 'rotate', clip: sel, box };
     for (const c of corners) {
       if (Math.hypot(px - c.x, py - c.y) < 28) return { mode: 'scale', clip: sel, box };
     }
+    return null;
+  }
+
+  hitTestGizmo(px, py, t) {
+    const h = this.hitTestGizmoHandles(px, py, t);
+    if (h) return h;
+    const sel = this.findSelectedClip();
+    if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return null;
+    const box = this.getClipBoundingBox(sel, t);
     const dx = px - box.cx, dy = py - box.cy;
     const rad = (-box.rot * Math.PI) / 180;
     const lx = dx * Math.cos(rad) - dy * Math.sin(rad);
@@ -1634,6 +1737,7 @@ export class VideoEngine {
     // Preflight: block export if any active timeline clip references offline/missing media
     const missingClips = [];
     for (const tr of snap.tracks) {
+      if (tr.type === 'audio' && tr.muted) continue;
       if (tr.hidden && tr.muted) continue;
       for (const c of tr.clips) {
         if (!c.mediaId) continue;
@@ -1665,20 +1769,27 @@ export class VideoEngine {
         if (!c.mediaId || c.muted) continue;
         const m = snap.library.find(x => x.id === c.mediaId);
         if (!m || !m.hasAudio) continue;
-        // Include A->B overlap crossfade matching preview: extend outgoing clip A's tail by transDur
+        // Include A->B overlap crossfade matching preview on normal constant-speed clips with handle
         let fadeIn = c.fadeIn || 0;
         let fadeOut = c.fadeOut || 0;
         let expDuration = c.duration;
+        const isRampedOrRev = Boolean(c.reverse) || (c.speedCurve && c.speedCurve !== 'none');
         if ((tr.type === 'video' || tr.type === 'overlay') && c.transIn && c.transIn !== 'none') {
           const prev = tr.clips.find(p => p.id !== c.id && Math.abs((p.start + p.duration) - c.start) <= 0.06);
           if (prev) fadeIn = Math.max(fadeIn, Math.min(c.transInDur || 0.5, c.duration * 0.5));
         }
-        if (tr.type === 'video' || tr.type === 'overlay') {
+        if ((tr.type === 'video' || tr.type === 'overlay') && !isRampedOrRev) {
           const next = tr.clips.find(n => n.id !== c.id && n.transIn && n.transIn !== 'none' && Math.abs((c.start + c.duration) - n.start) <= 0.06);
           if (next) {
             const td = Math.min(next.transInDur || 0.5, next.duration * 0.5);
-            expDuration = c.duration + td;
-            fadeOut = Math.max(fadeOut, td);
+            const availHandle = Math.max(0, (m.duration - ((c.trimStart || 0) + c.duration * (c.speed || 1))) / (c.speed || 1));
+            const ext = Math.min(td, availHandle);
+            if (ext > 0.02) {
+              expDuration = c.duration + ext;
+              fadeOut = Math.max(fadeOut, ext);
+            } else {
+              fadeOut = Math.max(fadeOut, td);
+            }
           }
         }
         audioClips.push({
@@ -1688,6 +1799,8 @@ export class VideoEngine {
           trimStart: c.trimStart || 0,
           speed: c.speed || 1,
           speedCurve: c.speedCurve || 'none',
+          curveStartU: c.curveStartU ?? 0,
+          curveEndU: c.curveEndU ?? 1,
           reverse: Boolean(c.reverse),
           volume: c.volume ?? 1,
           volumeKeyframes: c.keyframes?.volume || [],
