@@ -339,6 +339,59 @@ export class VideoEngine {
     }
   }
 
+  _applyAudioFxParams(nodes, clip, vol) {
+    if (!nodes || !this.audioCtx) return;
+    nodes.gain.gain.setTargetAtTime(Math.max(0, Math.min(2, vol)), this.audioCtx.currentTime, 0.015);
+    nodes.low.gain.value = clip.eqBass || 0;
+    nodes.high.gain.value = clip.eqTreble || 0;
+    const vfx = clip.voiceFx || 'none';
+    if (vfx === 'radio') {
+      nodes.band.type = 'bandpass'; nodes.band.frequency.value = 1350; nodes.band.Q.value = 1.6;
+      nodes.fxTone.type = 'allpass';
+      nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+    } else if (vfx === 'deep') {
+      nodes.band.type = 'lowshelf'; nodes.band.frequency.value = 240; nodes.band.gain.value = 12;
+      nodes.fxTone.type = 'lowpass'; nodes.fxTone.frequency.value = 1900;
+      nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+    } else if (vfx === 'chipmunk') {
+      nodes.band.type = 'highpass'; nodes.band.frequency.value = 520;
+      nodes.fxTone.type = 'peaking'; nodes.fxTone.frequency.value = 3400; nodes.fxTone.gain.value = 10;
+      nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+    } else if (vfx === 'echo') {
+      nodes.band.type = 'allpass'; nodes.fxTone.type = 'allpass';
+      nodes.delay.delayTime.value = 0.12;
+      nodes.delayFb.gain.value = 0.38;
+      nodes.delayWet.gain.value = 0.55;
+    } else {
+      nodes.band.type = 'allpass'; nodes.fxTone.type = 'allpass';
+      nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+    }
+  }
+
+  _buildFxChain(srcNode) {
+    const ac = this.audioCtx;
+    const low = ac.createBiquadFilter(); low.type = 'lowshelf'; low.frequency.value = 180;
+    const high = ac.createBiquadFilter(); high.type = 'highshelf'; high.frequency.value = 4200;
+    const band = ac.createBiquadFilter(); band.type = 'allpass'; band.frequency.value = 1200; band.Q.value = 1.2;
+    const fxTone = ac.createBiquadFilter(); fxTone.type = 'allpass'; fxTone.frequency.value = 1000;
+    const delay = ac.createDelay(0.5); delay.delayTime.value = 0.12;
+    const delayFb = ac.createGain(); delayFb.gain.value = 0;
+    const delayWet = ac.createGain(); delayWet.gain.value = 0;
+    const gain = ac.createGain();
+    srcNode.connect(low);
+    low.connect(high);
+    high.connect(band);
+    band.connect(fxTone);
+    fxTone.connect(gain);
+    fxTone.connect(delay);
+    delay.connect(delayFb);
+    delayFb.connect(delay);
+    delay.connect(delayWet);
+    delayWet.connect(gain);
+    gain.connect(this.masterGain);
+    return { src: srcNode, low, high, band, fxTone, delay, delayFb, delayWet, gain };
+  }
+
   _stopComplexAudio(clipId) {
     const entry = this.complexSources.get(clipId);
     if (!entry) return;
@@ -532,8 +585,14 @@ export class VideoEngine {
                 const u0 = Math.max(0, Math.min(1, Number(clip.curveStartU ?? 0)));
                 const u1 = Math.max(u0 + 0.0001, Math.min(1, Number(clip.curveEndU ?? 1)));
                 const u = u0 + Math.max(0, Math.min(1, localT / Math.max(0.04, clip.duration))) * (u1 - u0);
-                const liveRate = Math.max(0.25, Math.min(4, speed * (hasCurve ? evalSpeedCurve(clip.speedCurve, u) : 1) * shuttleSpeed));
+                const liveRate = Math.max(0.25, Math.min(8, speed * (hasCurve ? evalSpeedCurve(clip.speedCurve, u) : 1) * shuttleSpeed));
                 let entry = this.complexSources.get(clip.id);
+                // Restart AudioBufferSource on seek/loop jump (>0.10s discontinuity) or reverse toggle!
+                const jumped = entry && (entry.reverse !== Boolean(clip.reverse) || Math.abs(t - entry.lastTimelineT) > 0.10);
+                if (jumped) {
+                  this._stopComplexAudio(clip.id);
+                  entry = null;
+                }
                 if (!entry) {
                   const bufOffset = clip.reverse
                     ? Math.max(0, Math.min(buf.duration - 0.02, buf.duration - target))
@@ -541,16 +600,15 @@ export class VideoEngine {
                   const src = this.audioCtx.createBufferSource();
                   src.buffer = buf;
                   src.playbackRate.value = liveRate;
-                  const g = this.audioCtx.createGain();
-                  g.gain.value = Math.max(0, Math.min(2, vol));
-                  src.connect(g);
-                  g.connect(this.masterGain);
+                  const chain = this._buildFxChain(src);
+                  this._applyAudioFxParams(chain, clip, vol);
                   try { src.start(0, bufOffset); } catch {}
-                  entry = { src, gain: g };
+                  entry = { ...chain, reverse: Boolean(clip.reverse), lastTimelineT: t };
                   this.complexSources.set(clip.id, entry);
                 } else {
                   entry.src.playbackRate.setTargetAtTime(liveRate, this.audioCtx.currentTime, 0.02);
-                  entry.gain.gain.setTargetAtTime(Math.max(0, Math.min(2, vol)), this.audioCtx.currentTime, 0.02);
+                  this._applyAudioFxParams(entry, clip, vol);
+                  entry.lastTimelineT = t;
                 }
               }
             }
@@ -849,11 +907,16 @@ export class VideoEngine {
         ctx.drawImage(this.layerCanvasB, 0, 0);
       }
     } else if (kind === 'flash') {
-      ctx.drawImage(ease < 0.5 ? this.layerCanvas : this.layerCanvasB, 0, 0);
+      // Scope white flash to the active layer's alpha via source-atop so PiP overlays never flash V1!
+      const srcC = ease < 0.5 ? this.layerCanvas : this.layerCanvasB;
+      const srcCtx = ease < 0.5 ? this.layerCtx : this.layerCtxB;
       const peak = 1 - Math.abs(ease - 0.5) * 2;
-      // Scoped white flash using clip alpha (via source-atop on offscreen or bounded rect)
-      ctx.fillStyle = `rgba(255,255,255,${(peak * 0.92).toFixed(3)})`;
-      ctx.fillRect(0, 0, baseW, baseH);
+      srcCtx.save();
+      srcCtx.globalCompositeOperation = 'source-atop';
+      srcCtx.fillStyle = `rgba(255,255,255,${(peak * 0.92).toFixed(3)})`;
+      srcCtx.fillRect(0, 0, baseW, baseH);
+      srcCtx.restore();
+      ctx.drawImage(srcC, 0, 0);
     } else {
       ctx.drawImage(this.layerCanvasB, 0, 0);
     }
@@ -1636,8 +1699,8 @@ export class VideoEngine {
   }
 
   hitTestAnyClip(px, py, t) {
-    // state.tracks is ordered top-to-bottom (Text -> Overlay -> Main Video), exact reverse of draw order
-    const layers = this.state.tracks.filter(tr => !tr.hidden && tr.type !== 'audio');
+    // state.tracks is ordered top-to-bottom (Text -> Overlay -> Main Video); skip hidden & locked tracks
+    const layers = this.state.tracks.filter(tr => !tr.hidden && !tr.locked && tr.type !== 'audio');
     for (const tr of layers) {
       for (let i = tr.clips.length - 1; i >= 0; i--) {
         const clip = tr.clips[i];

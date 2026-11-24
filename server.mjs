@@ -542,12 +542,13 @@ function buildVolumeExpr(baseVol, kfs) {
     } else if (easeKind === 'easeOut') {
       eased = `(1-pow(1-${p},3))`;
     } else if (easeKind === 'bounce') {
-      eased = `if(lt(${p},0.363636),7.5625*pow(${p},2),if(lt(${p},0.727273),7.5625*pow(${p}-0.545455,2)+0.75,if(lt(${p},0.909091),7.5625*pow(${p}-0.818182,2)+0.9375,7.5625*pow(${p}-0.954545,2)+0.984375)))`;
+      // Exact cubic easeOutBack matching engine.js:77-81 (clamped to [0, 2])
+      eased = `(1+2.70158*pow(${p}-1,3)+1.70158*pow(${p}-1,2))`;
     } else {
       // easeInOut cubic (default)
       eased = `if(lt(${p},0.5),4*pow(${p},3),1-pow(-2*${p}+2,3)/2)`;
     }
-    const seg = `(${v0.toFixed(3)}+(${(v1 - v0).toFixed(3)})*${eased})`;
+    const seg = `min(2,max(0,${v0.toFixed(3)}+(${(v1 - v0).toFixed(3)})*${eased}))`;
     expr = `if(lt(t,${t1.toFixed(3)}),${seg},${expr})`;
   }
   expr = `if(lt(t,${Number(sorted[0].t).toFixed(3)}),${clampV(sorted[0].v)},${expr})`;
@@ -631,9 +632,12 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
       const clampedSpan = Math.max(0.04, Math.min(mediaDur - trimStart, totalSpan));
       const scaleFactor = totalSpan > 0 ? Math.min(1, clampedSpan / totalSpan) : 1;
 
+      // Read extra +0.08s lookahead into prep so WSOLA atempo never runs dry and produces ZERO silent gaps!
+      const lookahead = 0.08;
+      const prepDur = Math.max(0.04, Math.min(mediaDur - trimStart, clampedSpan + lookahead));
       const prepFilters = [
         'aformat=sample_rates=48000:channel_layouts=stereo',
-        `atrim=start=${trimStart.toFixed(4)}:duration=${clampedSpan.toFixed(4)}`,
+        `atrim=start=${trimStart.toFixed(4)}:duration=${prepDur.toFixed(4)}`,
         'asetpts=PTS-STARTPTS',
       ];
       if (c.reverse) prepFilters.push('areverse', 'asetpts=PTS-STARTPTS');
@@ -647,13 +651,13 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
         const segSpeed = segSpeeds[k];
         const segSrcDur = Math.max(0.02, segOutDur * segSpeed * scaleFactor);
         const effSpeed = Math.max(0.25, Math.min(8, segSrcDur / segOutDur));
-        const segStart = Math.min(Math.max(0, clampedSpan - 0.02), srcCursor);
-        const segDur = Math.max(0.02, Math.min(clampedSpan - segStart, segSrcDur));
+        const segStart = Math.min(Math.max(0, prepDur - 0.02), srcCursor);
+        // Feed extra lookahead samples to atempo so it outputs >= segOutDur with 0ms silence dropout
+        const segReadDur = Math.max(0.02, Math.min(prepDur - segStart, segSrcDur + lookahead * effSpeed));
         const segChain = [
-          `atrim=start=${segStart.toFixed(4)}:duration=${segDur.toFixed(4)}`,
+          `atrim=start=${segStart.toFixed(4)}:duration=${segReadDur.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
           ...buildAtempoChain(effSpeed),
-          `apad=whole_dur=${segOutDur.toFixed(4)}`,
           `atrim=start=0:duration=${segOutDur.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
         ];
@@ -688,10 +692,12 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     mixLabels.push(`[${lbl}]`);
   });
 
+  // Always apply fast transparent limiter (0.5ms attack -> <1ms latency, zero single- or multi-clip clipping!)
+  const limiter = 'alimiter=limit=0.92:level=disabled:attack=0.5:release=40';
   if (mixLabels.length === 1) {
-    filterParts.push(`${mixLabels[0]}apad=whole_dur=${totalDuration.toFixed(4)},atrim=start=0:duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`);
+    filterParts.push(`${mixLabels[0]}${limiter},apad=whole_dur=${totalDuration.toFixed(4)},atrim=start=0:duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`);
   } else {
-    filterParts.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:normalize=0,alimiter=limit=0.95:level=disabled:attack=5:release=50,apad=whole_dur=${totalDuration.toFixed(4)},atrim=start=0:duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`);
+    filterParts.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:normalize=0,${limiter},apad=whole_dur=${totalDuration.toFixed(4)},atrim=start=0:duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`);
   }
 
   args.push(
@@ -808,7 +814,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '4.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '5.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -898,8 +904,9 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/projects' && req.method === 'POST') {
       if (!checkCsrfToken(req, res)) return;
       const body = await readJsonBody(req, 8 * 1024 * 1024);
-      if (!Array.isArray(body.tracks)) {
-        return sendJSON(res, 422, { error: 'Invalid project payload: tracks array is required' });
+      const validTypes = new Set(['video', 'overlay', 'text', 'graphic', 'audio']);
+      if (!Array.isArray(body.tracks) || body.tracks.some(tr => !tr || typeof tr !== 'object' || Array.isArray(tr) || !validTypes.has(tr.type) || !Array.isArray(tr.clips))) {
+        return sendJSON(res, 422, { error: 'Invalid project payload: every track must be a valid object with type and clips array' });
       }
       const safe = String(body.title || 'project').replace(/[^a-zA-Z0-9._-]/g, '_');
       const fp = path.join(PROJECTS_DIR, `${safe}.mcut.json`);
@@ -1101,7 +1108,12 @@ const server = http.createServer(async (req, res) => {
         cleanupExportJob(jobId, true);
         return sendJSON(res, 400, { error: 'No frames were pushed to export job' });
       }
+      if (job.finishing) {
+        return sendJSON(res, 409, { error: 'Export is already finalizing' });
+      }
+      job.finishing = true;
       job.lastActivity = Date.now();
+      const heartbeat = setInterval(() => { job.lastActivity = Date.now(); }, 15000);
       try {
         job.proc.stdin.end();
         await job.donePromise;
@@ -1121,6 +1133,7 @@ const server = http.createServer(async (req, res) => {
         try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
         return sendJSON(res, wasCancelled ? 409 : 500, { error: String(err.message || err) });
       } finally {
+        clearInterval(heartbeat);
         exportJobs.delete(jobId);
       }
       const stat = fs.statSync(job.finalPath);
@@ -1269,6 +1282,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v3 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v5 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

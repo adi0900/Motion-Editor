@@ -122,6 +122,9 @@ function validateProjectObject(d) {
     return out;
   };
   const validTrackTypes = new Set(['video', 'overlay', 'text', 'graphic', 'audio']);
+  const seenClipIds = new Set();
+  const validFitModes = new Set(['contain', 'cover', 'stretch']);
+  const validCurves = new Set(Object.keys(SPEED_CURVES));
   const tracks = Array.isArray(d.tracks) ? d.tracks.filter(tr => tr && typeof tr === 'object' && validTrackTypes.has(tr.type)).map(tr => ({
     id: safeStr(tr.id, uid('tr')),
     name: safeStr(tr.name, 'Track'),
@@ -132,17 +135,27 @@ function validateProjectObject(d) {
     locked: Boolean(tr.locked),
     clips: Array.isArray(tr.clips) ? tr.clips.filter(c => c && typeof c === 'object').map(c => {
       const def = createDefaultClip({});
+      let cid = safeStr(c.id, uid('clip'));
+      if (seenClipIds.has(cid)) cid = uid('clip');
+      seenClipIds.add(cid);
       return {
         ...def,
         ...c,
-        id: safeStr(c.id, uid('clip')),
+        id: cid,
         name: safeStr(c.name, 'Clip'),
         start: safeNum(c.start, 0, 0, 86400),
         duration: safeNum(c.duration, 1, 0.04, 86400),
         trimStart: safeNum(c.trimStart, 0, 0, 86400),
         speed: safeNum(c.speed, 1, 0.1, 16),
+        speedCurve: validCurves.has(c.speedCurve) ? c.speedCurve : 'none',
         curveStartU: safeNum(c.curveStartU, 0, 0, 1),
         curveEndU: safeNum(c.curveEndU, 1, 0.001, 1),
+        x: safeNum(c.x, 0, -8000, 8000),
+        y: safeNum(c.y, 0, -8000, 8000),
+        rotation: safeNum(c.rotation, 0, -3600, 3600),
+        fitMode: validFitModes.has(c.fitMode) ? c.fitMode : 'contain',
+        transInDur: safeNum(c.transInDur, 0.5, 0.05, 5),
+        transOutDur: safeNum(c.transOutDur, 0.5, 0.05, 5),
         volume: safeNum(c.volume, 1, 0, 2),
         opacity: safeNum(c.opacity, 1, 0, 1),
         scale: safeNum(c.scale, 1, 0.05, 10),
@@ -1245,6 +1258,8 @@ function attachClipInteractions(el, clip, track, hL, hR) {
       start: x.clip.start,
       duration: x.clip.duration,
       trimStart: x.clip.trimStart || 0,
+      curveStartU: Number(x.clip.curveStartU ?? 0),
+      curveEndU: Number(x.clip.curveEndU ?? 1),
       keyframes: structuredClone(x.clip.keyframes || {}),
     }]));
 
@@ -1265,8 +1280,17 @@ function attachClipInteractions(el, clip, track, hL, hR) {
       return dstTrack.type === 'video' || dstTrack.type === 'overlay';
     };
 
+  // Check if the selection is a single logical unit (1 clip OR 1 primary clip + its linked partners)
+    const isSingleLogicalUnit = initMap.size === 1 || (
+      Boolean(clip.linkGroupId) && [...initMap.values()].every(x => x.clip.linkGroupId === clip.linkGroupId)
+    );
+    const linkedPartners = clip.linkGroupId
+      ? state.tracks.flatMap(tr => tr.locked ? [] : tr.clips.filter(p => p.id !== clip.id && p.linkGroupId === clip.linkGroupId).map(p => ({ clip: p, track: tr, origStart: p.start, origDur: p.duration, origTrim: p.trimStart || 0, origU0: Number(p.curveStartU ?? 0), origU1: Number(p.curveEndU ?? 1) })))
+      : [];
+
     let moved = false;
     let hoverTargetTrack = null;
+    let lastDropTime = clip.start;
 
     const onMove = (ev) => {
       // Drag-edge autoscroll
@@ -1286,10 +1310,23 @@ function attachClipInteractions(el, clip, track, hL, hR) {
           item.clip.start = quantize(Math.max(0, item.start + appliedDt));
           if (item.el) item.el.style.left = `${item.clip.start * state.zoom}px`;
         }
-        // Detect vertical cross-track drag target (when moving a single clip)
+        // Compute pointer drop time for Magnetic Main Track insert-before + visual insertion bar
+        const laneRect = el.parentElement.getBoundingClientRect();
+        lastDropTime = Math.max(0, (ev.clientX - laneRect.left) / state.zoom);
+        if (isSingleLogicalUnit && track.type === 'video' && state.magnetMain) {
+          const others = track.clips.filter(c => c.id !== clip.id).sort((a, b) => a.start - b.start);
+          let insX = others.reduce((m, c) => Math.max(m, c.start + c.duration), 0);
+          for (const o of others) {
+            if (lastDropTime < o.start + o.duration * 0.5) { insX = o.start; break; }
+          }
+          const sg = $('#snapGuide');
+          sg.style.left = `${insX * state.zoom}px`;
+          sg.classList.remove('hidden');
+        }
+        // Detect vertical cross-track drag target (works for single clip OR single linked unit!)
         $$('.track-lane.drop-target').forEach(l => l.classList.remove('drop-target'));
         hoverTargetTrack = null;
-        if (initMap.size === 1) {
+        if (isSingleLogicalUnit) {
           const lanes = $$('.track-lane[data-track-id]');
           for (const lane of lanes) {
             const lr = lane.getBoundingClientRect();
@@ -1309,20 +1346,38 @@ function attachClipInteractions(el, clip, track, hL, hR) {
       } else if (mode === 'trimL') {
         const orig = initMap.get(clip.id);
         const speed = clip.speed || 1;
+        const avgMult = (clip.speedCurve && clip.speedCurve !== 'none') ? (getClipSourceSpan({ ...clip, duration: orig.duration, curveStartU: orig.curveStartU ?? 0, curveEndU: orig.curveEndU ?? 1 }) / Math.max(0.04, orig.duration)) : speed;
         const maxTrimIn = orig.duration - 0.12;
-        const maxExtendByNeighbor = prevNeighborEnd - orig.start; // <= 0
+        const maxExtendByNeighbor = prevNeighborEnd - orig.start;
         const maxExtendBySource = clip.reverse
-          ? -Math.max(0, (clip.sourceDuration - (orig.trimStart + orig.duration * speed)) / speed)
-          : -(orig.trimStart / speed);
+          ? -Math.max(0, (clip.sourceDuration - (orig.trimStart + orig.duration * avgMult)) / Math.max(0.1, avgMult))
+          : -(orig.trimStart / Math.max(0.1, avgMult));
         const minDelta = Math.max(maxExtendByNeighbor, maxExtendBySource);
         let delta = Math.max(minDelta, Math.min(maxTrimIn, dt));
         const snappedStart = snapBothEdges(Math.max(prevNeighborEnd, orig.start + delta), orig.duration - delta, excludeIds);
         delta = Math.max(minDelta, Math.min(maxTrimIn, snappedStart - orig.start));
         clip.start = quantize(orig.start + delta);
         clip.duration = quantize(orig.duration - delta);
-        // Forward clips advance trimStart on left-trim; reversed clips keep trimStart (playback end) fixed!
         if (!clip.reverse) {
-          clip.trimStart = Math.max(0, orig.trimStart + delta * speed);
+          const baseClip = { ...clip, duration: orig.duration, trimStart: orig.trimStart, curveStartU: orig.curveStartU ?? 0, curveEndU: orig.curveEndU ?? 1 };
+          clip.trimStart = delta >= 0
+            ? Math.max(0, getSourceTime(baseClip, delta, clip.sourceDuration))
+            : Math.max(0, orig.trimStart + delta * avgMult);
+        }
+        if (clip.speedCurve && clip.speedCurve !== 'none') {
+          const u0 = Number(orig.curveStartU ?? 0), u1 = Number(orig.curveEndU ?? 1);
+          clip.curveStartU = Math.max(0, Math.min(u1 - 0.01, u0 + (delta / Math.max(0.04, orig.duration)) * (u1 - u0)));
+        }
+        // Sync linked partner clips identically on left-trim!
+        if (state.linkedSelection) {
+          for (const lp of linkedPartners) {
+            lp.clip.start = quantize(Math.max(0, lp.origStart + delta));
+            lp.clip.duration = quantize(Math.max(0.12, lp.origDur - delta));
+            if (!lp.clip.reverse) lp.clip.trimStart = Math.max(0, lp.origTrim + delta * avgMult);
+            if (lp.clip.speedCurve && lp.clip.speedCurve !== 'none') {
+              lp.clip.curveStartU = Math.max(0, Math.min(lp.origU1 - 0.01, lp.origU0 + (delta / Math.max(0.04, lp.origDur)) * (lp.origU1 - lp.origU0)));
+            }
+          }
         }
         // Rebase keyframes smoothly on left-trim (preserving exact boundary value at t=0!)
         const rebased = {};
@@ -1345,11 +1400,10 @@ function attachClipInteractions(el, clip, track, hL, hR) {
       } else if (mode === 'trimR') {
         const orig = initMap.get(clip.id);
         const speed = clip.speed || 1;
-        // On Magnetic Main Track, right-trim extends freely up to source media and pushes later clips!
         const allowRippleExtend = track.type === 'video' && state.magnetMain;
         const maxDurByNeighbor = (!allowRippleExtend && Number.isFinite(nextNeighborStart))
           ? Math.max(0.12, nextNeighborStart - orig.start) : Infinity;
-        const avgMult = (clip.speedCurve && clip.speedCurve !== 'none') ? (getClipSourceSpan(clip) / Math.max(0.04, clip.duration)) : speed;
+        const avgMult = (clip.speedCurve && clip.speedCurve !== 'none') ? (getClipSourceSpan({ ...clip, duration: orig.duration, curveStartU: orig.curveStartU ?? 0, curveEndU: orig.curveEndU ?? 1 }) / Math.max(0.04, orig.duration)) : speed;
         const maxDurBySource = (clip.type === 'text' || clip.type === 'image' || clip.type === 'graphic')
           ? 300
           : (clip.reverse
@@ -1367,7 +1421,26 @@ function attachClipInteractions(el, clip, track, hL, hR) {
           const endSrc = orig.trimStart + orig.duration * avgMult;
           clip.trimStart = Math.max(0, endSrc - nextDur * avgMult);
         }
+        if (clip.speedCurve && clip.speedCurve !== 'none') {
+          const u0 = Number(orig.curveStartU ?? 0), u1 = Number(orig.curveEndU ?? 1);
+          clip.curveEndU = Math.max(u0 + 0.01, Math.min(1, u0 + (nextDur / Math.max(0.04, orig.duration)) * (u1 - u0)));
+        }
         clip.duration = nextDur;
+        // Sync linked partner clips identically on right-trim!
+        if (state.linkedSelection) {
+          const durDelta = nextDur - orig.duration;
+          for (const lp of linkedPartners) {
+            const pNextDur = quantize(Math.max(0.12, lp.origDur + durDelta));
+            if (lp.clip.reverse) {
+              const pEndSrc = lp.origTrim + lp.origDur * avgMult;
+              lp.clip.trimStart = Math.max(0, pEndSrc - pNextDur * avgMult);
+            }
+            if (lp.clip.speedCurve && lp.clip.speedCurve !== 'none') {
+              lp.clip.curveEndU = Math.max(lp.origU0 + 0.01, Math.min(1, lp.origU0 + (pNextDur / Math.max(0.04, lp.origDur)) * (lp.origU1 - lp.origU0)));
+            }
+            lp.clip.duration = pNextDur;
+          }
+        }
         el.style.width = `${Math.max(14, clip.duration * state.zoom)}px`;
         showDragHud((clip.start + clip.duration) * state.zoom, el.parentElement.offsetTop, `Out ${formatTC(clip.start + clip.duration, state.fps)} · Dur ${clip.duration.toFixed(2)}s`);
       }
@@ -1389,11 +1462,16 @@ function attachClipInteractions(el, clip, track, hL, hR) {
             showToast(`Moved "${clip.name}" to ${hoverTargetTrack.name}`);
           }
           const finalTrack = initMap.get(clip.id).track;
-          if (initMap.size === 1 && finalTrack.type === 'video' && state.magnetMain) {
-            // CapCut Magnetic Main Track reorder / insert-before!
-            insertOrReorderOnMainTrack(finalTrack, clip, clip.start);
+          if (isSingleLogicalUnit && finalTrack.type === 'video' && state.magnetMain) {
+            // Reset partner starts to their pre-drag starts so insertOrReorderOnMainTrack shifts them cleanly once!
+            for (const item of initMap.values()) {
+              if (item.clip.id !== clip.id) item.clip.start = item.start;
+            }
+            // Also reset clip.start to its pre-drag start before computing delta inside insertOrReorderOnMainTrack
+            const origStart = initMap.get(clip.id).start;
+            clip.start = origStart;
+            insertOrReorderOnMainTrack(finalTrack, clip, lastDropTime);
           } else {
-            // Resolve accidental same-track overlaps cleanly
             for (const item of initMap.values()) {
               const others = new Set(item.track.clips.filter(c => excludeIds.has(c.id)).map(c => c.id));
               if (hasOverlap(item.track, item.clip.start, item.clip.duration, others)) {
@@ -1675,23 +1753,34 @@ function deleteSelectedClips(ripple = false) {
   }
 
   if (ripple) {
-    // Process each deleted range descending by start time so multi-clip ripple closes EVERY gap cleanly!
-    const hasMainVideo = unlocked.some(x => x.track.type === 'video');
-    const deletedRanges = [...unlocked]
+    // Deduplicate linked/overlapping ranges so linked A/V deletion NEVER double-shifts downstream audio!
+    const mainDeleted = unlocked.filter(x => x.track.type === 'video');
+    const mainLinkGroups = new Set(mainDeleted.map(x => x.clip.linkGroupId).filter(Boolean));
+    const hasMainVideo = mainDeleted.length > 0;
+    const filteredUnlocked = unlocked.filter(x => {
+      if (x.track.type === 'video') return true;
+      if (state.linkedSelection && hasMainVideo) {
+        // Skip partner already covered by a deleted Main V1 clip or contained inside a deleted Main V1 interval
+        if (x.clip.linkGroupId && mainLinkGroups.has(x.clip.linkGroupId)) return false;
+        const cStart = x.clip.start, cEnd = x.clip.start + x.clip.duration;
+        if (mainDeleted.some(m => cStart >= m.clip.start - 0.01 && cEnd <= m.clip.start + m.clip.duration + 0.01)) return false;
+      }
+      return true;
+    });
+
+    const deletedRanges = [...filteredUnlocked]
       .sort((a, b) => b.clip.start - a.clip.start)
       .map(x => ({ pivot: x.clip.start + x.clip.duration, gap: x.clip.duration, trackId: x.track.id, isMain: x.track.type === 'video' }));
 
     for (const r of deletedRanges) {
       for (const tr of state.tracks) {
         if (tr.locked) continue;
-        // Ripple-deleting an audio/overlay clip shifts its own track (and linked tracks ONLY when a Main V1 clip was deleted)
         const shouldShift = tr.id === r.trackId || (r.isMain && state.linkedSelection);
         if (!shouldShift) continue;
         const sorted = [...tr.clips].sort((a, b) => a.start - b.start);
         for (const c of sorted) {
           if (c.start >= r.pivot - 0.01) {
             const desired = quantize(Math.max(0, c.start - r.gap));
-            // Prevent overlap with any preceding clip on non-main tracks
             const prevEnd = tr.clips
               .filter(o => o.id !== c.id && o.start < c.start)
               .reduce((mx, o) => Math.max(mx, o.start + o.duration), 0);
@@ -1795,50 +1884,74 @@ async function freezeFrameAtPlayhead() {
           c.start = quantize(c.start + freezeDur);
         }
       }
-      // Also split any linked/spanning audio clip crossing cutT so audio pauses cleanly during freeze!
-      if (state.linkedSelection) {
-        for (const tr of state.tracks) {
-          if (tr.id === track.id || tr.locked) continue;
-          const toAdd = [];
-          for (const c of tr.clips) {
-            if (c.start >= cutT - 0.01) {
-              c.start = quantize(c.start + freezeDur);
-            } else if (c.linkGroupId && c.linkGroupId === origClip.linkGroupId && cutT > c.start + 0.06 && cutT < c.start + c.duration - 0.06) {
-              const pLeft = quantize(cutT - c.start);
-              const pRight = quantize(c.duration - pLeft);
-              const pSrc = getSourceTime(c, pLeft, c.sourceDuration);
-              const { leftKf: lk, rightKf: rk } = partitionKeyframesAtCut(c, pLeft);
-              const rc = structuredClone(c);
-              rc.id = uid('clip');
-              rc.start = quantize(cutT + freezeDur);
-              rc.duration = pRight;
-              rc.keyframes = rk;
-              if (c.reverse) { const ot = c.trimStart || 0; c.trimStart = Math.max(0, pSrc); rc.trimStart = Math.max(0, ot); }
-              else rc.trimStart = Math.max(0, pSrc);
-              const newLink = uid('lnk');
-              rightClip.linkGroupId = newLink;
-              rc.linkGroupId = newLink;
-              c.duration = pLeft;
-              c.keyframes = lk;
-              toAdd.push(rc);
+      // Always split any linked audio clip crossing cutT (preserving curveStartU/curveEndU!) regardless of linkedSelection
+      for (const tr of state.tracks) {
+        if (tr.id === track.id || tr.locked) continue;
+        const toAdd = [];
+        for (const c of tr.clips) {
+          if (c.linkGroupId && c.linkGroupId === origClip.linkGroupId && cutT > c.start + 0.06 && cutT < c.start + c.duration - 0.06) {
+            const pOrigDur = c.duration;
+            const pLeft = quantize(cutT - c.start);
+            const pRight = quantize(c.duration - pLeft);
+            const pSrc = getSourceTime(c, pLeft, c.sourceDuration);
+            const { leftKf: lk, rightKf: rk } = partitionKeyframesAtCut(c, pLeft);
+            const rc = structuredClone(c);
+            rc.id = uid('clip');
+            rc.start = quantize(cutT + freezeDur);
+            rc.duration = pRight;
+            rc.keyframes = rk;
+            if (c.reverse) { const ot = c.trimStart || 0; c.trimStart = Math.max(0, pSrc); rc.trimStart = Math.max(0, ot); }
+            else rc.trimStart = Math.max(0, pSrc);
+            if (c.speedCurve && c.speedCurve !== 'none') {
+              const pu0 = Number(c.curveStartU ?? 0), pu1 = Number(c.curveEndU ?? 1);
+              const pMid = pu0 + (pLeft / Math.max(0.04, pOrigDur)) * (pu1 - pu0);
+              c.curveStartU = pu0; c.curveEndU = pMid;
+              rc.curveStartU = pMid; rc.curveEndU = pu1;
             }
+            const newLink = uid('lnk');
+            rightClip.linkGroupId = newLink;
+            rc.linkGroupId = newLink;
+            c.duration = pLeft;
+            c.keyframes = lk;
+            toAdd.push(rc);
+          } else if (state.linkedSelection && c.start >= cutT - 0.01) {
+            c.start = quantize(c.start + freezeDur);
           }
-          tr.clips.push(...toAdd);
         }
+        tr.clips.push(...toAdd);
       }
-      // Shift captions & markers after cutT forward by freezeDur
+      // Shift captions & markers after cutT forward by freezeDur (and extend spanning captions cleanly)
       for (const cap of state.captions) {
         if (cap.start >= cutT - 0.01) {
           cap.start = quantize(cap.start + freezeDur);
+          cap.end = quantize(cap.end + freezeDur);
+        } else if (cap.end > cutT + 0.01) {
           cap.end = quantize(cap.end + freezeDur);
         }
       }
       state.markers = state.markers.map(m => m >= cutT - 0.01 ? quantize(m + freezeDur) : m);
       track.clips.push(rightClip);
     } else {
+      // At clip start/end boundary: shift clips at/after cutT (including origClip if at its start!) + linked tracks/captions/markers
+      const insertAt = cutT <= origClip.start + 0.06 ? origClip.start : quantize(origClip.start + origClip.duration);
       for (const c of track.clips) {
-        if (c.start >= cutT - 0.01) c.start = quantize(c.start + freezeDur);
+        if (c.start >= insertAt - 0.01) c.start = quantize(c.start + freezeDur);
       }
+      if (state.linkedSelection) {
+        for (const tr of state.tracks) {
+          if (tr.id === track.id || tr.locked) continue;
+          for (const c of tr.clips) {
+            if (c.start >= insertAt - 0.01) c.start = quantize(c.start + freezeDur);
+          }
+        }
+      }
+      for (const cap of state.captions) {
+        if (cap.start >= insertAt - 0.01) {
+          cap.start = quantize(cap.start + freezeDur);
+          cap.end = quantize(cap.end + freezeDur);
+        }
+      }
+      state.markers = state.markers.map(m => m >= insertAt - 0.01 ? quantize(m + freezeDur) : m);
     }
 
     const freezeClip = createDefaultClip({
@@ -1885,6 +1998,8 @@ function detachAudioFromSelected() {
     sourceDuration: f.clip.sourceDuration,
     speed: f.clip.speed,
     speedCurve: f.clip.speedCurve,
+    curveStartU: f.clip.curveStartU ?? 0,
+    curveEndU: f.clip.curveEndU ?? 1,
     reverse: f.clip.reverse,
     volume: f.clip.volume,
     fadeIn: f.clip.fadeIn,
@@ -2245,9 +2360,13 @@ function renderInspector() {
     const applySpeed = (sp) => {
       const oldSpan = getClipSourceSpan(clip);
       clip.speed = Math.max(0.25, Math.min(4, sp));
+      // Account for active speedCurve average multiplier when computing new duration!
+      const curveMult = (clip.speedCurve && clip.speedCurve !== 'none')
+        ? (getClipSourceSpan({ ...clip, speed: 1, duration: 1 }) || 1)
+        : 1;
       const availSrc = Math.max(0.2, (clip.sourceDuration || oldSpan) - (clip.trimStart || 0));
       const desiredSrc = Math.min(availSrc, oldSpan);
-      const rawDur = quantize(Math.max(0.15, desiredSrc / clip.speed));
+      const rawDur = quantize(Math.max(0.15, desiredSrc / Math.max(0.1, clip.speed * curveMult)));
       clip.duration = quantize(clampDurToNeighbor(rawDur));
       syncLinkedSpeed();
       compactMainTrackIfMagnetic();
@@ -2528,8 +2647,14 @@ function renderMediaLibrary() {
     if (delBtn) {
       delBtn.onclick = async (e) => {
         e.stopPropagation();
-        await fetch(`/api/media/${encodeURIComponent(m.id)}`, { method: 'DELETE', headers: apiHeaders() });
+        const inUse = state.tracks.some(tr => tr.clips.some(c => c.mediaId === m.id));
+        if (inUse && !confirm(`"${m.name}" is used on the current timeline. Removing it will permanently delete the uploaded file and mark those clips OFFLINE. Continue?`)) {
+          return;
+        }
+        const res = await fetch(`/api/media/${encodeURIComponent(m.id)}`, { method: 'DELETE', headers: apiHeaders() });
+        if (!res.ok) return showToast(`Failed to remove "${m.name}"`);
         state.library = state.library.filter(x => x.id !== m.id);
+        engine.erroredMedia.add(m.id);
         renderMediaLibrary();
         renderTimeline();
         renderNow();
@@ -3167,22 +3292,36 @@ function updateCanvasResBadge() {
   $('#canvasResBadge').textContent = `${state.canvasWidth} × ${state.canvasHeight} · ${state.aspect}`;
 }
 
-function saveProjectJSON() {
+async function saveProjectJSON(downloadFile = true) {
   const payload = buildProjectPayload();
   const jsonStr = JSON.stringify(payload, null, 2);
-  try { localStorage.setItem(AUTOSAVE_KEY, jsonStr); setSaveStatus('Saved'); } catch {}
-  // Also backup on server quietly
-  fetch('/api/projects', {
-    method: 'POST',
-    headers: apiHeaders({ 'Content-Type': 'application/json' }),
-    body: jsonStr,
-  }).catch(() => {});
-  const blob = new Blob([jsonStr], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `${state.title || 'motioncut'}.mcut.json`;
-  a.click();
-  showToast('Project saved (.mcut.json + autosave)');
+  try { localStorage.setItem(AUTOSAVE_KEY, jsonStr); } catch {}
+  let serverOk = false;
+  try {
+    const r = await fetch('/api/projects', {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
+      body: jsonStr,
+    });
+    serverOk = r.ok;
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      showToast(`Server backup warning: ${d.error || r.status}`);
+    }
+  } catch {
+    showToast('Server backup unreachable — saved locally');
+  }
+  setSaveStatus(serverOk ? 'Saved' : 'Local Only');
+  if (downloadFile) {
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${state.title || 'motioncut'}.mcut.json`;
+    a.click();
+    showToast('Project exported (.mcut.json + server backup)');
+  } else if (serverOk) {
+    showToast('Project saved to server & local autosave (⌘S)');
+  }
 }
 
 function startNewProject() {
@@ -3589,10 +3728,14 @@ function setupUIEvents() {
           const pr = await fetch(`/api/projects/${encodeURIComponent(fname)}`);
           const pd = await pr.json();
           if (!pr.ok || !pd.project) return showToast(pd.error || 'Failed to load project');
-          applySnapshot(JSON.stringify(pd.project), true);
-          snapshotHistory();
-          $('#projectsModal').classList.add('hidden');
-          showToast(`Loaded ${fname}`);
+          try {
+            applySnapshot(JSON.stringify(pd.project), true);
+            snapshotHistory();
+            $('#projectsModal').classList.add('hidden');
+            showToast(`Loaded ${fname}`);
+          } catch (err) {
+            showToast(`Corrupt project file: ${err.message}`);
+          }
         };
         listEl.appendChild(row);
       });
@@ -3666,7 +3809,7 @@ function setupUIEvents() {
 
     if (cmd && e.key.toLowerCase() === 's') {
       e.preventDefault();
-      saveProjectJSON();
+      saveProjectJSON(false);
       return;
     }
 
@@ -3689,18 +3832,30 @@ function setupUIEvents() {
         if (under) f = { clip: under, track: mainTr };
       }
       if (f && !f.track.locked && state.currentTime > f.clip.start + 0.04 && state.currentTime < f.clip.start + f.clip.duration - 0.12) {
-        const delta = quantize(state.currentTime - f.clip.start);
-        const origDur = f.clip.duration;
-        const { rightKf } = partitionKeyframesAtCut(f.clip, delta);
-        const srcAtCut = getSourceTime(f.clip, delta, f.clip.sourceDuration);
-        f.clip.start = quantize(state.currentTime);
-        f.clip.duration = quantize(origDur - delta);
-        if (!f.clip.reverse) f.clip.trimStart = Math.max(0, srcAtCut);
-        if (f.clip.speedCurve && f.clip.speedCurve !== 'none') {
-          const u0 = Number(f.clip.curveStartU ?? 0), u1 = Number(f.clip.curveEndU ?? 1);
-          f.clip.curveStartU = u0 + (delta / Math.max(0.04, origDur)) * (u1 - u0);
+        const trimOneLeft = (c) => {
+          const delta = quantize(state.currentTime - c.start);
+          const origDur = c.duration;
+          const { rightKf } = partitionKeyframesAtCut(c, delta);
+          const srcAtCut = getSourceTime(c, delta, c.sourceDuration);
+          c.start = quantize(state.currentTime);
+          c.duration = quantize(origDur - delta);
+          if (!c.reverse) c.trimStart = Math.max(0, srcAtCut);
+          if (c.speedCurve && c.speedCurve !== 'none') {
+            const u0 = Number(c.curveStartU ?? 0), u1 = Number(c.curveEndU ?? 1);
+            c.curveStartU = u0 + (delta / Math.max(0.04, origDur)) * (u1 - u0);
+          }
+          c.keyframes = rightKf;
+        };
+        const lg = f.clip.linkGroupId;
+        trimOneLeft(f.clip);
+        if (lg && state.linkedSelection) {
+          for (const tr of state.tracks) {
+            if (tr.id === f.track.id || tr.locked) continue;
+            for (const p of tr.clips) {
+              if (p.linkGroupId === lg && state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) trimOneLeft(p);
+            }
+          }
         }
-        f.clip.keyframes = rightKf;
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
         showToast('Trimmed clip start to playhead (Q)');
       }
@@ -3714,17 +3869,29 @@ function setupUIEvents() {
         if (under) f = { clip: under, track: mainTr };
       }
       if (f && !f.track.locked && state.currentTime > f.clip.start + 0.12 && state.currentTime < f.clip.start + f.clip.duration - 0.04) {
-        const origDur = f.clip.duration;
-        const newDur = quantize(state.currentTime - f.clip.start);
-        const { leftKf } = partitionKeyframesAtCut(f.clip, newDur);
-        const srcAtCut = getSourceTime(f.clip, newDur, f.clip.sourceDuration);
-        if (f.clip.reverse) f.clip.trimStart = Math.max(0, srcAtCut);
-        if (f.clip.speedCurve && f.clip.speedCurve !== 'none') {
-          const u0 = Number(f.clip.curveStartU ?? 0), u1 = Number(f.clip.curveEndU ?? 1);
-          f.clip.curveEndU = u0 + (newDur / Math.max(0.04, origDur)) * (u1 - u0);
+        const trimOneRight = (c) => {
+          const origDur = c.duration;
+          const newDur = quantize(state.currentTime - c.start);
+          const { leftKf } = partitionKeyframesAtCut(c, newDur);
+          const srcAtCut = getSourceTime(c, newDur, c.sourceDuration);
+          if (c.reverse) c.trimStart = Math.max(0, srcAtCut);
+          if (c.speedCurve && c.speedCurve !== 'none') {
+            const u0 = Number(c.curveStartU ?? 0), u1 = Number(c.curveEndU ?? 1);
+            c.curveEndU = u0 + (newDur / Math.max(0.04, origDur)) * (u1 - u0);
+          }
+          c.duration = newDur;
+          c.keyframes = leftKf;
+        };
+        const lg = f.clip.linkGroupId;
+        trimOneRight(f.clip);
+        if (lg && state.linkedSelection) {
+          for (const tr of state.tracks) {
+            if (tr.id === f.track.id || tr.locked) continue;
+            for (const p of tr.clips) {
+              if (p.linkGroupId === lg && state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) trimOneRight(p);
+            }
+          }
         }
-        f.clip.duration = newDur;
-        f.clip.keyframes = leftKf;
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
         showToast('Trimmed clip end to playhead (W)');
       }
