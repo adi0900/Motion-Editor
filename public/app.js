@@ -563,7 +563,8 @@ function layoutMainTrackLinked(main, orderedClips) {
   // Track already-placed partner intervals per track so two moving partners don't overlap each other
   const placedOnTrack = new Map(); // track.id -> [{ start, duration }]
   let cursor = 0;
-  let unlinkedLockedCount = 0;
+  const unlinkedLockedIds = new Set();
+  const unlinkedOffIds = new Set();
 
   for (const c of orderedClips) {
     const oldStart = c.start;
@@ -619,10 +620,26 @@ function layoutMainTrackLinked(main, orderedClips) {
 
     if (locked.length && Math.abs(finalDelta) > 0.001) {
       for (const { clip: lp } of locked) {
-        lp.linkGroupId = null;
-        unlinkedLockedCount++;
+        if (lp.linkGroupId) {
+          lp.linkGroupId = null;
+          unlinkedLockedIds.add(lp.id);
+        }
       }
       if (!unlocked.length) c.linkGroupId = null;
+    }
+
+    // If Link is OFF and Main clip shifted, unlink cross-track partners so they don't stay linked out of sync!
+    if (!state.linkedSelection && c.linkGroupId && Math.abs(finalDelta) > 0.001) {
+      const lg = c.linkGroupId;
+      for (const tr of state.tracks) {
+        if (tr.id === main.id) continue;
+        for (const p of tr.clips) {
+          if (p.linkGroupId === lg) {
+            p.linkGroupId = null;
+            unlinkedOffIds.add(p.id);
+          }
+        }
+      }
     }
 
     cursor = quantizeCeil(c.start + c.duration);
@@ -649,7 +666,7 @@ function layoutMainTrackLinked(main, orderedClips) {
     }
   }
 
-  // Prune any solo orphan linkGroupId across all tracks (e.g., after locked-partner unlinking)
+  // Prune any solo orphan linkGroupId across all tracks (e.g., after locked-partner or Link-OFF unlinking)
   const linkCounts = new Map();
   for (const tr of state.tracks) {
     for (const c of tr.clips) {
@@ -662,8 +679,10 @@ function layoutMainTrackLinked(main, orderedClips) {
     }
   }
 
-  if (unlinkedLockedCount > 0) {
-    showToast(`Unlinked ${unlinkedLockedCount} locked partner clip(s) to prevent silent desync`);
+  if (unlinkedLockedIds.size > 0) {
+    showToast(`Unlinked ${unlinkedLockedIds.size} locked partner clip(s) to prevent silent desync`);
+  } else if (unlinkedOffIds.size > 0) {
+    showToast(`Unlinked ${unlinkedOffIds.size} partner clip(s) after magnetic shift (Link off)`);
   }
 }
 

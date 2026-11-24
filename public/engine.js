@@ -1939,17 +1939,19 @@ export class VideoEngine {
       }
     }
 
-    let jobId = null;
+    const clientJobId = 'job_' + Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, '0')).join('');
+    let jobId = clientJobId;
+    this.activeExportJobId = clientJobId;
     try {
       const startRes = await fetch('/api/export-frames/start', {
         method: 'POST',
         headers: getApiTokenHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ width, height, fps, crf, name, totalDuration: totalDur, audioClips }),
+        body: JSON.stringify({ jobId: clientJobId, width, height, fps, crf, name, totalDuration: totalDur, audioClips }),
         signal,
       });
       const startData = await startRes.json();
       if (!startRes.ok) throw new Error(startData.error || 'Failed to start export job');
-      jobId = startData.jobId;
+      jobId = startData.jobId || clientJobId;
       this.activeExportJobId = jobId;
 
       const t0 = performance.now();

@@ -931,7 +931,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '18.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '19.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1152,7 +1152,14 @@ const server = http.createServer(async (req, res) => {
       }
       const expectedFrames = Math.max(1, Math.round(totalDuration * fps));
 
-      const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
+      const reqJobId = (typeof body.jobId === 'string' && /^job_[a-f0-9]{12,24}$/.test(body.jobId)) ? body.jobId : null;
+      const jobId = reqJobId || ('job_' + crypto.randomBytes(6).toString('hex'));
+      if (exportJobHistory.get(jobId)?.status === 'cancelled') {
+        return sendJSON(res, 409, { error: 'Export cancelled' });
+      }
+      if (exportJobs.has(jobId)) {
+        return sendJSON(res, 409, { error: 'Export job ID already active' });
+      }
       const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || body.fileName || `motioncut_${Date.now()}`, jobId);
       const videoOnlyPath = path.join(EXPORTS_DIR, `_vid_${jobId}.mp4`);
 
@@ -1212,6 +1219,10 @@ const server = http.createServer(async (req, res) => {
       job.donePromise = donePromise;
 
       exportJobs.set(jobId, job);
+      if (req.aborted || res.destroyed || exportJobHistory.get(jobId)?.status === 'cancelled') {
+        cleanupExportJob(jobId, true);
+        return sendJSON(res, 409, { error: 'Export cancelled' });
+      }
       return sendJSON(res, 200, { ok: true, jobId, fileName });
     }
 
@@ -1278,6 +1289,10 @@ const server = http.createServer(async (req, res) => {
       const hist = exportJobHistory.get(jobId);
       if (hist?.status === 'cancelled') return sendJSON(res, 200, { ok: true, cancelled: true, status: 'cancelled' });
       if (hist?.status === 'committed') return sendJSON(res, 200, { ok: true, cancelled: false, status: 'committed' });
+      // Pre-mark valid client-generated job IDs as cancelled if /cancel races ahead of /start
+      if (/^job_[a-f0-9]{12,24}$/.test(jobId)) {
+        exportJobHistory.set(jobId, { status: 'cancelled', at: Date.now() });
+      }
       return sendJSON(res, 200, { ok: true, cancelled: false, status: 'not_found' });
     }
 
@@ -1565,6 +1580,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v18 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v19 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });
