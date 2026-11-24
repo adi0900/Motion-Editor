@@ -787,7 +787,12 @@ export class VideoEngine {
 
     // Backdrop CapCut Blur from active main video
     if (!isolateClipId && snap.bgMode === 'blur') {
-      const mainTr = snap.tracks.find(tr => tr.id === snap.mainTrackId && !tr.hidden) || snap.tracks.find(tr => tr.type === 'video' && !tr.hidden);
+      let mainTr = snap.tracks.find(tr => tr.id === snap.mainTrackId && tr.type === 'video' && !tr.hidden);
+      if (!mainTr) {
+        for (let i = snap.tracks.length - 1; i >= 0; i--) {
+          if (snap.tracks[i].type === 'video' && !snap.tracks[i].hidden) { mainTr = snap.tracks[i]; break; }
+        }
+      }
       const mainClip = mainTr?.clips.find(c => t >= c.start && t < c.start + c.duration);
       if (mainClip) {
         const el = this.getOrCreateElement(mainClip, snap);
@@ -1708,6 +1713,8 @@ export class VideoEngine {
     if (h) return h;
     const sel = this.findSelectedClip();
     if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return null;
+    const selTrack = this.state.tracks.find(tr => tr.clips.some(c => c.id === sel.id));
+    if (selTrack && (selTrack.locked || selTrack.hidden)) return null;
     const box = this.getClipBoundingBox(sel, t);
     const dx = px - box.cx, dy = py - box.cy;
     const rad = (-box.rot * Math.PI) / 180;
@@ -1804,6 +1811,7 @@ export class VideoEngine {
 
     // Immutable project snapshot so edits/state never corrupt export
     const snap = structuredClone({
+      mainTrackId: this.state.mainTrackId,
       canvasWidth: this.state.canvasWidth,
       canvasHeight: this.state.canvasHeight,
       fps: this.state.fps,

@@ -45,12 +45,13 @@ input, select, textarea { font: inherit; color: var(--text-0); }
 
 /* TOPBAR */
 .topbar {
-  height: 44px; flex: 0 0 44px; background: var(--bg-1);
+  min-height: 44px; flex: 0 0 auto; background: var(--bg-1);
   border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 0 10px; gap: 10px;
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: nowrap;
+  padding: 0 10px; gap: 10px; overflow-x: auto; scrollbar-width: none;
 }
-.topbar-left, .topbar-center, .topbar-right { display: flex; align-items: center; gap: 8px; }
+.topbar::-webkit-scrollbar { display: none; }
+.topbar-left, .topbar-center, .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .brand { display: flex; align-items: center; gap: 6px; font-weight: 700; letter-spacing: -0.02em; }
 .brand-mark {
   width: 22px; height: 22px; border-radius: 6px;
@@ -445,10 +446,18 @@ input, select, textarea { font: inherit; color: var(--text-0); }
   display: flex; flex-direction: column; overflow: hidden;
 }
 .timeline-toolbar {
-  height: 36px; flex: 0 0 36px; background: var(--bg-2); border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between; padding: 0 10px; gap: 6px;
+  min-height: 36px; flex: 0 0 auto; background: var(--bg-2); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: nowrap;
+  padding: 3px 10px; gap: 6px; overflow-x: auto; scrollbar-width: none;
 }
-.tl-tools-left, .tl-tools-right { display: flex; align-items: center; gap: 4px; }
+.timeline-toolbar::-webkit-scrollbar { display: none; }
+.tl-tools-left, .tl-tools-right { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+@media (max-width: 1120px) {
+  .topbar { flex-wrap: wrap; row-gap: 4px; padding: 4px 8px; }
+  .project-title { width: 120px; }
+  .timeline-toolbar { flex-wrap: wrap; row-gap: 4px; padding: 4px 8px; }
+  .zoom-slider { width: 58px; }
+}
 .tl-btn {
   padding: 4px 8px; border-radius: 5px; background: var(--bg-3); border: 1px solid var(--border);
   font-size: 11px; font-weight: 600; color: var(--text-1); white-space: nowrap;

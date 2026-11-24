@@ -96,9 +96,9 @@ const state = {
 let projectEpoch = 0;
 
 function getMainTrack() {
-  const byId = state.tracks.find(tr => tr.id === state.mainTrackId);
+  const byId = state.tracks.find(tr => tr.id === state.mainTrackId && tr.type === 'video');
   if (byId) return byId;
-  // Fall back to bottom-most video track (never newly unshifted top tracks!)
+  // Fall back to bottom-most video track (never newly unshifted top tracks or overlays!)
   for (let i = state.tracks.length - 1; i >= 0; i--) {
     if (state.tracks[i].type === 'video') {
       state.mainTrackId = state.tracks[i].id;
@@ -330,6 +330,7 @@ function snapshotHistory() {
   state.history.push(snap);
   if (state.history.length > 60) state.history.shift();
   state.historyIdx = state.history.length - 1;
+  if (state.history.length > 1) state.hasUnsavedChanges = true;
   try {
     localStorage.setItem(AUTOSAVE_KEY, snap);
     setSaveStatus('Saved locally');
@@ -511,16 +512,123 @@ function hasOverlap(track, start, duration, ignoreIds = new Set()) {
   return false;
 }
 
+function quantizeCeil(sec) {
+  const fps = state.fps || 30;
+  return Math.max(0, Math.ceil((sec - 1e-6) * fps) / fps);
+}
+
 function resolveNonOverlappingStart(track, desiredStart, duration, ignoreIds = new Set()) {
   let s = quantize(Math.max(0, desiredStart));
   const others = track.clips.filter(c => !ignoreIds.has(c.id)).sort((a, b) => a.start - b.start);
   for (const o of others) {
     if (s < o.start + o.duration - 0.002 && s + duration > o.start + 0.002) {
-      // Push cleanly after the blocking clip
-      s = quantize(o.start + o.duration);
+      // Push cleanly after the blocking clip (round UP so we never land inside the blocker!)
+      s = quantizeCeil(o.start + o.duration);
     }
   }
   return s;
+}
+
+/**
+ * Atomic two-phase magnetic layout for Main Track clips + their linked partners.
+ * - Excludes all moving linked partners from each other's collision checks (so reorders swap cleanly).
+ * - If a linked partner would hit a stationary clip or go < 0, shifts the whole linked unit together
+ *   so A/V offsets NEVER silently drift.
+ * - If a linked partner is on a locked track and the main clip moves, unlinks it honestly with a toast.
+ */
+function layoutMainTrackLinked(main, orderedClips) {
+  main.clips = orderedClips;
+  const movingPartnerIds = new Set();
+  const partnerMap = new Map(); // mainClip.id -> { unlocked: [{track, clip}], locked: [{track, clip}] }
+  if (state.linkedSelection) {
+    for (const c of orderedClips) {
+      if (!c.linkGroupId) continue;
+      const unlocked = [];
+      const locked = [];
+      for (const tr of state.tracks) {
+        if (tr.id === main.id) continue;
+        for (const p of tr.clips) {
+          if (p.linkGroupId === c.linkGroupId) {
+            if (tr.locked) locked.push({ track: tr, clip: p });
+            else { unlocked.push({ track: tr, clip: p }); movingPartnerIds.add(p.id); }
+          }
+        }
+      }
+      if (unlocked.length || locked.length) partnerMap.set(c.id, { unlocked, locked });
+    }
+  }
+
+  // Track already-placed partner intervals per track so two moving partners don't overlap each other
+  const placedOnTrack = new Map(); // track.id -> [{ start, duration }]
+  let cursor = 0;
+  let unlinkedLockedCount = 0;
+
+  for (const c of orderedClips) {
+    const oldStart = c.start;
+    const entry = partnerMap.get(c.id);
+    const unlocked = entry ? entry.unlocked : [];
+    const locked = entry ? entry.locked : [];
+
+    let candidateStart = quantize(cursor);
+    // Ensure no unlocked linked partner would be pushed before t = 0
+    for (const { clip: p } of unlocked) {
+      const offset = p.start - oldStart;
+      if (candidateStart + offset < 0) {
+        candidateStart = quantizeCeil(-offset);
+      }
+    }
+
+    // Converging collision check across all unlocked linked partners against stationary + already-placed clips
+    if (unlocked.length) {
+      for (let pass = 0; pass < 20; pass++) {
+        let extraShift = 0;
+        const delta = candidateStart - oldStart;
+        for (const { track: tr, clip: p } of unlocked) {
+          const desiredP = quantize(p.start + delta);
+          // 1. Check stationary clips on tr (ignoring all moving partners)
+          const resolvedStat = resolveNonOverlappingStart(tr, desiredP, p.duration, movingPartnerIds);
+          if (resolvedStat > desiredP + 0.001) {
+            extraShift = Math.max(extraShift, resolvedStat - desiredP);
+          }
+          // 2. Check already-placed moving partners on tr
+          const placed = placedOnTrack.get(tr.id) || [];
+          for (const pl of placed) {
+            if (desiredP < pl.start + pl.duration - 0.002 && desiredP + p.duration > pl.start + 0.002) {
+              const afterPl = quantizeCeil(pl.start + pl.duration);
+              extraShift = Math.max(extraShift, afterPl - desiredP);
+            }
+          }
+        }
+        if (extraShift <= 0.001) break;
+        candidateStart = quantizeCeil(candidateStart + extraShift);
+      }
+    }
+
+    const finalDelta = candidateStart - oldStart;
+    c.start = candidateStart;
+
+    if (unlocked.length) {
+      for (const { track: tr, clip: p } of unlocked) {
+        p.start = quantize(Math.max(0, p.start + finalDelta));
+        if (!placedOnTrack.has(tr.id)) placedOnTrack.set(tr.id, []);
+        placedOnTrack.get(tr.id).push({ start: p.start, duration: p.duration });
+      }
+    }
+
+    if (locked.length && Math.abs(finalDelta) > 0.001) {
+      for (const { clip: lp } of locked) {
+        lp.linkGroupId = null;
+        unlinkedLockedCount++;
+      }
+      if (!unlocked.length) c.linkGroupId = null;
+    }
+
+    cursor = quantize(c.start + c.duration);
+  }
+
+  if (unlinkedLockedCount > 0) {
+    showToast(`Unlinked ${unlinkedLockedCount} locked audio clip(s) to prevent silent desync`);
+  }
 }
 
 /** Magnetic Main Track: close gaps on the single designated Main Track sequentially */
@@ -528,29 +636,8 @@ function compactMainTrackIfMagnetic() {
   if (!state.magnetMain) return;
   const main = getMainTrack();
   if (!main || main.locked) return;
-  main.clips.sort((a, b) => a.start - b.start);
-  let cursor = 0;
-  for (const c of main.clips) {
-    const delta = quantizeSigned(cursor - c.start);
-    if (Math.abs(delta) > 0.001) {
-      c.start = quantize(cursor);
-      // Keep linked audio in sync with main track magnet when linkedSelection is active!
-      if (c.linkGroupId && state.linkedSelection) {
-        for (const tr of state.tracks) {
-          if (tr.id === main.id || tr.locked) continue;
-          for (const partner of tr.clips) {
-            if (partner.linkGroupId === c.linkGroupId) {
-              const desired = quantize(Math.max(0, partner.start + delta));
-              partner.start = hasOverlap(tr, desired, partner.duration, new Set([partner.id]))
-                ? resolveNonOverlappingStart(tr, desired, partner.duration, new Set([partner.id]))
-                : desired;
-            }
-          }
-        }
-      }
-    }
-    cursor = quantize(c.start + c.duration);
-  }
+  const ordered = [...main.clips].sort((a, b) => a.start - b.start);
+  layoutMainTrackLinked(main, ordered);
 }
 
 function findOrCreateFreeTrack(preferredType, start, duration) {
@@ -584,28 +671,7 @@ function insertOrReorderOnMainTrack(track, clip, dropTime) {
     if (dropTime < mid) { insertIdx = i; break; }
   }
   others.splice(insertIdx, 0, clip);
-  track.clips = others;
-  let cursor = 0;
-  for (const c of track.clips) {
-    const oldStart = c.start;
-    const newStart = quantize(cursor);
-    const delta = quantizeSigned(newStart - oldStart);
-    c.start = newStart;
-    if (c.linkGroupId && state.linkedSelection && Math.abs(delta) > 0.001) {
-      for (const tr of state.tracks) {
-        if (tr.id === track.id || tr.locked) continue;
-        for (const p of tr.clips) {
-          if (p.linkGroupId === c.linkGroupId) {
-            const desired = quantize(Math.max(0, p.start + delta));
-            p.start = hasOverlap(tr, desired, p.duration, new Set([p.id]))
-              ? resolveNonOverlappingStart(tr, desired, p.duration, new Set([p.id]))
-              : desired;
-          }
-        }
-      }
-    }
-    cursor = quantize(c.start + c.duration);
-  }
+  layoutMainTrackLinked(track, others);
 }
 
 function addMediaToTimeline(media, targetTrackId = null, dropTime = null) {
@@ -904,7 +970,7 @@ function drawRuler() {
     mk.className = 'beat-marker';
     mk.style.left = `${mSec * state.zoom}px`;
     mk.title = `Marker ${formatTC(mSec, state.fps)} (Click: jump · Right-click: remove)`;
-    mk.addEventListener('click', (e) => { e.stopPropagation(); state.currentTime = quantize(mSec); renderNow(); });
+    mk.addEventListener('click', (e) => { e.stopPropagation(); state.currentTime = quantize(mSec); ensurePlayheadVisible(); renderNow(); });
     mk.addEventListener('contextmenu', (e) => {
       e.preventDefault(); e.stopPropagation();
       state.markers.splice(idx, 1);
@@ -1371,8 +1437,9 @@ function attachClipInteractions(el, clip, track, hL, hR) {
 
       if (mode === 'move') {
         const primary = initMap.get(clip.id);
+        const minInitStart = Math.min(...[...initMap.values()].map(x => x.start));
         const snappedStart = snapBothEdges(Math.max(0, primary.start + dt), primary.duration, excludeIds);
-        const appliedDt = snappedStart - primary.start;
+        const appliedDt = Math.max(-minInitStart, snappedStart - primary.start);
         for (const item of initMap.values()) {
           item.clip.start = quantize(Math.max(0, item.start + appliedDt));
           if (item.el) item.el.style.left = `${item.clip.start * state.zoom}px`;
@@ -1455,12 +1522,25 @@ function attachClipInteractions(el, clip, track, hL, hR) {
           for (const [prop, list] of Object.entries(origKfs)) {
             const sorted = [...list].sort((a, b) => a.t - b.t);
             const hasBefore = sorted.some(k => k.t < d - 0.001);
-            const hasAfter = sorted.some(k => k.t > d + 0.001);
-            const hasExact = sorted.some(k => Math.abs(k.t - d) <= 0.001);
-            const shifted = sorted.map(k => ({ ...k, t: quantize(k.t - d) })).filter(k => k.t >= 0 && k.t <= targetClip.duration);
-            if (d > 0.001 && hasBefore && hasAfter && !hasExact) {
+            const exactKf = sorted.find(k => Math.abs(k.t - d) <= 0.001);
+            // Filter strictly AFTER cut BEFORE subtracting d so pre-cut keyframes never clamp to t=0!
+            const shifted = sorted
+              .filter(k => k.t > d + 0.001)
+              .map(k => ({ ...k, t: quantize(k.t - d) }))
+              .filter(k => k.t > 0.0005 && k.t <= targetClip.duration + 0.001);
+            if (exactKf) {
+              shifted.unshift({ ...exactKf, t: 0 });
+            } else if (d > 0.001 && hasBefore) {
               const bVal = evalKeyframe({ ...targetClip, keyframes: origKfs }, prop, d, targetClip[prop] ?? 0);
               shifted.unshift({ t: 0, v: bVal, ease: 'easeInOut' });
+            } else if (d <= 0.001) {
+              for (const k of sorted) {
+                if (k.t <= d + 0.001) {
+                  const nt = quantize(k.t - d);
+                  if (nt >= 0 && nt <= targetClip.duration + 0.001) shifted.unshift({ ...k, t: nt });
+                }
+              }
+              shifted.sort((a, b) => a.t - b.t);
             }
             if (shifted.length) rebased[prop] = shifted;
           }
@@ -1538,11 +1618,10 @@ function attachClipInteractions(el, clip, track, hL, hR) {
           const out = {};
           for (const [prop, list] of Object.entries(origKfs)) {
             const sorted = [...list].sort((a, b) => a.t - b.t);
-            const hasBefore = sorted.some(k => k.t < durLimit - 0.001);
             const hasAfter = sorted.some(k => k.t > durLimit + 0.001);
             const hasExact = sorted.some(k => Math.abs(k.t - durLimit) <= 0.001);
             const kept = sorted.filter(k => k.t <= durLimit + 0.001).map(k => ({ ...k }));
-            if (hasBefore && hasAfter && !hasExact) {
+            if (hasAfter && !hasExact) {
               const bVal = evalKeyframe({ ...targetClip, keyframes: origKfs }, prop, durLimit, targetClip[prop] ?? 0);
               kept.push({ t: quantize(durLimit), v: bVal, ease: 'easeInOut' });
             }
@@ -1805,33 +1884,73 @@ function duplicateSelectedClip() {
   const f = findClipAndTrack(state.selectedClipId);
   if (!f) return showToast('Select a clip to duplicate');
   if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
-  const copy = structuredClone(f.clip);
-  copy.id = uid('clip');
+
   const origLink = f.clip.linkGroupId;
-  const newLink = origLink && state.linkedSelection ? uid('lnk') : null;
-  copy.linkGroupId = newLink;
-  const targetStart = quantize(f.clip.start + f.clip.duration);
-  if (f.track.id === getMainTrack()?.id && state.magnetMain) {
-    copy.start = targetStart;
-    insertOrReorderOnMainTrack(f.track, copy, targetStart);
-  } else {
-    copy.start = resolveNonOverlappingStart(f.track, targetStart, copy.duration);
-    f.track.clips.push(copy);
-  }
-  if (origLink && newLink) {
+  const unlockedPartners = [];
+  if (origLink && state.linkedSelection) {
     for (const tr of state.tracks) {
       if (tr.id === f.track.id || tr.locked) continue;
-      const p = tr.clips.find(c => c.linkGroupId === origLink);
-      if (p) {
-        const pCopy = structuredClone(p);
-        pCopy.id = uid('clip');
-        pCopy.linkGroupId = newLink;
-        pCopy.start = resolveNonOverlappingStart(tr, copy.start, pCopy.duration);
-        tr.clips.push(pCopy);
+      for (const p of tr.clips) {
+        if (p.linkGroupId === origLink) {
+          unlockedPartners.push({ track: tr, clip: p, offset: p.start - f.clip.start });
+        }
       }
     }
   }
-  compactMainTrackIfMagnetic();
+
+  const newLink = unlockedPartners.length > 0 ? uid('lnk') : null;
+  const copy = structuredClone(f.clip);
+  copy.id = uid('clip');
+  copy.linkGroupId = newLink;
+
+  const isMainMagnetic = f.track.id === getMainTrack()?.id && state.magnetMain;
+  let baseStart = quantize(f.clip.start + f.clip.duration);
+  for (const up of unlockedPartners) {
+    if (baseStart + up.offset < 0) baseStart = quantizeCeil(-up.offset);
+  }
+
+  if (isMainMagnetic) {
+    // Insert copy right after f.clip on Main Track, with partner copies at exact relative offsets
+    copy.start = baseStart;
+    const pCopies = unlockedPartners.map(up => {
+      const pCopy = structuredClone(up.clip);
+      pCopy.id = uid('clip');
+      pCopy.linkGroupId = newLink;
+      pCopy.start = quantize(Math.max(0, baseStart + up.offset));
+      up.track.clips.push(pCopy);
+      return pCopy;
+    });
+    const idx = f.track.clips.indexOf(f.clip);
+    const ordered = [...f.track.clips];
+    ordered.splice(idx + 1, 0, copy);
+    layoutMainTrackLinked(f.track, ordered);
+    void pCopies;
+  } else {
+    // Converging atomic placement across primary + all linked partner tracks preserving exact J/L-cut offsets!
+    for (let pass = 0; pass < 20; pass++) {
+      let extraShift = 0;
+      const rMain = resolveNonOverlappingStart(f.track, baseStart, copy.duration);
+      if (rMain > baseStart + 0.001) extraShift = Math.max(extraShift, rMain - baseStart);
+      for (const up of unlockedPartners) {
+        const pDesired = quantize(Math.max(0, baseStart + up.offset));
+        const rP = resolveNonOverlappingStart(up.track, pDesired, up.clip.duration);
+        if (rP > pDesired + 0.001) extraShift = Math.max(extraShift, rP - pDesired);
+      }
+      if (extraShift <= 0.001) break;
+      baseStart = quantizeCeil(baseStart + extraShift);
+    }
+    copy.start = baseStart;
+    f.track.clips.push(copy);
+    for (const up of unlockedPartners) {
+      const pCopy = structuredClone(up.clip);
+      pCopy.id = uid('clip');
+      pCopy.linkGroupId = newLink;
+      pCopy.start = quantize(Math.max(0, baseStart + up.offset));
+      up.track.clips.push(pCopy);
+    }
+    compactMainTrackIfMagnetic();
+  }
+
   selectSingleClip(copy.id);
   snapshotHistory();
   renderTimeline();
@@ -1855,20 +1974,55 @@ function copySelectedClips() {
 function pasteCopiedClips() {
   if (!state.copiedClips?.length) return showToast('Clipboard empty');
   state.selectedClipIds.clear();
-  const linkRemap = new Map();
+
+  // Only preserve linkGroupId for groups with >= 2 clips in the clipboard (no orphan link badges!)
+  const linkCounts = new Map();
   for (const item of state.copiedClips) {
+    if (item.clip.linkGroupId) {
+      linkCounts.set(item.clip.linkGroupId, (linkCounts.get(item.clip.linkGroupId) || 0) + 1);
+    }
+  }
+  const linkRemap = new Map();
+  const mainTr = getMainTrack();
+
+  // Assign target tracks up front (preferring Main Track for video clips!)
+  const planned = state.copiedClips.map(item => {
     const c = structuredClone(item.clip);
     c.id = uid('clip');
-    if (c.linkGroupId) {
+    if (c.linkGroupId && (linkCounts.get(c.linkGroupId) || 0) >= 2) {
       if (!linkRemap.has(c.linkGroupId)) linkRemap.set(c.linkGroupId, uid('lnk'));
       c.linkGroupId = linkRemap.get(c.linkGroupId);
+    } else {
+      c.linkGroupId = null;
     }
     const desiredStart = quantize(state.currentTime + item.relStart);
-    const tr = findOrCreateFreeTrack(item.trackType, desiredStart, c.duration);
-    c.start = resolveNonOverlappingStart(tr, desiredStart, c.duration);
-    tr.clips.push(c);
-    state.selectedClipIds.add(c.id);
-    state.selectedClipId = c.id;
+    let tr = null;
+    if (item.trackType === 'video' && mainTr && !mainTr.locked && !hasOverlap(mainTr, desiredStart, c.duration)) {
+      tr = mainTr;
+    } else {
+      tr = findOrCreateFreeTrack(item.trackType, desiredStart, c.duration);
+    }
+    return { item, clip: c, track: tr };
+  });
+
+  // Converging atomic shift so all pasted clips preserve relative spacing & linked A/V offsets
+  let groupShift = 0;
+  for (let pass = 0; pass < 20; pass++) {
+    let extraShift = 0;
+    for (const p of planned) {
+      const desired = quantize(state.currentTime + groupShift + p.item.relStart);
+      const resolved = resolveNonOverlappingStart(p.track, desired, p.clip.duration);
+      if (resolved > desired + 0.001) extraShift = Math.max(extraShift, resolved - desired);
+    }
+    if (extraShift <= 0.001) break;
+    groupShift = quantizeCeil(groupShift + extraShift);
+  }
+
+  for (const p of planned) {
+    p.clip.start = quantize(state.currentTime + groupShift + p.item.relStart);
+    p.track.clips.push(p.clip);
+    state.selectedClipIds.add(p.clip.id);
+    state.selectedClipId = p.clip.id;
   }
   compactMainTrackIfMagnetic();
   snapshotHistory();
@@ -3523,8 +3677,9 @@ async function saveProjectJSON(downloadFile = true) {
       showToast(`Server backup warning: ${d.error || r.status}`);
     }
   } catch {
-    showToast('Server backup unreachable — saved locally');
+    showToast(localOk ? 'Server backup unreachable — saved locally' : 'Save failed (local storage & server unavailable)');
   }
+  if (serverOk || localOk) state.hasUnsavedChanges = false;
   setSaveStatus(serverOk && localOk ? 'Saved' : (serverOk ? 'Server Only' : (localOk ? 'Local Only' : 'Save Failed')), (!serverOk && !localOk) ? 'error' : '');
   if (downloadFile) {
     const blob = new Blob([jsonStr], { type: 'application/json' });
@@ -3540,7 +3695,20 @@ async function saveProjectJSON(downloadFile = true) {
   }
 }
 
-function startNewProject() {
+function backupProjectForRecovery() {
+  try {
+    const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
+    if (!hasContent) return;
+    localStorage.setItem(`motioncut_backup_${state.projectId}`, JSON.stringify(buildProjectPayload()));
+  } catch {}
+}
+
+function startNewProject(fromUser = false) {
+  const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
+  if (fromUser && hasContent && typeof window.confirm === 'function') {
+    if (!window.confirm('Start a new empty project? Your current edit will be backed up in local recovery storage.')) return;
+  }
+  backupProjectForRecovery();
   if (state.playing) togglePlay(false);
   projectEpoch++;
   state.projectId = uid('proj');
@@ -3557,46 +3725,76 @@ function startNewProject() {
   state.markers = [];
   state.history = [];
   state.historyIdx = -1;
+  state.hasUnsavedChanges = false;
   state.selectedClipId = null;
   state.selectedClipIds.clear();
   state.selectedCaptionId = null;
   $('#projectTitle').value = state.title;
   $('#fpsSelect').value = '30';
   $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
+  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === 'black'));
   updateCanvasResBadge();
   engine.pruneUnusedElements();
   snapshotHistory();
+  state.hasUnsavedChanges = false;
   renderTimeline();
   renderCaptionsUI();
   renderInspector();
+  syncEffectsDrawer();
   renderNow();
-  showToast('Started new clean project');
+  showToast('Started new clean project (previous edit backed up)');
 }
 
-function loadStarterDemo() {
+function loadStarterDemo(fromUser = false) {
+  const hasContent = state.tracks.some(t => t.clips.length > 0) || state.captions.length > 0;
+  if (fromUser && hasContent && typeof window.confirm === 'function') {
+    if (!window.confirm('Load the starter demo project? Your current edit will be backed up in local recovery storage.')) return;
+  }
+  backupProjectForRecovery();
   if (state.playing) togglePlay(false);
+  projectEpoch++;
   state.projectId = uid('proj');
   state.mainTrackId = 't_vid1';
+  state.title = 'Scanner_16x9_Edit';
+  state.aspect = '16:9';
+  state.canvasWidth = 1920;
+  state.canvasHeight = 1080;
+  state.fps = 30;
+  state.bgMode = 'black';
   state.tracks = makeEmptyTracks();
   state.captions = [];
   state.markers = [];
   state.selectedClipId = null;
   state.selectedClipIds = new Set();
+  state.selectedCaptionId = null;
   state.history = [];
   state.historyIdx = -1;
-  projectEpoch++;
+  state.hasUnsavedChanges = false;
   state.currentTime = 0;
-  state.title = 'Scanner_16x9_Edit';
   $('#projectTitle').value = state.title;
+  $('#fpsSelect').value = '30';
+  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
+  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === 'black'));
+  updateCanvasResBadge();
+  engine.pruneUnusedElements();
   const starter = state.library.find(m => m.name.includes('16:9')) || state.library.find(m => m.type === 'video');
   if (starter) {
     addMediaToTimeline(starter, 't_vid1', 0);
     state.currentTime = 0;
+    state.hasUnsavedChanges = false;
+    renderCaptionsUI();
+    renderInspector();
+    syncEffectsDrawer();
     renderNow();
     showToast(`Loaded demo: ${starter.name}`);
   } else {
     snapshotHistory();
+    state.hasUnsavedChanges = false;
     renderTimeline();
+    renderCaptionsUI();
+    renderInspector();
+    syncEffectsDrawer();
+    renderNow();
     showToast('No sample videos found — import media to begin');
   }
 }
@@ -3618,8 +3816,14 @@ function setupUIEvents() {
 
   $('#projectTitle').oninput = (e) => { state.title = e.target.value; setSaveStatus('Unsaved', 'dirty'); };
   $('#projectTitle').onchange = () => snapshotHistory();
-  $('#btnNewProject').onclick = startNewProject;
-  $('#btnLoadDemo').onclick = loadStarterDemo;
+  $('#btnNewProject').onclick = () => startNewProject(true);
+  $('#btnLoadDemo').onclick = () => loadStarterDemo(true);
+  window.addEventListener('beforeunload', (e) => {
+    if (state.hasUnsavedChanges) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
 
   $$('#toolRail .rail-btn').forEach(btn => {
     btn.onclick = () => {
@@ -4088,12 +4292,17 @@ function setupUIEvents() {
         const lg = f.clip.linkGroupId;
         trimOneLeft(f.clip);
         if (lg && state.linkedSelection) {
+          let unlinked = 0;
           for (const tr of state.tracks) {
             if (tr.id === f.track.id || tr.locked) continue;
             for (const p of tr.clips) {
-              if (p.linkGroupId === lg && state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) trimOneLeft(p);
+              if (p.linkGroupId === lg) {
+                if (state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) trimOneLeft(p);
+                else { p.linkGroupId = null; unlinked++; }
+              }
             }
           }
+          if (unlinked > 0) showToast(`Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`);
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
         showToast('Trimmed clip start to playhead (Q)');
@@ -4125,12 +4334,17 @@ function setupUIEvents() {
         const lg = f.clip.linkGroupId;
         trimOneRight(f.clip);
         if (lg && state.linkedSelection) {
+          let unlinked = 0;
           for (const tr of state.tracks) {
             if (tr.id === f.track.id || tr.locked) continue;
             for (const p of tr.clips) {
-              if (p.linkGroupId === lg && state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) trimOneRight(p);
+              if (p.linkGroupId === lg) {
+                if (state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) trimOneRight(p);
+                else { p.linkGroupId = null; unlinked++; }
+              }
             }
           }
+          if (unlinked > 0) showToast(`Trimmed to playhead (unlinked ${unlinked} out-of-range partner)`);
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
         showToast('Trimmed clip end to playhead (W)');

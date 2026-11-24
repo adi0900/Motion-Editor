@@ -119,17 +119,18 @@ async function probeFile(filePath) {
   const info = JSON.parse(stdout);
   const vStream = (info.streams || []).find(s => s.codec_type === 'video');
   const aStream = (info.streams || []).find(s => s.codec_type === 'audio');
-  const dur = parseFloat(info.format?.duration || vStream?.duration || aStream?.duration || '5');
+  const dur = parseFloat(info.format?.duration || vStream?.duration || aStream?.duration || '0');
   let fps = 30;
   if (vStream?.r_frame_rate && vStream.r_frame_rate.includes('/')) {
     const [n, d] = vStream.r_frame_rate.split('/').map(Number);
     if (d > 0 && n > 0 && n / d <= 240) fps = Math.round((n / d) * 100) / 100;
   }
   return {
-    duration: Number.isFinite(dur) && dur > 0 ? dur : 5,
-    width: vStream?.width || 1920,
-    height: vStream?.height || 1080,
+    duration: Number.isFinite(dur) && dur > 0 ? dur : 0,
+    width: vStream?.width || 0,
+    height: vStream?.height || 0,
     fps,
+    hasVideo: Boolean(vStream),
     hasAudio: Boolean(aStream),
   };
 }
@@ -449,14 +450,19 @@ async function detectCrop(filePath) {
   return { w: Number(last[1]), h: Number(last[2]), x: Number(last[3]), y: Number(last[4]) };
 }
 
+const reservedExportPaths = new Set();
+
 function uniqueExportPath(baseName) {
   const clean = (baseName || `motioncut_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.mp4$/i, '');
   let candidate = `${clean}.mp4`;
+  let fullPath = path.join(EXPORTS_DIR, candidate);
   let n = 2;
-  while (fs.existsSync(path.join(EXPORTS_DIR, candidate))) {
+  while (fs.existsSync(fullPath) || reservedExportPaths.has(fullPath)) {
     candidate = `${clean}_${n++}.mp4`;
+    fullPath = path.join(EXPORTS_DIR, candidate);
   }
-  return { fileName: candidate, fullPath: path.join(EXPORTS_DIR, candidate) };
+  reservedExportPaths.add(fullPath);
+  return { fileName: candidate, fullPath };
 }
 
 // Speed ramp curve definitions matching engine.js identically
@@ -744,6 +750,7 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   if (!job) return false;
   if (markCancelled) job.cancelled = true;
   exportJobs.delete(jobId);
+  if (job.finalPath) reservedExportPaths.delete(job.finalPath);
   if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
     try { job.proc.stdin.destroy(); } catch {}
     try { job.proc.kill('SIGKILL'); } catch {}
@@ -856,7 +863,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '8.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '9.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1054,6 +1061,28 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 400, { error: 'Invalid totalDuration (must be finite > 0)' });
       }
       const totalDuration = Math.max(1 / fps, rawTotalDur);
+      if (body.audioClips !== undefined && !Array.isArray(body.audioClips)) {
+        return sendJSON(res, 400, { error: 'Invalid audioClips (must be an array)' });
+      }
+      const audioClips = Array.isArray(body.audioClips) ? body.audioClips : [];
+      for (let i = 0; i < audioClips.length; i++) {
+        const ac = audioClips[i];
+        if (!ac || typeof ac !== 'object' || Array.isArray(ac)) {
+          return sendJSON(res, 400, { error: `Invalid audioClips[${i}]: expected object` });
+        }
+        if (typeof ac.mediaId !== 'string' || !mediaMap.has(ac.mediaId)) {
+          return sendJSON(res, 400, { error: `Invalid audioClips[${i}].mediaId` });
+        }
+        const st = Number(ac.start ?? 0);
+        const du = Number(ac.duration);
+        const ts = Number(ac.trimStart ?? 0);
+        const sp = Number(ac.speed ?? 1);
+        const vol = Number(ac.volume ?? 1);
+        if (!Number.isFinite(st) || st < 0 || !Number.isFinite(du) || du <= 0 || !Number.isFinite(ts) || ts < 0 || !Number.isFinite(sp) || sp < 0.25 || sp > 8 || !Number.isFinite(vol) || vol < 0) {
+          return sendJSON(res, 400, { error: `Invalid numeric parameters in audioClips[${i}]` });
+        }
+      }
+      const expectedFrames = Math.max(1, Math.round(totalDuration * fps));
 
       const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
       const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`);
@@ -1062,7 +1091,7 @@ const server = http.createServer(async (req, res) => {
       const proc = spawn('ffmpeg', [
         '-y', '-v', 'error',
         '-f', 'image2pipe', '-vcodec', 'mjpeg', '-framerate', String(fps), '-i', '-',
-        '-vf', `scale=${width}:${height}:flags=lanczos,setsar=1`,
+        '-vf', `scale=${width}:${height}:flags=lanczos,setsar=1,format=yuv420p`,
         '-r', String(fps),
         '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
         '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
@@ -1074,7 +1103,8 @@ const server = http.createServer(async (req, res) => {
         proc, videoOnlyPath, finalPath, fileName,
         width, height, fps, crf,
         totalDuration,
-        audioClips: Array.isArray(body.audioClips) ? body.audioClips : [],
+        expectedFrames,
+        audioClips,
         framesWritten: 0,
         lastActivity: Date.now(),
         failed: false,
@@ -1173,6 +1203,10 @@ const server = http.createServer(async (req, res) => {
         cleanupExportJob(jobId, true);
         return sendJSON(res, 400, { error: 'No frames were pushed to export job' });
       }
+      if (job.expectedFrames && job.framesWritten < job.expectedFrames) {
+        cleanupExportJob(jobId, true);
+        return sendJSON(res, 400, { error: `Incomplete export: received ${job.framesWritten} of ${job.expectedFrames} expected frames` });
+      }
       if (job.finishing) {
         return sendJSON(res, 409, { error: 'Export is already finalizing' });
       }
@@ -1200,9 +1234,14 @@ const server = http.createServer(async (req, res) => {
       } finally {
         clearInterval(heartbeat);
         exportJobs.delete(jobId);
+        reservedExportPaths.delete(job.finalPath);
       }
       const stat = fs.statSync(job.finalPath);
       const meta = await probeFile(job.finalPath);
+      if (!meta.hasVideo || meta.duration <= 0 || !meta.width || !meta.height) {
+        try { fs.unlinkSync(job.finalPath); } catch {}
+        return sendJSON(res, 500, { error: 'Export produced an empty or unreadable video file' });
+      }
       await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
         ok: true,
@@ -1222,6 +1261,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJsonBody(req, 262144);
       const item = mediaMap.get(body.mediaId);
       if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Clip not found' });
+      if (item.type !== 'video') return sendJSON(res, 400, { error: 'Quick Reframe requires a video clip' });
       const rawW = Number(body.width ?? 1920);
       const rawH = Number(body.height ?? 1080);
       if (!Number.isFinite(rawW) || !Number.isFinite(rawH) || rawW < 160 || rawH < 160 || rawW > 5120 || rawH > 5120) {
@@ -1236,18 +1276,15 @@ const server = http.createServer(async (req, res) => {
       const start = body.trimStart === undefined ? 0 : Number(body.trimStart);
       const dur = body.duration === undefined ? item.duration : Number(body.duration);
       const speed = body.speed === undefined ? 1 : Number(body.speed);
-      if (!Number.isFinite(start) || start < 0) return sendJSON(res, 400, { error: 'Invalid trimStart' });
+      if (!Number.isFinite(start) || start < 0 || start >= item.duration - 0.05) {
+        return sendJSON(res, 400, { error: `Invalid trimStart (must be >= 0 and < clip duration ${item.duration.toFixed(2)}s)` });
+      }
       if (!Number.isFinite(dur) || dur <= 0) return sendJSON(res, 400, { error: 'Invalid duration' });
       if (!Number.isFinite(speed) || speed < 0.25 || speed > 8) return sendJSON(res, 400, { error: 'Invalid speed (0.25..8)' });
-      if (body.speedCurve && body.speedCurve !== 'none') {
+      if (body.speedCurve !== undefined && body.speedCurve !== null && body.speedCurve !== 'none') {
         return sendJSON(res, 400, { error: 'Quick Reframe does not support speed ramp curves — use Full Timeline Export' });
       }
       const mode = ['cover', 'contain', 'stretch', 'blur'].includes(body.fitMode) ? body.fitMode : 'cover';
-      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
-
-      // Compute exact source read duration = timeline dur * speed (clamped to available source)
-      const srcSpan = Math.max(0.05, Math.min(Math.max(0.05, item.duration - start), dur * speed));
-      const outDur = srcSpan / speed;
 
       let vPre = '';
       if (body.cropRect) {
@@ -1259,6 +1296,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (Math.abs(speed - 1) > 0.01) vPre += `setpts=(PTS-STARTPTS)/${speed.toFixed(4)},`;
       if (body.reverse) vPre += 'reverse,setpts=PTS-STARTPTS,';
+
+      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
+
+      // Compute exact source read duration = timeline dur * speed (clamped to available source)
+      const srcSpan = Math.max(0.05, Math.min(Math.max(0.05, item.duration - start), dur * speed));
+      const outDur = srcSpan / speed;
 
       let vfGraph = '';
       if (mode === 'cover') {
@@ -1305,10 +1348,15 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, quickJob.cancelled ? 499 : 500, { error: String(err.message || err) });
       } finally {
         res.off('close', onClose);
+        reservedExportPaths.delete(outMp4);
       }
 
       const stat = fs.statSync(outMp4);
       const meta = await probeFile(outMp4);
+      if (!meta.hasVideo || meta.duration <= 0 || !meta.width || !meta.height) {
+        try { fs.unlinkSync(outMp4); } catch {}
+        return sendJSON(res, 500, { error: 'Quick export produced an empty or unreadable video file' });
+      }
       await registerMedia(outMp4, fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
         ok: true, fileName,
