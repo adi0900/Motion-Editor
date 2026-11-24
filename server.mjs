@@ -44,6 +44,7 @@ process.on('unhandledRejection', (err) => {
 const mediaMap = new Map();       // id -> internal media item (includes filePath)
 const waveformCache = new Map();  // `${id}:${bins}` -> { peaks, beats }
 const exportJobs = new Map();     // jobId -> active export job state
+const exportJobHistory = new Map(); // jobId -> { status: 'cancelled' | 'committed', at: number }
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -804,7 +805,10 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   const job = exportJobs.get(jobId);
   if (!job) return false;
   if (markCancelled && job.committed) return false;
-  if (markCancelled) job.cancelled = true;
+  if (markCancelled) {
+    job.cancelled = true;
+    exportJobHistory.set(jobId, { status: 'cancelled', at: Date.now() });
+  }
   job.cleanupScheduled = true;
   exportJobs.delete(jobId);
   if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
@@ -927,7 +931,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '16.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '17.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1270,7 +1274,11 @@ const server = http.createServer(async (req, res) => {
       if (!checkCsrfToken(req, res)) return;
       const jobId = p.split('/').pop();
       const existed = cleanupExportJob(jobId, true);
-      return sendJSON(res, 200, { ok: true, cancelled: existed });
+      if (existed) return sendJSON(res, 200, { ok: true, cancelled: true, status: 'cancelled' });
+      const hist = exportJobHistory.get(jobId);
+      if (hist?.status === 'cancelled') return sendJSON(res, 200, { ok: true, cancelled: true, status: 'cancelled' });
+      if (hist?.status === 'committed') return sendJSON(res, 200, { ok: true, cancelled: false, status: 'committed' });
+      return sendJSON(res, 200, { ok: true, cancelled: false, status: 'not_found' });
     }
 
     if (p.startsWith('/api/export-frames/finish/') && req.method === 'POST') {
@@ -1349,6 +1357,7 @@ const server = http.createServer(async (req, res) => {
         }
         // Atomic commit point: once committed, cancel cannot delete finalPath or leave a stale catalog entry
         job.committed = true;
+        exportJobHistory.set(jobId, { status: 'committed', at: Date.now() });
         exportJobs.delete(jobId);
         await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
         return sendJSON(res, 200, {
@@ -1556,6 +1565,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v16 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v17 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

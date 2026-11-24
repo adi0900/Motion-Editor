@@ -1800,8 +1800,13 @@ export class VideoEngine {
         });
         if (r.ok) {
           const d = await r.json().catch(() => ({}));
-          if (d.cancelled === true) result = { cancelled: true, committed: false, networkError: false };
-          else result = { cancelled: false, committed: true, networkError: false };
+          if (d.cancelled === true || d.status === 'cancelled') {
+            result = { cancelled: true, committed: false, networkError: false };
+          } else if (d.status === 'committed') {
+            result = { cancelled: false, committed: true, networkError: false };
+          } else {
+            result = { cancelled: false, committed: false, networkError: false };
+          }
         }
       } catch {
         // Network/dropped cancel response: keep activeExportJobId so the user can retry Cancel!

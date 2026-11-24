@@ -649,6 +649,19 @@ function layoutMainTrackLinked(main, orderedClips) {
     }
   }
 
+  // Prune any solo orphan linkGroupId across all tracks (e.g., after locked-partner unlinking)
+  const linkCounts = new Map();
+  for (const tr of state.tracks) {
+    for (const c of tr.clips) {
+      if (c.linkGroupId) linkCounts.set(c.linkGroupId, (linkCounts.get(c.linkGroupId) || 0) + 1);
+    }
+  }
+  for (const tr of state.tracks) {
+    for (const c of tr.clips) {
+      if (c.linkGroupId && (linkCounts.get(c.linkGroupId) || 0) < 2) c.linkGroupId = null;
+    }
+  }
+
   if (unlinkedLockedCount > 0) {
     showToast(`Unlinked ${unlinkedLockedCount} locked audio clip(s) to prevent silent desync`);
   }
@@ -4402,16 +4415,21 @@ function setupUIEvents() {
     if (!file) return;
     try {
       const txt = await file.text();
-      // Validate BOTH JSON syntax AND full MotionCut project schema BEFORE prompting or backing up!
+      // Validate BOTH JSON syntax AND full MotionCut project schema (tracks + clips) BEFORE prompting or backing up!
       const parsed = JSON.parse(txt);
       const allowedTrackTypes = new Set(['video', 'overlay', 'text', 'audio', 'graphic']);
+      const allowedClipTypes = new Set(['video', 'image', 'audio', 'text', 'graphic']);
       const validTracks = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
         && Array.isArray(parsed.tracks)
         && parsed.tracks.length > 0
         && parsed.tracks.every(tr => tr && typeof tr === 'object' && !Array.isArray(tr)
-          && allowedTrackTypes.has(tr.type) && Array.isArray(tr.clips));
+          && allowedTrackTypes.has(tr.type)
+          && Array.isArray(tr.clips)
+          && tr.clips.every(c => c && typeof c === 'object' && !Array.isArray(c)
+            && allowedClipTypes.has(c.type)
+            && Number.isFinite(Number(c.duration)) && Number(c.duration) > 0));
       if (!validTracks) {
-        showToast('Invalid MotionCut project file (malformed or unsupported tracks)');
+        showToast('Invalid MotionCut project file (malformed tracks or clips)');
         e.target.value = '';
         return;
       }
