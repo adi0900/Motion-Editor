@@ -814,6 +814,10 @@ function cleanupExportJob(jobId, killProc = true, markCancelled = true) {
   if (killProc && job.muxProc && !job.muxProc.killed && job.muxProc.exitCode === null) {
     try { job.muxProc.kill('SIGKILL'); } catch {}
   }
+  // Immediately unlink cancelled finalPath so /exports/<name> never briefly serves 200 after 409!
+  if (markCancelled && job.finalPath && reservedExportPaths.get(job.finalPath) === jobId) {
+    try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+  }
   setTimeout(() => {
     try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
     // Only unlink & release reservation if this job still owns the path!
@@ -923,7 +927,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '14.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '15.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1302,7 +1306,7 @@ const server = http.createServer(async (req, res) => {
         const encErr = job.getStderr ? job.getStderr() : '';
         if (/overread|corrupt|truncated|invalid data|mjpeg.*error|decode error/i.test(encErr)) {
           try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
-          return sendJSON(res, 400, { error: `Corrupt or truncated JPEG frame detected: ${encErr.trim().slice(0, 140)}` });
+          return sendJSON(res, 400, { error: 'Corrupt or truncated JPEG frame detected during decode' });
         }
         await muxAudioWithVideo(job.videoOnlyPath, job.finalPath, job.totalDuration, job.audioClips, job);
         if (job.cancelled) {
@@ -1368,7 +1372,7 @@ const server = http.createServer(async (req, res) => {
           try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
         }
         return sendJSON(res, wasCancelled ? 409 : (isCorruptInput ? 400 : 500), {
-          error: isCorruptInput ? `Corrupt or truncated JPEG frame detected: ${(encErr || errMsg).trim().slice(0, 140)}` : errMsg,
+          error: isCorruptInput ? 'Corrupt or truncated JPEG frame detected during decode' : errMsg,
         });
       } finally {
         clearInterval(heartbeat);
@@ -1552,6 +1556,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v14 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v15 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

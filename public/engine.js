@@ -1792,15 +1792,18 @@ export class VideoEngine {
       return { cancelled: true };
     }
     this.cancelInFlight = (async () => {
-      let serverCancelled = true;
+      let serverCancelled = false;
       try {
         const r = await fetch(`/api/export-frames/cancel/${jid}`, {
           method: 'POST',
           headers: getApiTokenHeaders(),
         });
         const d = await r.json().catch(() => ({}));
-        if (r.ok && d.cancelled === false) serverCancelled = false;
-      } catch {}
+        if (r.ok && d.cancelled === true) serverCancelled = true;
+      } catch {
+        // Network/dropped cancel response: never blindly abort an in-flight /finish that may have committed!
+        serverCancelled = false;
+      }
       this.activeExportJobId = null;
       this.lastCancelResult = { cancelled: serverCancelled };
       if (serverCancelled && this.exportAbortCtrl) {

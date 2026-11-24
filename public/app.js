@@ -538,6 +538,8 @@ function resolveNonOverlappingStart(track, desiredStart, duration, ignoreIds = n
  */
 function layoutMainTrackLinked(main, orderedClips) {
   main.clips = orderedClips;
+  // Detect same-track clips sharing a linkGroupId before compaction so any shifted pair unlinks honestly
+  const origStarts = new Map(orderedClips.map(c => [c.id, c.start]));
   const movingPartnerIds = new Set();
   const partnerMap = new Map(); // mainClip.id -> { unlocked: [{track, clip}], locked: [{track, clip}] }
   if (state.linkedSelection) {
@@ -624,6 +626,22 @@ function layoutMainTrackLinked(main, orderedClips) {
     }
 
     cursor = quantizeCeil(c.start + c.duration);
+  }
+
+  // If Magnetic Main shifted same-track clips sharing a linkGroupId out of their original relative offset, unlink them cleanly
+  const byLink = new Map();
+  for (const c of orderedClips) {
+    if (!c.linkGroupId) continue;
+    if (!byLink.has(c.linkGroupId)) byLink.set(c.linkGroupId, []);
+    byLink.get(c.linkGroupId).push(c);
+  }
+  for (const group of byLink.values()) {
+    if (group.length < 2) continue;
+    const baseDelta = group[0].start - (origStarts.get(group[0].id) ?? group[0].start);
+    const drifted = group.some(c => Math.abs((c.start - (origStarts.get(c.id) ?? c.start)) - baseDelta) > 0.002);
+    if (drifted) {
+      for (const c of group) c.linkGroupId = null;
+    }
   }
 
   if (unlinkedLockedCount > 0) {
@@ -3635,7 +3653,10 @@ async function closeOrCancelExportModal() {
     return;
   }
   if (engine.isExporting) {
-    await engine.cancelExport();
+    const res = await engine.cancelExport();
+    if (res && res.cancelled === false) {
+      showToast('Export already committed — finishing download…');
+    }
     return;
   }
   $('#exportModal').classList.add('hidden');
@@ -3651,7 +3672,11 @@ function setupSplitter() {
     const startY = e.clientY;
     const startH = dock.getBoundingClientRect().height;
     const onMove = (ev) => {
-      const nextH = Math.max(170, Math.min(window.innerHeight - 230, startH - (ev.clientY - startY)));
+      const topH = ($('.topbar')?.getBoundingClientRect().height || 44);
+      const spH = (sp.getBoundingClientRect().height || 5);
+      const minWorkspaceH = 220;
+      const maxH = Math.max(150, window.innerHeight - topH - spH - minWorkspaceH);
+      const nextH = Math.max(150, Math.min(maxH, startH - (ev.clientY - startY)));
       dock.style.height = `${nextH}px`;
       dock.style.flexBasis = `${nextH}px`;
     };
@@ -4361,10 +4386,15 @@ function setupUIEvents() {
     if (!file) return;
     try {
       const txt = await file.text();
-      // Validate BOTH JSON syntax AND MotionCut project schema BEFORE prompting or backing up!
+      // Validate BOTH JSON syntax AND full MotionCut project schema BEFORE prompting or backing up!
       const parsed = JSON.parse(txt);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Array.isArray(parsed.tracks)) {
-        showToast('Invalid MotionCut project file (missing tracks)');
+      const validTracks = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && Array.isArray(parsed.tracks)
+        && parsed.tracks.length > 0
+        && parsed.tracks.every(tr => tr && typeof tr === 'object' && !Array.isArray(tr)
+          && typeof tr.type === 'string' && Array.isArray(tr.clips));
+      if (!validTracks) {
+        showToast('Invalid MotionCut project file (malformed tracks)');
         e.target.value = '';
         return;
       }
