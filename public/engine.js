@@ -1791,6 +1791,7 @@ export class VideoEngine {
       if (this.exportAbortCtrl) this.exportAbortCtrl.abort();
       return { cancelled: true, committed: false, networkError: false };
     }
+    this.cancelRequested = true;
     this.cancelInFlight = (async () => {
       let result = { cancelled: false, committed: false, networkError: true };
       try {
@@ -1799,7 +1800,8 @@ export class VideoEngine {
           headers: getApiTokenHeaders(),
         });
         if (r.ok) {
-          const d = await r.json().catch(() => ({}));
+          // Do NOT swallow r.json() errors — an interrupted response body must be treated as networkError so retry works!
+          const d = await r.json();
           if (d.cancelled === true || d.status === 'cancelled') {
             result = { cancelled: true, committed: false, networkError: false };
           } else if (d.status === 'committed') {
@@ -1809,7 +1811,7 @@ export class VideoEngine {
           }
         }
       } catch {
-        // Network/dropped cancel response: keep activeExportJobId so the user can retry Cancel!
+        // Network/interrupted cancel response: keep activeExportJobId so the user can retry Cancel!
         result = { cancelled: false, committed: false, networkError: true };
       }
       if (!result.networkError) {
@@ -1837,6 +1839,7 @@ export class VideoEngine {
   async exportDeterministicMP4({ width, height, fps, crf, name, onProgress }) {
     this.pauseAllMedia();
     this.isExporting = true;
+    this.cancelRequested = false;
     this.cancelInFlight = null;
     this.lastCancelResult = null;
     this.exportAbortCtrl = new AbortController();
@@ -2001,18 +2004,27 @@ export class VideoEngine {
       onProgress?.(100, 'Export complete!');
       return finData;
     } catch (err) {
+      let confirmedCancelled = false;
       if (jobId) {
         try {
-          await fetch(`/api/export-frames/cancel/${jobId}`, {
+          const cr = await fetch(`/api/export-frames/cancel/${jobId}`, {
             method: 'POST',
             headers: getApiTokenHeaders(),
           });
+          if (cr.ok) {
+            const cd = await cr.json().catch(() => ({}));
+            if (cd.cancelled === true || cd.status === 'cancelled') confirmedCancelled = true;
+          }
         } catch {}
       }
       this.activeExportJobId = null;
+      if (this.cancelRequested && (confirmedCancelled || /not found|cancelled/i.test(String(err?.message || '')))) {
+        throw new Error('Export cancelled');
+      }
       throw err;
     } finally {
       this.isExporting = false;
+      this.cancelRequested = false;
       this.exportAbortCtrl = null;
     }
   }

@@ -663,7 +663,7 @@ function layoutMainTrackLinked(main, orderedClips) {
   }
 
   if (unlinkedLockedCount > 0) {
-    showToast(`Unlinked ${unlinkedLockedCount} locked audio clip(s) to prevent silent desync`);
+    showToast(`Unlinked ${unlinkedLockedCount} locked partner clip(s) to prevent silent desync`);
   }
 }
 
@@ -4427,7 +4427,8 @@ function setupUIEvents() {
           && Array.isArray(tr.clips)
           && tr.clips.every(c => c && typeof c === 'object' && !Array.isArray(c)
             && allowedClipTypes.has(c.type)
-            && Number.isFinite(Number(c.duration)) && Number(c.duration) > 0));
+            && typeof c.duration === 'number' && Number.isFinite(c.duration) && c.duration > 0
+            && (c.start === undefined || (typeof c.start === 'number' && Number.isFinite(c.start) && c.start >= 0))));
       if (!validTracks) {
         showToast('Invalid MotionCut project file (malformed tracks or clips)');
         e.target.value = '';
