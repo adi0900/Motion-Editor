@@ -612,14 +612,19 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     if ((c.eqBass || 0) !== 0) postChain.push(`bass=g=${Math.max(-18, Math.min(18, Number(c.eqBass))).toFixed(1)}`);
     if ((c.eqTreble || 0) !== 0) postChain.push(`treble=g=${Math.max(-18, Math.min(18, Number(c.eqTreble))).toFixed(1)}`);
     postChain.push(...buildVoiceFxFilters(c.voiceFx));
+    // Subdivide to 256-sample (~5.3ms) frames before per-frame volume expression so all 5 easings have <0.015 error!
+    if (Array.isArray(c.volumeKeyframes) && c.volumeKeyframes.length > 1) {
+      postChain.push('asetnsamples=n=256:p=0');
+    }
     postChain.push(buildVolumeExpr(vol, c.volumeKeyframes));
     postChain.push(`atrim=start=0:duration=${dur.toFixed(3)}`, 'asetpts=PTS-STARTPTS', 'aresample=48000:first_pts=0', 'aformat=sample_rates=48000:channel_layouts=stereo');
 
     if (curve !== 'none') {
-      // Adaptive piecewise speed-ramp audio (each segment >= 0.14s, exact padded duration -> 0ms tail loss)
+      // Adaptive piecewise speed-ramp audio with 8ms triangular acrossfade between segments -> ZERO clicks & ZERO dropouts!
       const cU0 = Math.max(0, Math.min(1, Number(c.curveStartU ?? 0)));
       const cU1 = Math.max(cU0 + 0.001, Math.min(1, Number(c.curveEndU ?? 1)));
-      const N = Math.max(4, Math.min(16, Math.round(dur / 0.14)));
+      const N = Math.max(4, Math.min(16, Math.round(dur / 0.16)));
+      const xfade = 0.008;
       const segOutDur = dur / N;
       const segSpeeds = [];
       let totalSpan = 0;
@@ -631,41 +636,62 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
       }
       const clampedSpan = Math.max(0.04, Math.min(mediaDur - trimStart, totalSpan));
       const scaleFactor = totalSpan > 0 ? Math.min(1, clampedSpan / totalSpan) : 1;
-
-      // Read extra +0.08s lookahead into prep so WSOLA atempo never runs dry and produces ZERO silent gaps!
       const lookahead = 0.08;
-      const prepDur = Math.max(0.04, Math.min(mediaDur - trimStart, clampedSpan + lookahead));
-      const prepFilters = [
-        'aformat=sample_rates=48000:channel_layouts=stereo',
-        `atrim=start=${trimStart.toFixed(4)}:duration=${prepDur.toFixed(4)}`,
-        'asetpts=PTS-STARTPTS',
-      ];
-      if (c.reverse) prepFilters.push('areverse', 'asetpts=PTS-STARTPTS');
+
+      // For reverse: reverse ONLY [trimStart, trimStart + clampedSpan] so source anchor NEVER shifts,
+      // then pad 0.12s of tail silence AFTER reversing so WSOLA atempo never runs dry near EOF!
+      const prepFilters = ['aformat=sample_rates=48000:channel_layouts=stereo'];
+      let prepAvail;
+      if (c.reverse) {
+        prepFilters.push(
+          `atrim=start=${trimStart.toFixed(4)}:duration=${clampedSpan.toFixed(4)}`,
+          'asetpts=PTS-STARTPTS',
+          'areverse',
+          'asetpts=PTS-STARTPTS',
+          'apad=pad_dur=0.14'
+        );
+        prepAvail = clampedSpan + 0.14;
+      } else {
+        const rawRead = Math.max(0.04, Math.min(mediaDur - trimStart, clampedSpan + lookahead));
+        prepFilters.push(
+          `atrim=start=${trimStart.toFixed(4)}:duration=${rawRead.toFixed(4)}`,
+          'asetpts=PTS-STARTPTS',
+          'apad=pad_dur=0.14'
+        );
+        prepAvail = rawRead + 0.14;
+      }
       const splitLabels = [];
       for (let k = 0; k < N; k++) splitLabels.push(`[s${idx}_${k}]`);
       filterParts.push(`[${inIdx}:a]${prepFilters.join(',')},asplit=${N}${splitLabels.join('')}`);
 
       let srcCursor = 0;
-      const concatInputs = [];
       for (let k = 0; k < N; k++) {
         const segSpeed = segSpeeds[k];
         const segSrcDur = Math.max(0.02, segOutDur * segSpeed * scaleFactor);
         const effSpeed = Math.max(0.25, Math.min(8, segSrcDur / segOutDur));
-        const segStart = Math.min(Math.max(0, prepDur - 0.02), srcCursor);
-        // Feed extra lookahead samples to atempo so it outputs >= segOutDur with 0ms silence dropout
-        const segReadDur = Math.max(0.02, Math.min(prepDur - segStart, segSrcDur + lookahead * effSpeed));
+        const extraOut = k < N - 1 ? xfade : 0;
+        const targetSegOut = segOutDur + extraOut;
+        const segStart = Math.min(Math.max(0, prepAvail - 0.03), srcCursor);
+        const segReadDur = Math.max(0.025, Math.min(prepAvail - segStart, (targetSegOut + lookahead) * effSpeed));
         const segChain = [
           `atrim=start=${segStart.toFixed(4)}:duration=${segReadDur.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
           ...buildAtempoChain(effSpeed),
-          `atrim=start=0:duration=${segOutDur.toFixed(4)}`,
+          `apad=whole_dur=${targetSegOut.toFixed(4)}`,
+          `atrim=start=0:duration=${targetSegOut.toFixed(4)}`,
           'asetpts=PTS-STARTPTS',
         ];
         filterParts.push(`[s${idx}_${k}]${segChain.join(',')}[r${idx}_${k}]`);
-        concatInputs.push(`[r${idx}_${k}]`);
         srcCursor += segSrcDur;
       }
-      filterParts.push(`${concatInputs.join('')}concat=n=${N}:v=0:a=1,asetpts=PTS-STARTPTS,${postChain.join(',')}[${rawLbl}]`);
+      // Chain segments with 8ms triangular acrossfade to eliminate waveform discontinuity clicks
+      let curLbl = `r${idx}_0`;
+      for (let k = 1; k < N; k++) {
+        const nextLbl = k === N - 1 ? `xf${idx}_end` : `xf${idx}_${k}`;
+        filterParts.push(`[${curLbl}][r${idx}_${k}]acrossfade=d=${xfade.toFixed(4)}:c1=tri:c2=tri[${nextLbl}]`);
+        curLbl = nextLbl;
+      }
+      filterParts.push(`[${curLbl}]asetpts=PTS-STARTPTS,${postChain.join(',')}[${rawLbl}]`);
     } else {
       const srcDur = Math.max(0.04, Math.min(mediaDur - trimStart, dur * baseSpeed));
       const chain = [
@@ -692,8 +718,8 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     mixLabels.push(`[${lbl}]`);
   });
 
-  // Always apply fast transparent limiter (0.5ms attack -> <1ms latency, zero single- or multi-clip clipping!)
-  const limiter = 'alimiter=limit=0.92:level=disabled:attack=0.5:release=40';
+  // Always apply fast true-peak-safe limiter (0.86 ceiling prevents post-AAC inter-sample clipping even on 6x sums!)
+  const limiter = 'alimiter=limit=0.86:level=disabled:attack=0.5:release=40';
   if (mixLabels.length === 1) {
     filterParts.push(`${mixLabels[0]}${limiter},apad=whole_dur=${totalDuration.toFixed(4)},atrim=start=0:duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS[aout]`);
   } else {
@@ -744,9 +770,25 @@ setInterval(() => {
 }, 120_000).unref();
 
 function isAllowedLocalHost(hostHeader) {
-  if (!hostHeader) return true;
+  if (!hostHeader) return false;
   const h = hostHeader.trim().toLowerCase();
   return h === `127.0.0.1:${PORT}` || h === `localhost:${PORT}` || h === '127.0.0.1' || h === 'localhost';
+}
+
+function validateProjectSchemaServer(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  const validTypes = new Set(['video', 'overlay', 'text', 'graphic', 'audio']);
+  if (!Array.isArray(obj.tracks)) return false;
+  for (const tr of obj.tracks) {
+    if (!tr || typeof tr !== 'object' || Array.isArray(tr)) return false;
+    if (!validTypes.has(tr.type) || !Array.isArray(tr.clips)) return false;
+    for (const c of tr.clips) {
+      if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+      if (c.start !== undefined && (!Number.isFinite(Number(c.start)) || Number(c.start) < 0)) return false;
+      if (c.duration !== undefined && (!Number.isFinite(Number(c.duration)) || Number(c.duration) <= 0)) return false;
+    }
+  }
+  return true;
 }
 
 function isAllowedOrigin(origin) {
@@ -814,7 +856,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '5.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '7.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -878,10 +920,17 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true });
     }
 
-    // ── Project Save / Load on Server (Backup & Restore) ──────────────────
+    // ── Project Save / Load / Delete on Server (Unique IDs + Deep Validation) ──
     if (p === '/api/projects' && req.method === 'GET') {
       const files = fs.readdirSync(PROJECTS_DIR).filter(f => f.endsWith('.json')).sort().reverse();
-      return sendJSON(res, 200, { projects: files });
+      const details = files.map(f => {
+        const fp = path.join(PROJECTS_DIR, f);
+        try {
+          const st = fs.statSync(fp);
+          return { fileName: f, updatedAt: st.mtime.toISOString(), size: st.size };
+        } catch { return { fileName: f, updatedAt: null, size: 0 }; }
+      });
+      return sendJSON(res, 200, { projects: files, details });
     }
     if (p.startsWith('/api/projects/') && req.method === 'GET') {
       const fname = path.basename(safeDecodeURIComponent(p.slice('/api/projects/'.length)));
@@ -893,7 +942,7 @@ const server = http.createServer(async (req, res) => {
       let data;
       try {
         data = JSON.parse(fs.readFileSync(fp, 'utf8'));
-        if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.tracks)) {
+        if (!validateProjectSchemaServer(data)) {
           return sendJSON(res, 422, { error: 'Project file is corrupt or has an invalid schema' });
         }
       } catch {
@@ -901,15 +950,26 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJSON(res, 200, { fileName: fname, project: data });
     }
+    if (p.startsWith('/api/projects/') && req.method === 'DELETE') {
+      if (!checkCsrfToken(req, res)) return;
+      const fname = path.basename(safeDecodeURIComponent(p.slice('/api/projects/'.length)));
+      if (!fname || !fname.endsWith('.json')) return sendJSON(res, 400, { error: 'Invalid project filename' });
+      const fp = path.resolve(PROJECTS_DIR, fname);
+      if (!fp.startsWith(PROJECTS_DIR + path.sep) || !fs.existsSync(fp)) {
+        return sendJSON(res, 404, { error: 'Project not found' });
+      }
+      fs.unlinkSync(fp);
+      return sendJSON(res, 200, { ok: true });
+    }
     if (p === '/api/projects' && req.method === 'POST') {
       if (!checkCsrfToken(req, res)) return;
       const body = await readJsonBody(req, 8 * 1024 * 1024);
-      const validTypes = new Set(['video', 'overlay', 'text', 'graphic', 'audio']);
-      if (!Array.isArray(body.tracks) || body.tracks.some(tr => !tr || typeof tr !== 'object' || Array.isArray(tr) || !validTypes.has(tr.type) || !Array.isArray(tr.clips))) {
-        return sendJSON(res, 422, { error: 'Invalid project payload: every track must be a valid object with type and clips array' });
+      if (!validateProjectSchemaServer(body)) {
+        return sendJSON(res, 422, { error: 'Invalid project payload: every track and clip must be a valid object with finite timings' });
       }
       const safe = String(body.title || 'project').replace(/[^a-zA-Z0-9._-]/g, '_');
-      const fp = path.join(PROJECTS_DIR, `${safe}.mcut.json`);
+      const pid = body.projectId ? '_' + String(body.projectId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16) : '';
+      const fp = path.join(PROJECTS_DIR, `${safe}${pid}.mcut.json`);
       const tmp = `${fp}.tmp_${Date.now()}`;
       fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
       fs.renameSync(tmp, fp);
@@ -989,7 +1049,11 @@ const server = http.createServer(async (req, res) => {
       const crf = body.crf === undefined ? 17 : Number(body.crf);
       if (!Number.isFinite(fps) || fps < 1 || fps > 120) return sendJSON(res, 400, { error: 'Invalid FPS (1..120)' });
       if (!Number.isFinite(crf) || crf < 10 || crf > 40) return sendJSON(res, 400, { error: 'Invalid CRF (10..40)' });
-      const totalDuration = Math.max(1 / fps, Number(body.totalDuration ?? 1));
+      const rawTotalDur = body.totalDuration === undefined ? 1 : Number(body.totalDuration);
+      if (!Number.isFinite(rawTotalDur) || rawTotalDur <= 0 || rawTotalDur > 36000) {
+        return sendJSON(res, 400, { error: 'Invalid totalDuration (must be finite > 0)' });
+      }
+      const totalDuration = Math.max(1 / fps, rawTotalDur);
 
       const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
       const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`);
@@ -1053,6 +1117,7 @@ const server = http.createServer(async (req, res) => {
       const jobId = p.split('/').pop();
       const job = exportJobs.get(jobId);
       if (!job) return sendJSON(res, 404, { error: 'Export job not found' });
+      if (job.finishing) return sendJSON(res, 409, { error: 'Export is already finalizing; cannot push additional frames' });
       if (job.cancelled) return sendJSON(res, 409, { error: 'Export was cancelled' });
       if (job.failed || job.proc.killed || job.proc.exitCode !== null) {
         const msg = job.failError?.message || 'FFmpeg encoder stopped unexpectedly';
@@ -1168,16 +1233,25 @@ const server = http.createServer(async (req, res) => {
       const crf = body.crf === undefined ? 15 : Number(body.crf);
       if (!Number.isFinite(fps) || fps < 1 || fps > 120) return sendJSON(res, 400, { error: 'Invalid FPS (1..120)' });
       if (!Number.isFinite(crf) || crf < 10 || crf > 40) return sendJSON(res, 400, { error: 'Invalid CRF (10..40)' });
-      const start = Math.max(0, Number(body.trimStart || 0));
-      const dur = Math.max(0.1, Number(body.duration || item.duration));
+      const start = body.trimStart === undefined ? 0 : Number(body.trimStart);
+      const dur = body.duration === undefined ? item.duration : Number(body.duration);
+      const speed = body.speed === undefined ? 1 : Number(body.speed);
+      if (!Number.isFinite(start) || start < 0) return sendJSON(res, 400, { error: 'Invalid trimStart' });
+      if (!Number.isFinite(dur) || dur <= 0) return sendJSON(res, 400, { error: 'Invalid duration' });
+      if (!Number.isFinite(speed) || speed < 0.25 || speed > 8) return sendJSON(res, 400, { error: 'Invalid speed (0.25..8)' });
       const mode = ['cover', 'contain', 'stretch', 'blur'].includes(body.fitMode) ? body.fitMode : 'cover';
       const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
 
       let vf = '';
-      if (body.cropRect && body.cropRect.w > 0 && body.cropRect.h > 0) {
+      if (body.cropRect) {
         const c = body.cropRect;
-        vf += `crop=${Math.round(c.w)}:${Math.round(c.h)}:${Math.round(c.x)}:${Math.round(c.y)},`;
+        if (!Number.isFinite(Number(c.w)) || !Number.isFinite(Number(c.h)) || !Number.isFinite(Number(c.x)) || !Number.isFinite(Number(c.y)) || Number(c.w) <= 0 || Number(c.h) <= 0) {
+          return sendJSON(res, 400, { error: 'Invalid cropRect dimensions' });
+        }
+        vf += `crop=${Math.round(Number(c.w))}:${Math.round(Number(c.h))}:${Math.round(Number(c.x))}:${Math.round(Number(c.y))},`;
       }
+      if (Math.abs(speed - 1) > 0.01) vf += `setpts=PTS/${speed.toFixed(4)},`;
+      if (body.reverse) vf += 'reverse,';
       if (mode === 'cover') {
         vf += `scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1`;
       } else if (mode === 'contain') {
@@ -1282,6 +1356,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v5 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v7 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

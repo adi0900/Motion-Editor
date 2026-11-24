@@ -404,6 +404,15 @@ export class VideoEngine {
     for (const id of [...this.complexSources.keys()]) this._stopComplexAudio(id);
   }
 
+  invalidateMediaCache(mediaId, mediaUrl) {
+    if (mediaId) this.erroredMedia.add(mediaId);
+    if (mediaUrl) {
+      this.decodedBuffers.delete(mediaUrl);
+      this.reversedBuffers.delete(mediaUrl);
+    }
+    this._stopAllComplexAudio();
+  }
+
   _ensureDecodedBuffer(media, reverse = false) {
     if (!this.audioCtx || !media?.url) return null;
     const cacheKey = media.url;
@@ -587,8 +596,9 @@ export class VideoEngine {
                 const u = u0 + Math.max(0, Math.min(1, localT / Math.max(0.04, clip.duration))) * (u1 - u0);
                 const liveRate = Math.max(0.25, Math.min(8, speed * (hasCurve ? evalSpeedCurve(clip.speedCurve, u) : 1) * shuttleSpeed));
                 let entry = this.complexSources.get(clip.id);
-                // Restart AudioBufferSource on seek/loop jump (>0.10s discontinuity) or reverse toggle!
-                const jumped = entry && (entry.reverse !== Boolean(clip.reverse) || Math.abs(t - entry.lastTimelineT) > 0.10);
+                // Restart AudioBufferSource on seek/loop jump (scaled for shuttleSpeed!) or reverse toggle
+                const jumpThresh = Math.max(0.06, 0.055 * Math.abs(shuttleSpeed));
+                const jumped = entry && (entry.reverse !== Boolean(clip.reverse) || Math.abs(t - entry.lastTimelineT) > jumpThresh);
                 if (jumped) {
                   this._stopComplexAudio(clip.id);
                   entry = null;
@@ -899,13 +909,16 @@ export class VideoEngine {
       ctx.drawImage(this.layerCanvasB, 0, 0);
       ctx.restore();
     } else if (kind === 'dip-black') {
-      if (ease < 0.5) {
-        ctx.globalAlpha = 1 - ease * 2;
-        ctx.drawImage(this.layerCanvas, 0, 0);
-      } else {
-        ctx.globalAlpha = (ease - 0.5) * 2;
-        ctx.drawImage(this.layerCanvasB, 0, 0);
-      }
+      // Scope black dip to active layer's alpha via source-atop so PiP/blur backdrops never bleed through
+      const srcC = ease < 0.5 ? this.layerCanvas : this.layerCanvasB;
+      const srcCtx = ease < 0.5 ? this.layerCtx : this.layerCtxB;
+      const dip = ease < 0.5 ? (ease * 2) : ((1 - ease) * 2);
+      srcCtx.save();
+      srcCtx.globalCompositeOperation = 'source-atop';
+      srcCtx.fillStyle = `rgba(0,0,0,${Math.max(0, Math.min(1, dip)).toFixed(3)})`;
+      srcCtx.fillRect(0, 0, baseW, baseH);
+      srcCtx.restore();
+      ctx.drawImage(srcC, 0, 0);
     } else if (kind === 'flash') {
       // Scope white flash to the active layer's alpha via source-atop so PiP overlays never flash V1!
       const srcC = ease < 0.5 ? this.layerCanvas : this.layerCanvasB;
@@ -1675,6 +1688,8 @@ export class VideoEngine {
   hitTestGizmoHandles(px, py, t) {
     const sel = this.findSelectedClip();
     if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return null;
+    const ownerTrack = this.state.tracks.find(tr => tr.clips.some(c => c.id === sel.id));
+    if (ownerTrack?.locked || ownerTrack?.hidden) return null;
     const box = this.getClipBoundingBox(sel, t);
     const { corners, rotHandle } = this.getHandlePoints(box);
     if (Math.hypot(px - rotHandle.x, py - rotHandle.y) < 30) return { mode: 'rotate', clip: sel, box };
