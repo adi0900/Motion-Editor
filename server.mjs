@@ -922,7 +922,7 @@ const server = http.createServer(async (req, res) => {
 
     // ── Health & Library ───────────────────────────────────────────────────
     if (p === '/api/health' && req.method === 'GET') {
-      return sendJSON(res, 200, { ok: true, version: '12.0', assets: mediaMap.size, activeExports: exportJobs.size });
+      return sendJSON(res, 200, { ok: true, version: '13.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
     if (p === '/api/library' && req.method === 'GET') {
@@ -1299,7 +1299,7 @@ const server = http.createServer(async (req, res) => {
           return sendJSON(res, 409, { error: 'Export cancelled' });
         }
         const encErr = job.getStderr ? job.getStderr() : '';
-        if (/overread|corrupt|truncated|invalid data|mjpeg.*error/i.test(encErr)) {
+        if (/overread|corrupt|truncated|invalid data|mjpeg.*error|decode error/i.test(encErr)) {
           try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
           return sendJSON(res, 400, { error: `Corrupt or truncated JPEG frame detected: ${encErr.trim().slice(0, 140)}` });
         }
@@ -1308,14 +1308,62 @@ const server = http.createServer(async (req, res) => {
           cleanupExportJob(jobId, true);
           return sendJSON(res, 409, { error: 'Export cancelled' });
         }
+        const stat = fs.statSync(job.finalPath);
+        const meta = await probeFile(job.finalPath);
+        if (job.cancelled) {
+          cleanupExportJob(jobId, true);
+          return sendJSON(res, 409, { error: 'Export cancelled' });
+        }
+        if (!meta.hasVideo || meta.duration <= 0 || !meta.width || !meta.height) {
+          try { fs.unlinkSync(job.finalPath); } catch {}
+          return sendJSON(res, 500, { error: 'Export produced an empty or unreadable video file' });
+        }
+        if (job.expectedFrames) {
+          let actualFrames = meta.nbFrames;
+          if (actualFrames <= 0) {
+            try {
+              const { stdout } = await execFileAsync('ffprobe', [
+                '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+                '-show_entries', 'stream=nb_read_frames', '-of', 'default=nk=1:nw=1', job.finalPath,
+              ]);
+              actualFrames = Number(stdout.trim()) || 0;
+            } catch {}
+          }
+          if (job.cancelled) {
+            cleanupExportJob(jobId, true);
+            return sendJSON(res, 409, { error: 'Export cancelled' });
+          }
+          if (actualFrames !== job.expectedFrames) {
+            try { fs.unlinkSync(job.finalPath); } catch {}
+            return sendJSON(res, 400, { error: `Decoded frame count (${actualFrames}) does not match expected (${job.expectedFrames})` });
+          }
+        }
+        if (job.cancelled) {
+          cleanupExportJob(jobId, true);
+          return sendJSON(res, 409, { error: 'Export cancelled' });
+        }
+        await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
+        return sendJSON(res, 200, {
+          ok: true,
+          fileName: job.fileName,
+          downloadUrl: `/exports/${encodeURIComponent(job.fileName)}`,
+          size: stat.size,
+          duration: meta.duration,
+          width: meta.width,
+          height: meta.height,
+          fps: meta.fps,
+        });
       } catch (err) {
         const wasCancelled = Boolean(job.cancelled);
+        const errMsg = String(err?.message || err);
+        const encErr = job.getStderr ? job.getStderr() : '';
+        const isCorruptInput = !wasCancelled && /overread|corrupt|truncated|invalid data|mjpeg.*error|decode error/i.test(`${errMsg} ${encErr}`);
         cleanupExportJob(jobId, true, wasCancelled);
         try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
         if (reservedExportPaths.get(job.finalPath) === jobId) {
           try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
         }
-        return sendJSON(res, wasCancelled ? 409 : 500, { error: String(err.message || err) });
+        return sendJSON(res, wasCancelled ? 409 : (isCorruptInput ? 400 : 500), { error: errMsg });
       } finally {
         clearInterval(heartbeat);
         exportJobs.delete(jobId);
@@ -1324,39 +1372,6 @@ const server = http.createServer(async (req, res) => {
           reservedExportPaths.delete(job.finalPath);
         }
       }
-      const stat = fs.statSync(job.finalPath);
-      const meta = await probeFile(job.finalPath);
-      if (!meta.hasVideo || meta.duration <= 0 || !meta.width || !meta.height) {
-        try { fs.unlinkSync(job.finalPath); } catch {}
-        return sendJSON(res, 500, { error: 'Export produced an empty or unreadable video file' });
-      }
-      if (job.expectedFrames) {
-        let actualFrames = meta.nbFrames;
-        if (actualFrames <= 0) {
-          try {
-            const { stdout } = await execFileAsync('ffprobe', [
-              '-v', 'error', '-count_frames', '-select_streams', 'v:0',
-              '-show_entries', 'stream=nb_read_frames', '-of', 'default=nk=1:nw=1', job.finalPath,
-            ]);
-            actualFrames = Number(stdout.trim()) || 0;
-          } catch {}
-        }
-        if (actualFrames !== job.expectedFrames) {
-          try { fs.unlinkSync(job.finalPath); } catch {}
-          return sendJSON(res, 400, { error: `Decoded frame count (${actualFrames}) does not match expected (${job.expectedFrames})` });
-        }
-      }
-      await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
-      return sendJSON(res, 200, {
-        ok: true,
-        fileName: job.fileName,
-        downloadUrl: `/exports/${encodeURIComponent(job.fileName)}`,
-        size: stat.size,
-        duration: meta.duration,
-        width: meta.width,
-        height: meta.height,
-        fps: meta.fps,
-      });
     }
 
     // ── Fast Direct FFmpeg 1-Click Source Reframe ──────────────────────────
@@ -1531,6 +1546,6 @@ const server = http.createServer(async (req, res) => {
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v11 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v13 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });

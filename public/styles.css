@@ -459,41 +459,6 @@ input, select, textarea { font: inherit; color: var(--text-0); }
   .tl-tools-left, .tl-tools-right { flex-wrap: wrap; }
   .zoom-slider { width: 58px; }
 }
-@media (max-width: 1000px) {
-  .left-panel { flex: 0 0 210px; width: 210px; }
-  .tool-rail { width: 48px; flex: 0 0 48px; padding: 4px 2px; }
-  .asset-drawer { overflow-x: hidden; padding: 7px; min-width: 0; }
-  .drawer-head { flex-wrap: wrap; gap: 4px; }
-  .filter-chips { flex-wrap: wrap; }
-  .chip { flex: 1 1 42%; min-width: 0; padding: 3px 4px; }
-  .row-2 { flex-wrap: wrap; }
-  .row-2 > * { flex: 1 1 42%; min-width: 0; }
-  .media-grid, .preset-grid { grid-template-columns: 1fr; }
-  .caption-global-ctrls { grid-template-columns: 1fr; }
-  .caption-top { flex-wrap: wrap; }
-  .cap-time-in { width: 48px; }
-  .inspector-panel { flex: 0 0 214px; width: 214px; }
-  .player-panel { min-width: 0; overflow-x: hidden; }
-  .transport-bar { flex-wrap: wrap; height: auto; min-height: 40px; padding: 4px 6px; row-gap: 4px; }
-  .transport-left, .transport-center, .transport-right { gap: 3px; flex-wrap: wrap; }
-  .inspector-tabs { flex-wrap: wrap; padding: 0 2px; }
-  .insp-tab { font-size: 10px; padding: 6px 2px; min-width: 0; }
-  .inspector-body { overflow-x: hidden; padding: 6px; }
-  .insp-section { padding: 7px; min-width: 0; overflow: hidden; }
-  .prop-row { min-width: 0; }
-  .prop-head { flex-wrap: wrap; gap: 3px; }
-  .prop-val-group { flex-wrap: wrap; min-width: 0; gap: 2px; }
-  .prop-num-in { width: 44px; padding: 2px 3px; }
-  .color-row { flex-wrap: wrap; gap: 4px; }
-  .speed-pills { grid-template-columns: repeat(3, 1fr); }
-  .path-import-row { flex-wrap: wrap; }
-  .path-import-row input { min-width: 0; flex: 1 1 80px; }
-  .track-headers { width: 162px; flex: 0 0 162px; }
-  .track-header { padding: 0 4px 0 6px; gap: 2px; }
-  .track-name { min-width: 0; flex: 1 1 auto; font-size: 10.5px; }
-  .track-name span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .track-ctrl { width: 17px; height: 17px; font-size: 9px; }
-}
 .tl-btn {
   padding: 4px 8px; border-radius: 5px; background: var(--bg-3); border: 1px solid var(--border);
   font-size: 11px; font-weight: 600; color: var(--text-1); white-space: nowrap;
@@ -726,3 +691,43 @@ input, select, textarea { font: inherit; color: var(--text-0); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+
+/* Responsive Narrow-Viewport Overrides (Placed last so cascade always wins!) */
+@media (max-width: 1000px) {
+  .left-panel { flex: 0 0 214px; width: 214px; }
+  .tool-rail { width: 46px; flex: 0 0 46px; padding: 4px 2px; }
+  .asset-drawer { overflow-x: hidden; padding: 7px; min-width: 0; }
+  .drawer-head { flex-wrap: wrap; gap: 4px; }
+  .filter-chips { flex-wrap: wrap; }
+  .chip { flex: 1 1 42%; min-width: 0; padding: 3px 4px; }
+  .row-2 { flex-wrap: wrap; }
+  .row-2 > * { flex: 1 1 42%; min-width: 0; }
+  .media-grid, .preset-grid { grid-template-columns: 1fr; }
+  .audio-row { flex-direction: column; align-items: stretch; gap: 5px; padding: 7px; }
+  .audio-row > div { width: 100%; }
+  .audio-row button { width: 100%; }
+  .caption-global-ctrls { grid-template-columns: 1fr; }
+  .caption-top { flex-wrap: wrap; }
+  .cap-time-in { width: 48px; }
+  .inspector-panel { flex: 0 0 218px; width: 218px; }
+  .player-panel { min-width: 0; overflow-x: hidden; }
+  .transport-bar { flex-wrap: wrap; height: auto; min-height: 40px; padding: 4px 6px; row-gap: 4px; }
+  .transport-left, .transport-center, .transport-right { gap: 3px; flex-wrap: wrap; }
+  .inspector-tabs { flex-wrap: wrap; padding: 0 2px; }
+  .insp-tab { font-size: 10px; padding: 6px 2px; min-width: 0; }
+  .inspector-body { overflow-x: hidden; overflow-y: auto; padding: 6px; }
+  .insp-section { padding: 7px; min-width: 0; flex-shrink: 0; overflow-x: hidden; overflow-y: visible; }
+  .prop-row { min-width: 0; }
+  .prop-head { flex-wrap: wrap; gap: 3px; }
+  .prop-val-group { flex-wrap: wrap; min-width: 0; gap: 2px; }
+  .prop-num-in { width: 44px; padding: 2px 3px; }
+  .color-row { flex-wrap: wrap; gap: 4px; }
+  .speed-pills { grid-template-columns: repeat(3, 1fr); }
+  .path-import-row { flex-wrap: wrap; }
+  .path-import-row input { min-width: 0; flex: 1 1 80px; }
+  .track-headers { width: 184px; flex: 0 0 184px; }
+  .track-header { padding: 0 4px 0 6px; gap: 4px; }
+  .track-name { min-width: 0; flex: 1 1 auto; font-size: 10.5px; }
+  .track-name span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .track-ctrl { width: 17px; height: 17px; font-size: 9px; }
+}

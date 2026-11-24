@@ -1782,19 +1782,23 @@ export class VideoEngine {
   }
 
   async cancelExport() {
-    if (this.exportAbortCtrl) {
-      this.exportAbortCtrl.abort();
-    }
+    let serverCancelled = true;
     if (this.activeExportJobId) {
       const jid = this.activeExportJobId;
       this.activeExportJobId = null;
       try {
-        await fetch(`/api/export-frames/cancel/${jid}`, {
+        const r = await fetch(`/api/export-frames/cancel/${jid}`, {
           method: 'POST',
           headers: getApiTokenHeaders(),
         });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.cancelled === false) serverCancelled = false;
       } catch {}
     }
+    if (serverCancelled && this.exportAbortCtrl) {
+      this.exportAbortCtrl.abort();
+    }
+    return { cancelled: serverCancelled };
   }
 
   /**

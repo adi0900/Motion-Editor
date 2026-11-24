@@ -4361,9 +4361,34 @@ function setupUIEvents() {
     if (!file) return;
     try {
       const txt = await file.text();
+      // Validate JSON before prompting or discarding current edit
+      JSON.parse(txt);
+      const hadContent = projectHasContent();
+      if (hadContent && typeof window.confirm === 'function') {
+        if (!window.confirm(`Open "${file.name}"? Your current edit will be backed up to Local Recovery.`)) {
+          e.target.value = '';
+          return;
+        }
+      }
+      const bkRes = backupProjectForRecovery();
+      if (hadContent && !bkRes.ok) {
+        if (typeof window.confirm === 'function') {
+          if (!window.confirm('Could not save a local recovery backup (browser storage full). Discard current project and open anyway?')) {
+            e.target.value = '';
+            return;
+          }
+        } else {
+          showToast('Open aborted: could not back up current project (storage full)');
+          e.target.value = '';
+          return;
+        }
+      }
       applySnapshot(txt, true);
       snapshotHistory();
-      showToast('Project loaded');
+      state.hasUnsavedChanges = false;
+      showToast(hadContent && !bkRes.ok
+        ? `Loaded ${file.name} (previous edit was not backed up — storage full)`
+        : `Loaded ${file.name}`);
     } catch { showToast('Invalid project JSON'); }
     e.target.value = '';
   };
@@ -4464,29 +4489,37 @@ function setupUIEvents() {
         trimOneLeft(f.clip);
         let unlinkedRange = 0;
         let unlinkedLocked = 0;
+        let unlinkedOff = 0;
         let remainingPartners = 0;
-        if (lg && state.linkedSelection) {
+        if (lg) {
           for (const tr of state.tracks) {
             if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
               if (p.linkGroupId === lg) {
-                if (tr.locked) {
+                if (!state.linkedSelection) {
                   p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
+                  unlinkedOff++;
+                } else if (tr.locked) {
+                  p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
                   unlinkedLocked++;
                 } else if (state.currentTime > p.start + 0.04 && state.currentTime < p.start + p.duration - 0.12) {
                   trimOneLeft(p);
                   remainingPartners++;
                 } else {
                   p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
                   unlinkedRange++;
                 }
               }
             }
           }
-          if ((unlinkedLocked > 0 || unlinkedRange > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
+          if ((unlinkedLocked > 0 || unlinkedRange > 0 || unlinkedOff > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
+        if (unlinkedOff > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedOff} partner while Link is off)`);
+        else if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
         else if (unlinkedLocked > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked partner)`);
         else if (unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedRange} out-of-range partner)`);
         else showToast('Trimmed clip start to playhead (Q)');
@@ -4519,29 +4552,37 @@ function setupUIEvents() {
         trimOneRight(f.clip);
         let unlinkedRange = 0;
         let unlinkedLocked = 0;
+        let unlinkedOff = 0;
         let remainingPartners = 0;
-        if (lg && state.linkedSelection) {
+        if (lg) {
           for (const tr of state.tracks) {
             if (tr.id === f.track.id) continue;
             for (const p of tr.clips) {
               if (p.linkGroupId === lg) {
-                if (tr.locked) {
+                if (!state.linkedSelection) {
                   p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
+                  unlinkedOff++;
+                } else if (tr.locked) {
+                  p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
                   unlinkedLocked++;
                 } else if (state.currentTime > p.start + 0.12 && state.currentTime < p.start + p.duration - 0.04) {
                   trimOneRight(p);
                   remainingPartners++;
                 } else {
                   p.linkGroupId = null;
+                  state.selectedClipIds.delete(p.id);
                   unlinkedRange++;
                 }
               }
             }
           }
-          if ((unlinkedLocked > 0 || unlinkedRange > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
+          if ((unlinkedLocked > 0 || unlinkedRange > 0 || unlinkedOff > 0) && remainingPartners === 0) f.clip.linkGroupId = null;
         }
         compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-        if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
+        if (unlinkedOff > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedOff} partner while Link is off)`);
+        else if (unlinkedLocked > 0 && unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked & ${unlinkedRange} out-of-range partner)`);
         else if (unlinkedLocked > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedLocked} locked partner)`);
         else if (unlinkedRange > 0) showToast(`Trimmed to playhead (unlinked ${unlinkedRange} out-of-range partner)`);
         else showToast('Trimmed clip end to playhead (W)');
