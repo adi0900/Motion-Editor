@@ -635,12 +635,17 @@ function layoutMainTrackLinked(main, orderedClips) {
     if (!byLink.has(c.linkGroupId)) byLink.set(c.linkGroupId, []);
     byLink.get(c.linkGroupId).push(c);
   }
-  for (const group of byLink.values()) {
+  for (const [lgId, group] of byLink.entries()) {
     if (group.length < 2) continue;
     const baseDelta = group[0].start - (origStarts.get(group[0].id) ?? group[0].start);
     const drifted = group.some(c => Math.abs((c.start - (origStarts.get(c.id) ?? c.start)) - baseDelta) > 0.002);
     if (drifted) {
-      for (const c of group) c.linkGroupId = null;
+      // Clear the linkGroupId across ALL tracks so no Overlay/Audio partner retains an orphaned link badge!
+      for (const tr of state.tracks) {
+        for (const c of tr.clips) {
+          if (c.linkGroupId === lgId) c.linkGroupId = null;
+        }
+      }
     }
   }
 
@@ -3654,7 +3659,9 @@ async function closeOrCancelExportModal() {
   }
   if (engine.isExporting) {
     const res = await engine.cancelExport();
-    if (res && res.cancelled === false) {
+    if (res && res.networkError) {
+      showToast('Cancel request failed — click Cancel again to retry');
+    } else if (res && res.committed) {
       showToast('Export already committed — finishing download…');
     }
     return;
@@ -3663,22 +3670,31 @@ async function closeOrCancelExportModal() {
 }
 
 // ── SPLITTER + SIDEBAR COLLAPSE + PLAYHEAD-ANCHORED ZOOM ────────────────────
+function clampTimelineDockHeight(desiredH = null) {
+  const sp = $('#timelineSplitter');
+  const dock = $('#timelineDock');
+  if (!dock) return;
+  const topH = ($('.topbar')?.getBoundingClientRect().height || 44);
+  const spH = (sp?.getBoundingClientRect().height || 5);
+  const minWorkspaceH = 220;
+  const maxH = Math.max(150, window.innerHeight - topH - spH - minWorkspaceH);
+  const curH = desiredH !== null ? desiredH : dock.getBoundingClientRect().height;
+  const nextH = Math.max(150, Math.min(maxH, Math.round(curH)));
+  dock.style.height = `${nextH}px`;
+  dock.style.flexBasis = `${nextH}px`;
+}
+
 function setupSplitter() {
   const sp = $('#timelineSplitter');
   const dock = $('#timelineDock');
+  window.addEventListener('resize', () => clampTimelineDockHeight());
   sp.addEventListener('mousedown', (e) => {
     e.preventDefault();
     sp.classList.add('dragging');
     const startY = e.clientY;
     const startH = dock.getBoundingClientRect().height;
     const onMove = (ev) => {
-      const topH = ($('.topbar')?.getBoundingClientRect().height || 44);
-      const spH = (sp.getBoundingClientRect().height || 5);
-      const minWorkspaceH = 220;
-      const maxH = Math.max(150, window.innerHeight - topH - spH - minWorkspaceH);
-      const nextH = Math.max(150, Math.min(maxH, startH - (ev.clientY - startY)));
-      dock.style.height = `${nextH}px`;
-      dock.style.flexBasis = `${nextH}px`;
+      clampTimelineDockHeight(startH - (ev.clientY - startY));
     };
     const onUp = () => {
       sp.classList.remove('dragging');
@@ -4388,13 +4404,14 @@ function setupUIEvents() {
       const txt = await file.text();
       // Validate BOTH JSON syntax AND full MotionCut project schema BEFORE prompting or backing up!
       const parsed = JSON.parse(txt);
+      const allowedTrackTypes = new Set(['video', 'overlay', 'text', 'audio', 'graphic']);
       const validTracks = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
         && Array.isArray(parsed.tracks)
         && parsed.tracks.length > 0
         && parsed.tracks.every(tr => tr && typeof tr === 'object' && !Array.isArray(tr)
-          && typeof tr.type === 'string' && Array.isArray(tr.clips));
+          && allowedTrackTypes.has(tr.type) && Array.isArray(tr.clips));
       if (!validTracks) {
-        showToast('Invalid MotionCut project file (malformed tracks)');
+        showToast('Invalid MotionCut project file (malformed or unsupported tracks)');
         e.target.value = '';
         return;
       }

@@ -1785,31 +1785,36 @@ export class VideoEngine {
     if (this.cancelInFlight) return this.cancelInFlight;
     const jid = this.activeExportJobId;
     if (!jid) {
-      if (this.lastCancelResult && this.lastCancelResult.cancelled === false) {
+      if (this.lastCancelResult && this.lastCancelResult.committed) {
         return this.lastCancelResult;
       }
       if (this.exportAbortCtrl) this.exportAbortCtrl.abort();
-      return { cancelled: true };
+      return { cancelled: true, committed: false, networkError: false };
     }
     this.cancelInFlight = (async () => {
-      let serverCancelled = false;
+      let result = { cancelled: false, committed: false, networkError: true };
       try {
         const r = await fetch(`/api/export-frames/cancel/${jid}`, {
           method: 'POST',
           headers: getApiTokenHeaders(),
         });
-        const d = await r.json().catch(() => ({}));
-        if (r.ok && d.cancelled === true) serverCancelled = true;
+        if (r.ok) {
+          const d = await r.json().catch(() => ({}));
+          if (d.cancelled === true) result = { cancelled: true, committed: false, networkError: false };
+          else result = { cancelled: false, committed: true, networkError: false };
+        }
       } catch {
-        // Network/dropped cancel response: never blindly abort an in-flight /finish that may have committed!
-        serverCancelled = false;
+        // Network/dropped cancel response: keep activeExportJobId so the user can retry Cancel!
+        result = { cancelled: false, committed: false, networkError: true };
       }
-      this.activeExportJobId = null;
-      this.lastCancelResult = { cancelled: serverCancelled };
-      if (serverCancelled && this.exportAbortCtrl) {
+      if (!result.networkError) {
+        this.activeExportJobId = null;
+        this.lastCancelResult = result;
+      }
+      if (result.cancelled && this.exportAbortCtrl) {
         this.exportAbortCtrl.abort();
       }
-      return this.lastCancelResult;
+      return result;
     })();
     try {
       return await this.cancelInFlight;
