@@ -3,6 +3,7 @@ uploads/
 thumbs/
 exports/
 projects/
+catalog.json
 *.log
 server.log
 .DS_Store

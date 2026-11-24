@@ -1,971 +1,1720 @@
 /**
- * MotionCut Pro v2 — Real-Time 60fps Multi-Track Compositor, Keyframes,
- * Stackable Multi-VFX, Masks, Chroma Key, Blend Modes, Speed Ramps,
- * Vector Stickers, Hormozi Captions, WebAudio EQ/VU & Deterministic FFmpeg Export.
+ * MotionCut Pro v3 — Frame-Accurate Resolution-Independent Canvas Compositor,
+ * WebAudio Mixer, A->B Transition Engine, Mask Feathering, Keyframes & Deterministic FFmpeg Exporter.
  */
 
-export const TEXT_PRESETS = [
-  { id: 'meta',     name: 'DIN Meta Hook',   text: 'FLORA + BLENDER\nIS NEW META', font: 'DIN Condensed, Impact, sans-serif', size: 112, color: '#ffffff', stroke: '#000000', strokeW: 0, bg: 'transparent', bgAlpha: 0, spacing: 2, anim: 'pop', y: -320 },
-  { id: 'bold',     name: 'Viral Bold',      text: 'WATCH THIS', font: 'Impact, Arial Black, sans-serif', size: 108, color: '#fff200', stroke: '#000000', strokeW: 10, bg: 'transparent', bgAlpha: 0, spacing: 2, anim: 'pop', y: 0 },
-  { id: 'pill',     name: 'CapCut Pill',     text: 'HOW THIS WAS MADE', font: '-apple-system, Inter, sans-serif', size: 52, color: '#081012', stroke: 'transparent', strokeW: 0, bg: '#00e5c3', bgAlpha: 0.96, spacing: 1, anim: 'slideUp', y: 310 },
-  { id: 'scanner',  name: 'Scanner Plate',   text: 'PLATE 01  ·  1200 DPI', font: 'SF Mono, Menlo, monospace', size: 40, color: '#eef6ff', stroke: 'transparent', strokeW: 0, bg: '#050810', bgAlpha: 0.78, spacing: 6, anim: 'typewriter', y: -360 },
-  { id: 'subtitle', name: 'Clean Caption',   text: 'one static image turned into a studio reel', font: '-apple-system, Inter, sans-serif', size: 46, color: '#ffffff', stroke: '#000000', strokeW: 5, bg: '#000000', bgAlpha: 0.55, spacing: 0, anim: 'fade', y: 360 },
-  { id: 'neon',     name: 'Neon Cyber',      text: 'MOTIONVIZ', font: 'Avenir Next, Helvetica Neue, sans-serif', size: 96, color: '#00e5c3', stroke: '#00e5c3', strokeW: 2, bg: 'transparent', bgAlpha: 0, spacing: 12, anim: 'glitch', y: 0 },
-  { id: 'minimal',  name: 'Swiss Editorial', text: 'FRAME 0001\nFLORA × BLENDER', font: 'Helvetica Neue, Inter, sans-serif', size: 58, color: '#f4f0e6', stroke: 'transparent', strokeW: 0, bg: 'transparent', bgAlpha: 0, spacing: 10, anim: 'fade', y: 0 },
-  { id: 'callout',  name: 'Highlight Tag',   text: '0.00$ LOCAL RENDER', font: 'SF Mono, Menlo, monospace', size: 38, color: '#ffffff', stroke: 'transparent', strokeW: 0, bg: '#ff4d6d', bgAlpha: 0.94, spacing: 2, anim: 'pop', y: -260 },
+export const SPEED_CURVES = {
+  none: { label: 'Normal (Constant)', pts: null },
+  montage: { label: 'Montage', pts: [[0, 2.2], [0.22, 0.45], [0.55, 0.45], [0.78, 2.2], [1, 1.4]] },
+  hero: { label: 'Hero Slow-Mo', pts: [[0, 1.0], [0.3, 0.35], [0.65, 0.35], [0.85, 2.4], [1, 1.0]] },
+  bullet: { label: 'Bullet Time', pts: [[0, 3.0], [0.2, 0.3], [0.75, 0.3], [1, 2.5]] },
+  flashin: { label: 'Flash In', pts: [[0, 3.5], [0.25, 1.0], [1, 1.0]] },
+  smooth: { label: 'Ease S-Curve', pts: [[0, 0.5], [0.5, 1.8], [1, 0.5]] },
+};
+
+export const EASING_TYPES = [
+  { id: 'easeInOut', label: 'Ease In-Out' },
+  { id: 'linear', label: 'Linear' },
+  { id: 'easeIn', label: 'Ease In' },
+  { id: 'easeOut', label: 'Ease Out' },
+  { id: 'bounce', label: 'Smooth Overshoot' },
 ];
 
-export const GRAPHIC_PRESETS = [
-  { id: 'recBadge',    name: 'REC ● Camera',     swatch: '#1a0a10', label: '● REC' },
-  { id: 'viewfinder',  name: 'Viewfinder HUD',   swatch: '#0d1420', label: '[ + ]' },
-  { id: 'progressBar', name: 'Timeline Bar',     swatch: '#091f1c', label: '━━━' },
-  { id: 'lowerThird',  name: 'Lower Third',      swatch: '#161b26', label: '▎TITLE' },
-  { id: 'arrowRight',  name: 'Accent Arrow',     swatch: '#1c1528', label: '➜' },
-  { id: 'colorMatte',  name: 'Gradient Matte',   swatch: 'linear-gradient(135deg,#00e5c3,#3b82f6)', label: 'BG' },
+export const LUT_FILTERS = [
+  { id: 'none', name: 'Original', css: '' },
+  { id: 'teal-orange', name: 'Teal & Orange', css: 'contrast(1.14) saturate(1.25) sepia(0.14) hue-rotate(-8deg)' },
+  { id: 'cinematic', name: 'Cinema Moody', css: 'contrast(1.22) brightness(0.93) saturate(0.85)' },
+  { id: 'cyberpunk', name: 'Cyber Neon', css: 'contrast(1.25) saturate(1.55) hue-rotate(12deg)' },
+  { id: 'kodak', name: 'Kodak 2383', css: 'contrast(1.12) saturate(1.18) sepia(0.18) brightness(1.03)' },
+  { id: 'vintage', name: '90s VHS', css: 'sepia(0.32) contrast(1.08) saturate(0.82) brightness(0.96)' },
+  { id: 'bw-noir', name: 'Noir B&W', css: 'grayscale(1) contrast(1.38) brightness(0.95)' },
+  { id: 'vivid', name: 'Vivid Pop', css: 'saturate(1.48) contrast(1.1) brightness(1.04)' },
+  { id: 'matte', name: 'Matte Film', css: 'contrast(0.9) brightness(1.06) saturate(0.88)' },
+  { id: 'cold-steel', name: 'Cold Steel', css: 'saturate(0.75) contrast(1.16) hue-rotate(18deg)' },
 ];
 
 export const EFFECT_PRESETS = [
-  { id: 'rgbSplit',   name: 'RGB Split',       swatch: 'linear-gradient(90deg,#ff2a55,#00f0ff)', label: 'RGB' },
-  { id: 'scannerBar', name: 'Optical Scanner', swatch: 'linear-gradient(90deg,#050814,#0033ff,#00f5ff,#fff)', label: 'SCAN' },
-  { id: 'crt',        name: 'CRT Scanlines',   swatch: 'repeating-linear-gradient(0deg,#111,#111 2px,#2b3040 2px,#2b3040 4px)', label: 'CRT' },
-  { id: 'vhsGlitch',  name: 'VHS Glitch',      swatch: 'linear-gradient(135deg,#2a0845,#ff006e)', label: 'VHS' },
-  { id: 'grain',      name: '35mm Grain',      swatch: 'radial-gradient(circle,#444,#141414)', label: 'FILM' },
-  { id: 'negative',   name: 'Negative X-Ray',  swatch: 'linear-gradient(135deg,#fff,#1b2438)', label: 'INV' },
-  { id: 'pixelate',   name: 'PS2 Pixelate',    swatch: 'linear-gradient(135deg,#334155,#0f172a)', label: '480i' },
-  { id: 'zoomPulse',  name: 'Beat Zoom Pulse', swatch: 'radial-gradient(circle,#00e5c3,#091418)', label: 'BEAT' },
-  { id: 'softGlow',   name: 'Dream Glow',      swatch: 'radial-gradient(circle,#ffd6e7,#3b1d38)', label: 'GLOW' },
-  { id: 'halftone',   name: 'Thermal Edge',    swatch: 'linear-gradient(135deg,#ff4d6d,#ffb84d,#00e5c3)', label: 'EDGE' },
+  { id: 'glitch', name: 'RGB Glitch', badge: 'VFX' },
+  { id: 'shake', name: 'Camera Shake', badge: 'MOTION' },
+  { id: 'vhs', name: 'VHS Scanlines', badge: 'RETRO' },
+  { id: 'bloom', name: 'Dream Glow', badge: 'GLOW' },
+  { id: 'vignette', name: 'Cinema Vignette', badge: 'FILM' },
+  { id: 'letterbox', name: '2.39:1 Bars', badge: 'SCOPE' },
+  { id: 'bw-flash', name: 'Strobe Flash', badge: 'BEAT' },
+  { id: 'chromatic', name: 'Chromatic Split', badge: 'OPTIC' },
+  { id: 'zoom-pulse', name: 'Beat Zoom Pulse', badge: 'BEAT' },
+  { id: 'pixelate', name: 'Retro Pixelate', badge: '8-BIT' },
+  { id: 'mirror-h', name: 'Mirror Split', badge: 'STYLE' },
 ];
 
 export const TRANSITION_PRESETS = [
-  { id: 'none',       name: 'Hard Cut',      label: '|' },
-  { id: 'fade',       name: 'Cross Fade',    label: '◐' },
-  { id: 'flashWhite', name: 'Flash White',   label: '✦' },
-  { id: 'fadeBlack',  name: 'Dip to Black',  label: '●' },
-  { id: 'zoomIn',     name: 'Zoom In',       label: '⊕' },
-  { id: 'zoomOut',    name: 'Zoom Out',      label: '⊖' },
-  { id: 'slideLeft',  name: 'Slide Left',    label: '←' },
-  { id: 'slideRight', name: 'Slide Right',   label: '→' },
-  { id: 'wipeRight',  name: 'Scanner Wipe',  label: '▌' },
-  { id: 'glitchCut',  name: 'Glitch Cut',    label: '⚡' },
+  { id: 'none', name: 'None (Hard Cut)', dur: 0 },
+  { id: 'crossfade', name: 'Cross Dissolve', dur: 0.5 },
+  { id: 'dip-black', name: 'Dip to Black', dur: 0.5 },
+  { id: 'flash', name: 'White Flash', dur: 0.35 },
+  { id: 'slide-left', name: 'Slide Push Left', dur: 0.45 },
+  { id: 'slide-up', name: 'Slide Push Up', dur: 0.45 },
+  { id: 'zoom-in', name: 'Zoom In Cut', dur: 0.45 },
+  { id: 'wipe-left', name: 'Wipe Left', dur: 0.5 },
+  { id: 'blur-dissolve', name: 'Blur Dissolve', dur: 0.5 },
 ];
 
-export const FILTER_PRESETS = [
-  { id: 'none',      name: 'Original',     vals: { brightness: 100, contrast: 100, saturate: 100, hue: 0, blur: 0, vignette: 0 } },
-  { id: 'cinema',    name: 'Cinema Teal',  vals: { brightness: 96,  contrast: 118, saturate: 112, hue: -8,  blur: 0, vignette: 35 } },
-  { id: 'y2k',       name: 'Y2K Gloss',    vals: { brightness: 106, contrast: 114, saturate: 128, hue: 4,   blur: 0, vignette: 18 } },
-  { id: 'darkroom',  name: 'Darkroom',     vals: { brightness: 84,  contrast: 136, saturate: 92,  hue: -12, blur: 0, vignette: 55 } },
-  { id: 'warmFilm',  name: 'Warm Kodak',   vals: { brightness: 104, contrast: 108, saturate: 118, hue: 14,  blur: 0, vignette: 26 } },
-  { id: 'noir',      name: 'High Noir',    vals: { brightness: 98,  contrast: 148, saturate: 0,   hue: 0,   blur: 0, vignette: 48 } },
-  { id: 'vivid',     name: 'Vivid Pop',    vals: { brightness: 105, contrast: 120, saturate: 145, hue: 0,   blur: 0, vignette: 10 } },
-  { id: 'cyber',     name: 'Neon Cyber',   vals: { brightness: 96,  contrast: 132, saturate: 155, hue: -24, blur: 0, vignette: 40 } },
+export const GRAPHICS_PRESETS = [
+  { id: 'rec-badge', name: 'REC ● HUD', label: 'REC 00:00' },
+  { id: 'viewfinder', name: 'Camera Frame', label: '4K 60FPS' },
+  { id: 'progress-bar', name: 'Progress Bar', label: 'AUTO BAR' },
+  { id: 'lower-third', name: 'Lower Third', label: 'SPEAKER' },
+  { id: 'arrow-callout', name: 'Neon Arrow', label: 'POINTER' },
+  { id: 'gradient-matte', name: 'Bottom Matte', label: 'GRADIENT' },
 ];
 
-export const SPEED_CURVES = {
-  normal:  { name: 'Constant',  fn: u => u },
-  montage: { name: 'Montage',   fn: u => u < 0.25 ? u * 2.0 : u < 0.75 ? 0.5 + (u - 0.25) * 0.4 : 0.7 + (u - 0.75) * 1.2 },
-  hero:    { name: 'Hero Slow', fn: u => u < 0.35 ? u * 1.6 : u < 0.7 ? 0.56 + (u - 0.35) * 0.35 : 0.6825 + (u - 0.7) * 1.058 },
-  bullet:  { name: 'Bullet',    fn: u => Math.pow(u, 1.8) },
-  flashIn: { name: 'Flash In',  fn: u => 1 - Math.pow(1 - u, 2.2) },
-  jumpCut: { name: 'Ease S',    fn: u => u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2 },
-};
-
-export const SFX_PRESETS = [
-  { id: 'whoosh',  name: 'Optical Whoosh', dur: 0.65 },
-  { id: 'subDrop', name: '808 Sub Drop',   dur: 1.10 },
-  { id: 'glitch',  name: 'Glitch Hit',     dur: 0.35 },
-  { id: 'shutter', name: 'Camera Shutter', dur: 0.25 },
-  { id: 'riser',   name: 'Tension Riser',  dur: 1.60 },
-  { id: 'chime',   name: 'Lock-In Chime',  dur: 0.85 },
-];
-
-export function synthSfxWavUrl(sfxId) {
-  const sr = 44100;
-  const preset = SFX_PRESETS.find(s => s.id === sfxId) || SFX_PRESETS[0];
-  const n = Math.floor(sr * preset.dur);
-  const data = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const t = i / sr, u = i / n;
-    let v = 0;
-    if (sfxId === 'whoosh') {
-      const env = Math.sin(Math.PI * u) ** 1.6;
-      v = (Math.random() * 2 - 1) * env * 0.45 + Math.sin(2 * Math.PI * (180 + 520 * u) * t) * env * 0.22;
-    } else if (sfxId === 'subDrop') {
-      const f = 36 + 115 * Math.exp(-t * 5.2);
-      v = Math.tanh(Math.sin(2 * Math.PI * f * t) * 1.8) * Math.exp(-t * 2.8) * 0.85;
-    } else if (sfxId === 'glitch') {
-      const step = Math.floor(t * 48);
-      const f = 320 + ((step * 313) % 1900);
-      v = (Math.sin(2 * Math.PI * f * t) * 0.6 + (Math.random() * 2 - 1) * 0.4) * Math.exp(-t * 9.5);
-    } else if (sfxId === 'shutter') {
-      v = ((Math.random() * 2 - 1) * Math.exp(-t * 65) + Math.sin(2 * Math.PI * 2600 * t) * Math.exp(-t * 110) * 0.5) * 0.8;
-    } else if (sfxId === 'riser') {
-      const f = 140 * Math.pow(8, u);
-      v = (Math.sin(2 * Math.PI * f * t) * 0.35 + (Math.random() * 2 - 1) * 0.25) * (u ** 1.8);
-    } else {
-      v = (Math.sin(2 * Math.PI * 1318.5 * t) + 0.55 * Math.sin(2 * Math.PI * 1760 * t)) * Math.exp(-t * 5.5) * 0.6;
+export function evalEasing(type, u) {
+  const x = Math.max(0, Math.min(1, u));
+  switch (type) {
+    case 'linear': return x;
+    case 'easeIn': return x * x * x;
+    case 'easeOut': return 1 - Math.pow(1 - x, 3);
+    case 'bounce': {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
     }
-    data[i] = Math.max(-1, Math.min(1, v));
+    case 'easeInOut':
+    default:
+      return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
   }
-  const buf = new ArrayBuffer(44 + n * 2);
-  const view = new DataView(buf);
-  const ws = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
-  ws(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE');
-  ws(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true); view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true);
-  view.setUint16(32, 2, true); view.setUint16(34, 16, true); ws(36, 'data'); view.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) view.setInt16(44 + i * 2, Math.round(data[i] * 32767), true);
-  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
 
-export function evalClipProp(clip, prop, localTime) {
-  const kfs = clip.keyframes?.[prop];
-  if (!kfs || kfs.length === 0) return clip[prop];
-  const sorted = [...kfs].sort((a, b) => a.t - b.t);
+export function evalKeyframe(clip, prop, localTime, fallback) {
+  const list = clip.keyframes?.[prop];
+  if (!list || list.length === 0) return fallback;
+  const sorted = [...list].sort((a, b) => a.t - b.t);
   if (localTime <= sorted[0].t) return sorted[0].v;
   if (localTime >= sorted[sorted.length - 1].t) return sorted[sorted.length - 1].v;
   for (let i = 0; i < sorted.length - 1; i++) {
-    const a = sorted[i], b = sorted[i + 1];
+    const a = sorted[i];
+    const b = sorted[i + 1];
     if (localTime >= a.t && localTime <= b.t) {
-      let u = (localTime - a.t) / Math.max(0.0001, b.t - a.t);
-      u = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
-      return a.v + (b.v - a.v) * u;
+      const u = (localTime - a.t) / Math.max(0.0001, b.t - a.t);
+      const ease = evalEasing(b.ease || a.ease || 'easeInOut', u);
+      return a.v + (b.v - a.v) * ease;
     }
   }
-  return clip[prop];
+  return fallback;
 }
 
-function hexToRgb(hex) {
-  const clean = (hex || '#00ff00').replace('#', '');
-  const n = parseInt(clean.length === 3 ? clean.split('').map(c => c + c).join('') : clean, 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+export function evalSpeedCurve(curveKey, u) {
+  const def = SPEED_CURVES[curveKey];
+  if (!def || !def.pts) return 1;
+  const pts = def.pts;
+  const uc = Math.max(0, Math.min(1, u));
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [u0, s0] = pts[i];
+    const [u1, s1] = pts[i + 1];
+    if (uc >= u0 && uc <= u1) {
+      const f = (uc - u0) / Math.max(0.0001, u1 - u0);
+      return s0 + (s1 - s0) * f;
+    }
+  }
+  return pts[pts.length - 1][1];
 }
 
-export class CompositorEngine {
-  constructor(canvas, overlayCanvas, onMediaReady = null) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext('2d', { willReadFrequently: true });
+export function getSourceTime(clip, localTime, mediaDuration) {
+  const baseSpeed = Math.max(0.1, Number(clip.speed) || 1);
+  const dur = Math.max(0.04, Number(clip.duration) || 1);
+  let srcOffset = 0;
+  if (clip.speedCurve && clip.speedCurve !== 'none' && SPEED_CURVES[clip.speedCurve]?.pts) {
+    const steps = 20;
+    const clampedLocal = Math.max(0, Math.min(dur, localTime));
+    const dt = clampedLocal / steps;
+    for (let i = 0; i < steps; i++) {
+      const u = ((i + 0.5) * dt) / dur;
+      srcOffset += dt * baseSpeed * evalSpeedCurve(clip.speedCurve, u);
+    }
+  } else {
+    srcOffset = localTime * baseSpeed;
+  }
+  const maxDur = Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 9999;
+  if (clip.reverse) {
+    const span = getClipSourceSpan(clip);
+    const revEnd = Math.min(maxDur - 0.02, (clip.trimStart || 0) + span);
+    return Math.max(0, Math.min(maxDur - 0.02, revEnd - srcOffset));
+  }
+  return Math.max(0, Math.min(maxDur - 0.02, (clip.trimStart || 0) + srcOffset));
+}
+
+export function getClipSourceSpan(clip) {
+  const baseSpeed = Math.max(0.1, Number(clip.speed) || 1);
+  const dur = Math.max(0.04, Number(clip.duration) || 1);
+  if (clip.speedCurve && clip.speedCurve !== 'none' && SPEED_CURVES[clip.speedCurve]?.pts) {
+    const steps = 20;
+    const dt = dur / steps;
+    let total = 0;
+    for (let i = 0; i < steps; i++) {
+      total += dt * baseSpeed * evalSpeedCurve(clip.speedCurve, (i + 0.5) / steps);
+    }
+    return total;
+  }
+  return dur * baseSpeed;
+}
+
+export function getSnapshotDuration(snap) {
+  let maxT = 0;
+  for (const tr of (snap.tracks || [])) {
+    for (const c of (tr.clips || [])) {
+      maxT = Math.max(maxT, (c.start || 0) + (c.duration || 0));
+    }
+  }
+  for (const cap of (snap.captions || [])) {
+    maxT = Math.max(maxT, cap.end || 0);
+  }
+  return maxT;
+}
+
+function getApiTokenHeaders(extra = {}) {
+  return { 'X-MC-Token': window.__MC_TOKEN__ || '', ...extra };
+}
+
+export class VideoEngine {
+  constructor(state, previewCanvas, overlayCanvas, callbacks = {}) {
+    this.state = state;
+    this.canvas = previewCanvas;
+    this.ctx = previewCanvas.getContext('2d', { willReadFrequently: false });
     this.overlay = overlayCanvas;
     this.octx = overlayCanvas.getContext('2d');
-    this.onMediaReady = onMediaReady;
-    this.mediaElements = new Map();
-    this.offscreen = document.createElement('canvas');
-    this.offCtx = this.offscreen.getContext('2d', { willReadFrequently: true });
-    this.chromaCanvas = document.createElement('canvas');
-    this.chromaCtx = this.chromaCanvas.getContext('2d', { willReadFrequently: true });
+    this.onMediaReady = callbacks.onMediaReady || (() => {});
+    this.onMediaError = callbacks.onMediaError || (() => {});
+
+    this.mediaElements = new Map(); // key -> HTMLVideoElement | HTMLAudioElement | HTMLImageElement
+    this.erroredMedia = new Set();  // mediaId set
     this.audioCtx = null;
+    this.masterGain = null;
     this.analyserL = null;
     this.analyserR = null;
-    this.audioNodes = new Map();
-    this.showGuides = false;
-    this.lastLayerBounds = []; // [{ clipId, cx, cy, w, h, rot }] for on-canvas hit-testing!
-    this.snapLines = { x: false, y: false };
+    this.clipAudioNodes = new Map();
+
+    // Reusable offscreen scratch canvases
+    this.layerCanvas = document.createElement('canvas');
+    this.layerCtx = this.layerCanvas.getContext('2d');
+    this.layerCanvasB = document.createElement('canvas');
+    this.layerCtxB = this.layerCanvasB.getContext('2d');
+    this.maskCanvas = document.createElement('canvas');
+    this.maskCtx = this.maskCanvas.getContext('2d');
+    this.chromaCanvas = document.createElement('canvas');
+    this.chromaCtx = this.chromaCanvas.getContext('2d', { willReadFrequently: true });
+
+    this.isExporting = false;
+    this.activeExportJobId = null;
+    this.exportAbortCtrl = null;
+    this.snapXGuide = null; // null or logical X
+    this.snapYGuide = null; // null or logical Y
   }
 
-  ensureAudioContext() {
+  ensureAudioCtx() {
     if (!this.audioCtx) {
-      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.audioCtx = new AC();
+      this.masterGain = this.audioCtx.createGain();
       const splitter = this.audioCtx.createChannelSplitter(2);
       this.analyserL = this.audioCtx.createAnalyser();
       this.analyserR = this.audioCtx.createAnalyser();
       this.analyserL.fftSize = 256;
       this.analyserR.fftSize = 256;
-      this.masterGain = this.audioCtx.createGain();
       this.masterGain.connect(this.audioCtx.destination);
       this.masterGain.connect(splitter);
       splitter.connect(this.analyserL, 0);
       splitter.connect(this.analyserR, 1);
     }
     if (this.audioCtx.state === 'suspended') this.audioCtx.resume().catch(() => {});
+    this.masterGain.gain.value = this.state.masterMuted ? 0 : 1;
+    return this.audioCtx;
   }
 
   getVULevels() {
-    if (!this.analyserL || !this.analyserR) return [0, 0];
-    const read = an => {
-      const buf = new Uint8Array(an.frequencyBinCount);
-      an.getByteTimeDomainData(buf);
-      let peak = 0;
-      for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
-      return Math.min(1, peak * 1.45);
+    if (!this.analyserL || !this.state.playing || this.state.masterMuted) return [0, 0];
+    const bufL = new Uint8Array(this.analyserL.frequencyBinCount);
+    const bufR = new Uint8Array(this.analyserR.frequencyBinCount);
+    this.analyserL.getByteTimeDomainData(bufL);
+    this.analyserR.getByteTimeDomainData(bufR);
+    const peak = (arr) => {
+      let m = 0;
+      for (let i = 0; i < arr.length; i++) m = Math.max(m, Math.abs((arr[i] - 128) / 128));
+      return Math.min(1, m * 1.85);
     };
-    return [read(this.analyserL), read(this.analyserR)];
+    return [peak(bufL), peak(bufR)];
   }
 
-  ensureMediaElement(clip, mediaItem) {
-    if (!mediaItem) return null;
-    let el = this.mediaElements.get(clip.id);
-    if (el && el.dataset.url === mediaItem.url) return el;
+  getMediaById(id, snap = this.state) {
+    return (snap.library || this.state.library).find(m => m.id === id) || null;
+  }
 
-    if (clip.type === 'video') {
-      el = document.createElement('video');
-      el.src = mediaItem.url;
-      el.crossOrigin = 'anonymous';
-      el.playsInline = true;
-      el.preload = 'auto';
-      el.muted = true;
-      el.addEventListener('loadeddata', () => this.onMediaReady?.(), { once: true });
-      el.addEventListener('seeked', () => this.onMediaReady?.());
-    } else if (clip.type === 'audio') {
-      el = document.createElement('audio');
-      el.src = mediaItem.url;
-      el.crossOrigin = 'anonymous';
-      el.preload = 'auto';
-    } else if (clip.type === 'image') {
-      el = new Image();
-      el.crossOrigin = 'anonymous';
-      el.onload = () => this.onMediaReady?.();
-      el.src = mediaItem.url;
+  getOrCreateElement(clip, snap = this.state) {
+    if (!clip.mediaId) return null;
+    const media = this.getMediaById(clip.mediaId, snap);
+    if (!media) return null;
+    const key = `${clip.id}::${media.id}::${media.url}`;
+    if (this.mediaElements.has(key)) return this.mediaElements.get(key);
+
+    if (media.type === 'image') {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        this.erroredMedia.delete(media.id);
+        if (!this.isExporting) this.onMediaReady();
+      };
+      img.onerror = () => {
+        this.erroredMedia.add(media.id);
+        if (!this.isExporting) this.onMediaError(media);
+      };
+      img.src = media.url;
+      this.mediaElements.set(key, img);
+      return img;
     }
-    if (el) {
-      el.dataset.url = mediaItem.url;
-      this.mediaElements.set(clip.id, el);
-    }
+
+    const el = document.createElement(media.type === 'audio' ? 'audio' : 'video');
+    el.crossOrigin = 'anonymous';
+    el.preload = 'auto';
+    el.playsInline = true;
+    el.muted = false;
+    el.addEventListener('loadeddata', () => {
+      this.erroredMedia.delete(media.id);
+      if (!this.isExporting) this.onMediaReady();
+    });
+    el.addEventListener('seeked', () => {
+      if (!this.isExporting) this.onMediaReady();
+    });
+    el.addEventListener('error', () => {
+      this.erroredMedia.add(media.id);
+      if (!this.isExporting) this.onMediaError(media);
+    });
+    el.src = media.url;
+    this.mediaElements.set(key, el);
     return el;
   }
 
-  cleanupUnusedElements(activeIds) {
-    for (const [id, el] of this.mediaElements.entries()) {
-      if (!activeIds.has(id)) {
-        try { if (el.pause) el.pause(); } catch {}
-        this.mediaElements.delete(id);
-        this.audioNodes.delete(id);
+  connectClipAudio(clipId, el) {
+    if (this.clipAudioNodes.has(clipId)) return this.clipAudioNodes.get(clipId);
+    const ac = this.ensureAudioCtx();
+    try {
+      const src = ac.createMediaElementSource(el);
+      const low = ac.createBiquadFilter(); low.type = 'lowshelf'; low.frequency.value = 180;
+      const high = ac.createBiquadFilter(); high.type = 'highshelf'; high.frequency.value = 4200;
+      const band = ac.createBiquadFilter(); band.type = 'allpass'; band.frequency.value = 1200; band.Q.value = 1.2;
+      const fxTone = ac.createBiquadFilter(); fxTone.type = 'allpass'; fxTone.frequency.value = 1000;
+      const delay = ac.createDelay(0.5); delay.delayTime.value = 0.12;
+      const delayFb = ac.createGain(); delayFb.gain.value = 0;
+      const delayWet = ac.createGain(); delayWet.gain.value = 0;
+      const gain = ac.createGain();
+
+      src.connect(low);
+      low.connect(high);
+      high.connect(band);
+      band.connect(fxTone);
+      fxTone.connect(gain);
+      // Parallel echo send
+      fxTone.connect(delay);
+      delay.connect(delayFb);
+      delayFb.connect(delay);
+      delay.connect(delayWet);
+      delayWet.connect(gain);
+      gain.connect(this.masterGain);
+
+      const bundle = { src, low, high, band, fxTone, delay, delayFb, delayWet, gain };
+      this.clipAudioNodes.set(clipId, bundle);
+      return bundle;
+    } catch {
+      return null;
+    }
+  }
+
+  pauseAllMedia() {
+    for (const el of this.mediaElements.values()) {
+      if (el instanceof HTMLMediaElement && !el.paused) {
+        try { el.pause(); } catch {}
       }
     }
   }
 
-  connectAudioElement(clip, el) {
-    if (!this.audioCtx || !el || (clip.type !== 'video' && clip.type !== 'audio')) return null;
-    if (this.audioNodes.has(clip.id)) return this.audioNodes.get(clip.id);
-    try {
-      el.muted = false;
-      const src = this.audioCtx.createMediaElementSource(el);
-      const bass = this.audioCtx.createBiquadFilter();
-      bass.type = 'lowshelf'; bass.frequency.value = 180;
-      const treble = this.audioCtx.createBiquadFilter();
-      treble.type = 'highshelf'; treble.frequency.value = 3200;
-      const bp = this.audioCtx.createBiquadFilter();
-      bp.type = 'allpass';
-      const gain = this.audioCtx.createGain();
-      src.connect(bass); bass.connect(treble); treble.connect(bp); bp.connect(gain);
-      gain.connect(this.masterGain);
-      const chain = { src, bass, treble, bp, gain };
-      this.audioNodes.set(clip.id, chain);
-      return chain;
-    } catch { return null; }
-  }
-
-  computeSourceTime(clip, media, localT) {
-    const speed = Math.max(0.25, Math.min(8, clip.speed || 1));
-    const curve = SPEED_CURVES[clip.speedCurve || 'normal'] || SPEED_CURVES.normal;
-    const u = Math.max(0, Math.min(1, localT / Math.max(0.001, clip.duration)));
-    const mappedLocal = curve.fn(u) * clip.duration;
-    let mediaT = (clip.trimStart || 0) + mappedLocal * speed;
-    if (clip.reverse) {
-      const endSrc = (clip.trimStart || 0) + clip.duration * speed;
-      mediaT = Math.max(0, endSrc - mappedLocal * speed);
+  pruneUnusedElements() {
+    const activeIds = new Set();
+    for (const tr of this.state.tracks) {
+      for (const c of tr.clips) activeIds.add(c.id);
     }
-    if (media?.duration) mediaT = Math.max(0, Math.min(media.duration - 0.025, mediaT));
-    return mediaT;
+    for (const [key, el] of this.mediaElements.entries()) {
+      const cid = key.split('::')[0];
+      if (!activeIds.has(cid)) {
+        if (el instanceof HTMLMediaElement) {
+          try { el.pause(); el.removeAttribute('src'); el.load(); } catch {}
+        }
+        this.mediaElements.delete(key);
+        this.clipAudioNodes.delete(cid);
+      }
+    }
   }
 
-  syncMediaForTime(state, t, isPlaying) {
-    this.cleanupUnusedElements(new Set(state.clips.map(c => c.id)));
-    for (const clip of state.clips) {
-      if (clip.type === 'text' || clip.type === 'graphic') continue;
-      const track = state.tracks.find(tr => tr.id === clip.trackId);
-      const media = state.library.find(m => m.id === clip.mediaId);
-      const el = this.ensureMediaElement(clip, media);
-      if (!el || clip.type === 'image') continue;
+  /** Find if clip B has an adjacent preceding clip A on the same track for A->B transitions */
+  findOutgoingTransitionClip(track, clipB, t) {
+    if (!clipB.transIn || clipB.transIn === 'none') return null;
+    const td = Math.min(clipB.transInDur || 0.5, clipB.duration * 0.5);
+    if (td <= 0.01 || t < clipB.start || t > clipB.start + td) return null;
+    // Find clip A whose end is within 0.06s of clipB.start
+    let prev = null;
+    for (const c of track.clips) {
+      if (c.id === clipB.id) continue;
+      if (Math.abs((c.start + c.duration) - clipB.start) <= 0.06) {
+        prev = c;
+        break;
+      }
+    }
+    if (!prev) return null;
+    const prog = Math.max(0, Math.min(1, (t - clipB.start) / td));
+    return { clipA: prev, prog, dur: td };
+  }
 
-      const inRange = t >= clip.start && t < clip.start + clip.duration;
-      const speed = Math.max(0.25, Math.min(8, clip.speed || 1));
-      const voiceRateMul = clip.voiceFx === 'chipmunk' ? 1.35 : clip.voiceFx === 'deep' ? 0.78 : 1.0;
+  syncMediaForTime(t, isPlaying) {
+    if (this.isExporting) return;
+    if (isPlaying) this.ensureAudioCtx();
+    const activeKeys = new Set();
 
-      if (inRange) {
+    for (const track of this.state.tracks) {
+      for (const clip of track.clips) {
+        if (!clip.mediaId) continue;
+        const media = this.getMediaById(clip.mediaId);
+        if (!media || media.type === 'image') continue;
+
+        const inClip = t >= clip.start && t < clip.start + clip.duration;
+        // Also keep outgoing clip A synced during A->B transition tail!
+        let isOutgoingTail = false;
+        if (!inClip && (track.type === 'video' || track.type === 'overlay')) {
+          const next = track.clips.find(n => n.id !== clip.id && n.transIn && n.transIn !== 'none' && Math.abs((clip.start + clip.duration) - n.start) <= 0.06);
+          if (next) {
+            const td = Math.min(next.transInDur || 0.5, next.duration * 0.5);
+            if (t >= next.start && t <= next.start + td) isOutgoingTail = true;
+          }
+        }
+        if (!inClip && !isOutgoingTail) continue;
+
+        const el = this.getOrCreateElement(clip);
+        if (!el) continue;
+        const key = `${clip.id}::${media.id}::${media.url}`;
+        activeKeys.add(key);
+
         const localT = t - clip.start;
-        const mediaT = this.computeSourceTime(clip, media, localT);
-        const trackMuted = track?.muted || clip.muted || state.masterMute;
-        const canAudio = !trackMuted && (clip.type === 'audio' || (clip.type === 'video' && media?.hasAudio && !clip.audioDetached));
-        let vol = canAudio ? (clip.volume ?? 1) : 0;
-        if (vol > 0) {
-          if ((clip.fadeIn || 0) > 0 && localT < clip.fadeIn) vol *= localT / clip.fadeIn;
-          if ((clip.fadeOut || 0) > 0 && (clip.duration - localT) < clip.fadeOut) vol *= Math.max(0, (clip.duration - localT) / clip.fadeOut);
+        const target = getSourceTime(clip, localT, media.duration);
+        const speed = Math.max(0.25, Math.min(8, Number(clip.speed) || 1));
+        const hasCurve = clip.speedCurve && clip.speedCurve !== 'none';
+        const isComplex = Boolean(clip.reverse) || hasCurve;
+
+        // Compute audio gain (including keyframed volume, fades, and A->B audio crossfade!)
+        let vol = evalKeyframe(clip, 'volume', Math.max(0, localT), clip.volume ?? 1);
+        const fi = Math.min(clip.duration, Math.max(0, clip.fadeIn || 0));
+        const fo = Math.min(clip.duration, Math.max(0, clip.fadeOut || 0));
+        if (fi > 0.01 && localT < fi) vol *= Math.max(0, localT / fi);
+        if (fo > 0.01 && localT > clip.duration - fo) vol *= Math.max(0, (clip.duration - localT) / fo);
+        if (isOutgoingTail) {
+          const next = track.clips.find(n => n.id !== clip.id && Math.abs((clip.start + clip.duration) - n.start) <= 0.06);
+          const td = Math.min(next?.transInDur || 0.5, (next?.duration || 1) * 0.5);
+          const p = Math.max(0, Math.min(1, (t - (clip.start + clip.duration)) / Math.max(0.01, td)));
+          vol *= (1 - p);
+        } else if (clip.transIn && clip.transIn !== 'none') {
+          const trans = this.findOutgoingTransitionClip(track, clip, t);
+          if (trans) vol *= trans.prog;
+        }
+        if (track.muted || clip.muted || this.state.masterMuted) vol = 0;
+
+        if (isPlaying && this.audioCtx) {
+          const nodes = this.connectClipAudio(clip.id, el);
+          if (nodes) {
+            nodes.gain.gain.setTargetAtTime(Math.max(0, Math.min(2, vol)), this.audioCtx.currentTime, 0.015);
+            nodes.low.gain.value = clip.eqBass || 0;
+            nodes.high.gain.value = clip.eqTreble || 0;
+            const vfx = clip.voiceFx || 'none';
+            // Voice FX handled purely in WebAudio (never mutates el.playbackRate so video never jitters!)
+            if (vfx === 'radio') {
+              nodes.band.type = 'bandpass'; nodes.band.frequency.value = 1350; nodes.band.Q.value = 1.6;
+              nodes.fxTone.type = 'allpass';
+              nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+            } else if (vfx === 'deep') {
+              nodes.band.type = 'lowshelf'; nodes.band.frequency.value = 240; nodes.band.gain.value = 12;
+              nodes.fxTone.type = 'lowpass'; nodes.fxTone.frequency.value = 1900;
+              nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+            } else if (vfx === 'chipmunk') {
+              nodes.band.type = 'highpass'; nodes.band.frequency.value = 520;
+              nodes.fxTone.type = 'peaking'; nodes.fxTone.frequency.value = 3400; nodes.fxTone.gain.value = 10;
+              nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+            } else if (vfx === 'echo') {
+              nodes.band.type = 'allpass'; nodes.fxTone.type = 'allpass';
+              nodes.delay.delayTime.value = 0.12;
+              nodes.delayFb.gain.value = 0.38;
+              nodes.delayWet.gain.value = 0.55;
+            } else {
+              nodes.band.type = 'allpass'; nodes.fxTone.type = 'allpass';
+              nodes.delayWet.gain.value = 0; nodes.delayFb.gain.value = 0;
+            }
+          }
+        } else {
+          el.volume = Math.max(0, Math.min(1, vol));
         }
 
         if (isPlaying) {
-          this.ensureAudioContext();
-          const chain = this.connectAudioElement(clip, el);
-          if (chain) {
-            chain.gain.gain.setTargetAtTime(vol, this.audioCtx.currentTime, 0.015);
-            chain.bass.gain.setTargetAtTime(clip.eqBass || 0, this.audioCtx.currentTime, 0.02);
-            chain.treble.gain.setTargetAtTime(clip.eqTreble || 0, this.audioCtx.currentTime, 0.02);
-            if (clip.voiceFx === 'radio') {
-              chain.bp.type = 'bandpass'; chain.bp.frequency.value = 1400; chain.bp.Q.value = 2.4;
-            } else {
-              chain.bp.type = 'allpass';
+          if (isComplex) {
+            if (!el.paused) el.pause();
+            if (Math.abs((el.currentTime || 0) - target) > 0.025) {
+              try { el.currentTime = target; } catch {}
             }
           } else {
-            el.muted = !canAudio; el.volume = Math.max(0, Math.min(1, vol));
-          }
-          el.playbackRate = Math.max(0.25, Math.min(4, speed * voiceRateMul));
-          if (clip.reverse || (clip.speedCurve && clip.speedCurve !== 'normal')) {
-            el.pause();
-            if (Math.abs(el.currentTime - mediaT) > 0.03) el.currentTime = mediaT;
-          } else {
-            if (Math.abs(el.currentTime - mediaT) > 0.24) el.currentTime = mediaT;
-            if (el.paused) el.play().catch(() => {});
+            const desiredRate = Math.max(0.25, Math.min(4, speed));
+            if (Math.abs(el.playbackRate - desiredRate) > 0.01) el.playbackRate = desiredRate;
+            if (Math.abs((el.currentTime || 0) - target) > 0.08) {
+              try { el.currentTime = target; } catch {}
+            }
+            if (el.paused && el.readyState >= 2) el.play().catch(() => {});
           }
         } else {
           if (!el.paused) el.pause();
-          const chain = this.audioNodes.get(clip.id);
-          if (chain && this.audioCtx) chain.gain.gain.setValueAtTime(0, this.audioCtx.currentTime);
-          if (el.readyState >= 1 && Math.abs(el.currentTime - mediaT) > 0.02) el.currentTime = mediaT;
+          if (Math.abs((el.currentTime || 0) - target) > 0.012) {
+            try { el.currentTime = target; } catch {}
+          }
         }
-      } else {
-        if (!el.paused) el.pause();
-        const chain = this.audioNodes.get(clip.id);
-        if (chain && this.audioCtx) chain.gain.gain.setValueAtTime(0, this.audioCtx.currentTime);
+      }
+    }
+
+    for (const [key, el] of this.mediaElements.entries()) {
+      if (el instanceof HTMLMediaElement && !activeKeys.has(key) && !el.paused) {
+        try { el.pause(); } catch {}
       }
     }
   }
 
-  async seekAllExact(state, t) {
-    const promises = [];
-    for (const clip of state.clips) {
-      if (clip.type !== 'video') continue;
-      if (t < clip.start || t >= clip.start + clip.duration) continue;
-      const media = state.library.find(m => m.id === clip.mediaId);
-      const el = this.ensureMediaElement(clip, media);
-      if (!el) continue;
-      if (el.readyState < 2) {
-        await new Promise(res => {
-          const ok = () => { el.removeEventListener('loadeddata', ok); res(); };
-          el.addEventListener('loadeddata', ok, { once: true });
-          setTimeout(res, 1500);
-        });
-      }
-      const mediaT = this.computeSourceTime(clip, media, t - clip.start);
-      if (Math.abs(el.currentTime - mediaT) > 0.012) {
-        promises.push(new Promise(resolve => {
-          const done = () => { el.removeEventListener('seeked', done); resolve(); };
-          el.addEventListener('seeked', done, { once: true });
-          setTimeout(done, 260);
-          el.currentTime = mediaT;
-        }));
+  /** Wait deterministically for ALL active video frames & image overlays at time t */
+  async seekAllExact(snap, t) {
+    const tasks = [];
+    for (const track of snap.tracks) {
+      if (track.hidden) continue;
+      for (const clip of track.clips) {
+        if (!clip.mediaId) continue;
+        const inClip = t >= clip.start && t < clip.start + clip.duration;
+        let isOutgoingTail = false;
+        if (!inClip && (track.type === 'video' || track.type === 'overlay')) {
+          const next = track.clips.find(n => n.id !== clip.id && n.transIn && n.transIn !== 'none' && Math.abs((clip.start + clip.duration) - n.start) <= 0.06);
+          if (next) {
+            const td = Math.min(next.transInDur || 0.5, next.duration * 0.5);
+            if (t >= next.start && t <= next.start + td) isOutgoingTail = true;
+          }
+        }
+        if (!inClip && !isOutgoingTail) continue;
+
+        const media = this.getMediaById(clip.mediaId, snap);
+        if (!media) continue;
+        const el = this.getOrCreateElement(clip, snap);
+        if (!el) continue;
+
+        if (media.type === 'image') {
+          if (!el.complete || el.naturalWidth === 0) {
+            tasks.push(new Promise((resolve) => {
+              const done = () => resolve();
+              const timer = setTimeout(done, 1500);
+              el.addEventListener('load', () => { clearTimeout(timer); done(); }, { once: true });
+              el.addEventListener('error', () => { clearTimeout(timer); done(); }, { once: true });
+            }));
+          }
+          continue;
+        }
+        if (media.type !== 'video') continue;
+
+        const target = getSourceTime(clip, t - clip.start, media.duration);
+        tasks.push(this._seekVideoAccurate(el, target));
       }
     }
-    if (promises.length) await Promise.all(promises);
+    if (tasks.length) await Promise.all(tasks);
   }
 
-  renderFrame(state, t, drawOverlay = true) {
-    const W = state.canvasWidth;
-    const H = state.canvasHeight;
-    if (this.canvas.width !== W || this.canvas.height !== H) {
-      this.canvas.width = W; this.canvas.height = H;
-      this.overlay.width = W; this.overlay.height = H;
+  async _seekVideoAccurate(el, target) {
+    if (!el.paused) { try { el.pause(); } catch {} }
+    // Ensure metadata/first frame loaded
+    if (el.readyState < 2) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 2000);
+        const onReady = () => { clearTimeout(timer); resolve(); };
+        el.addEventListener('loadeddata', onReady, { once: true });
+        el.addEventListener('error', onReady, { once: true });
+      });
     }
-    const ctx = this.ctx;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (Math.abs((el.currentTime || 0) - target) <= 0.008 && el.readyState >= 2) break;
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        const timer = setTimeout(finish, 1400);
+        const onSeeked = () => {
+          clearTimeout(timer);
+          if (typeof el.requestVideoFrameCallback === 'function') {
+            const rvfcTimer = setTimeout(finish, 90);
+            el.requestVideoFrameCallback(() => { clearTimeout(rvfcTimer); finish(); });
+          } else {
+            finish();
+          }
+        };
+        el.addEventListener('seeked', onSeeked, { once: true });
+        try { el.currentTime = target; } catch { clearTimeout(timer); finish(); }
+      });
+    }
+  }
+
+  buildCssFilter(clip) {
+    const parts = [];
+    const lut = LUT_FILTERS.find(f => f.id === (clip.filter || 'none'));
+    if (lut && lut.css) parts.push(lut.css);
+    const b = 1 + (clip.brightness || 0) / 100;
+    const c = 1 + (clip.contrast || 0) / 100;
+    const s = 1 + (clip.saturation || 0) / 100;
+    const temp = clip.temperature || 0;
+    const blur = clip.blur || 0;
+    if (Math.abs(b - 1) > 0.005) parts.push(`brightness(${b.toFixed(3)})`);
+    if (Math.abs(c - 1) > 0.005) parts.push(`contrast(${c.toFixed(3)})`);
+    if (Math.abs(s - 1) > 0.005) parts.push(`saturate(${s.toFixed(3)})`);
+    if (temp > 1) parts.push(`sepia(${Math.min(0.6, temp / 120).toFixed(3)})`);
+    if (temp < -1) parts.push(`hue-rotate(${(temp * 0.45).toFixed(1)}deg)`);
+    if (blur > 0.2) parts.push(`blur(${blur.toFixed(1)}px)`);
+    return parts.join(' ') || 'none';
+  }
+
+  /**
+   * Render a single frame in resolution-independent project coordinates.
+   * Supports isolated clip capture (Freeze Frame) and immutable export snapshots!
+   */
+  renderFrame(t, opts = {}) {
+    const snap = opts.snapshot || this.state;
+    const targetCanvas = opts.targetCanvas || this.canvas;
+    const ctx = opts.targetCtx || this.ctx;
+    const baseW = snap.canvasWidth || 1920;
+    const baseH = snap.canvasHeight || 1080;
+    const renderW = opts.renderW || targetCanvas.width || baseW;
+    const renderH = opts.renderH || targetCanvas.height || baseH;
+    const isExport = Boolean(opts.isExport);
+    const isolateClipId = opts.isolateClipId || null;
+
+    if (targetCanvas.width !== renderW || targetCanvas.height !== renderH) {
+      targetCanvas.width = renderW;
+      targetCanvas.height = renderH;
+    }
+
     ctx.save();
-    ctx.fillStyle = state.bgMode === 'white' ? '#f3f1eb' : '#000000';
-    ctx.fillRect(0, 0, W, H);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, renderW, renderH);
 
-    const renderTracks = [...state.tracks].filter(tr => tr.type !== 'audio' && !tr.hidden).reverse();
+    // Uniform scale into project coordinate space (center-fit if export aspect differs)
+    const scaleX = renderW / baseW;
+    const scaleY = renderH / baseH;
+    const uniformScale = Math.min(scaleX, scaleY);
+    const offsetX = (renderW - baseW * uniformScale) / 2;
+    const offsetY = (renderH - baseH * uniformScale) / 2;
 
-    // CapCut blurred pillars backdrop
-    if (state.bgMode === 'blur') {
-      const mainTrack = renderTracks.find(tr => tr.type === 'video');
-      const mainClip = mainTrack && state.clips.find(c => c.trackId === mainTrack.id && t >= c.start && t < c.start + c.duration);
+    if (!isolateClipId) {
+      ctx.fillStyle = snap.bgMode === 'white' ? '#ffffff' : '#000000';
+      ctx.fillRect(0, 0, renderW, renderH);
+    }
+
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(uniformScale, uniformScale);
+    ctx.beginPath();
+    ctx.rect(0, 0, baseW, baseH);
+    ctx.clip();
+
+    // Backdrop CapCut Blur from active main video
+    if (!isolateClipId && snap.bgMode === 'blur') {
+      const mainTr = snap.tracks.find(tr => tr.type === 'video' && !tr.hidden);
+      const mainClip = mainTr?.clips.find(c => t >= c.start && t < c.start + c.duration);
       if (mainClip) {
-        const media = state.library.find(m => m.id === mainClip.mediaId);
-        const el = this.ensureMediaElement(mainClip, media);
-        if (el && (el.readyState >= 2 || (el.complete && el.naturalWidth > 0))) {
+        const el = this.getOrCreateElement(mainClip, snap);
+        const dims = this._mediaDims(el);
+        if (el && dims.w > 0) {
           ctx.save();
-          ctx.filter = 'blur(38px) brightness(0.6)';
-          const sw = el.videoWidth || el.naturalWidth || W;
-          const sh = el.videoHeight || el.naturalHeight || H;
-          const sc = Math.max(W / sw, H / sh) * 1.12;
-          ctx.drawImage(el, (W - sw * sc) / 2, (H - sh * sc) / 2, sw * sc, sh * sc);
+          ctx.filter = 'blur(34px) brightness(0.68)';
+          const sc = Math.max(baseW / dims.w, baseH / dims.h) * 1.12;
+          ctx.drawImage(el, (baseW - dims.w * sc) / 2, (baseH - dims.h * sc) / 2, dims.w * sc, dims.h * sc);
           ctx.restore();
         }
       }
     }
 
-    this.lastLayerBounds = [];
-    let selectedBounds = null;
+    // Track draw order: bottom-up visual layers (video -> overlay -> text -> graphic)
+    const videoTracks = snap.tracks.filter(tr => tr.type === 'video' && !tr.hidden);
+    const overlayTracks = snap.tracks.filter(tr => tr.type === 'overlay' && !tr.hidden);
+    const textTracks = snap.tracks.filter(tr => (tr.type === 'text' || tr.type === 'graphic') && !tr.hidden);
+    const ordered = [...videoTracks, ...overlayTracks, ...textTracks];
 
-    for (const track of renderTracks) {
-      const clips = state.clips.filter(c => c.trackId === track.id && t >= c.start && t < c.start + c.duration);
-      for (const clip of clips) {
-        const bounds = this.drawClip(ctx, state, clip, t - clip.start, W, H, t);
-        if (bounds) {
-          this.lastLayerBounds.push({ clipId: clip.id, ...bounds });
-          if (clip.id === state.selectedClipId) selectedBounds = bounds;
+    for (const track of ordered) {
+      for (const clip of track.clips) {
+        if (isolateClipId && clip.id !== isolateClipId) continue;
+        if (t < clip.start || t >= clip.start + clip.duration) continue;
+
+        if (clip.type === 'text') {
+          this.drawTextClip(ctx, clip, t - clip.start, baseW, baseH);
+        } else if (clip.type === 'graphic') {
+          this.drawGraphicClip(ctx, clip, t - clip.start, t, baseW, baseH, snap);
+        } else if (clip.type === 'video' || clip.type === 'image') {
+          // Check real A->B clip-to-clip transition!
+          const ab = !isolateClipId ? this.findOutgoingTransitionClip(track, clip, t) : null;
+          if (ab) {
+            this.drawABTransition(ctx, ab.clipA, clip, t, ab.prog, baseW, baseH, snap, isExport);
+          } else {
+            this.drawMediaClip(ctx, clip, t - clip.start, baseW, baseH, snap, isExport, 1, 0, 0, 1);
+          }
         }
       }
     }
 
-    // Active Captions (CC) overlay on very top
-    for (const cap of state.captions || []) {
-      if (t >= cap.start && t < cap.end) {
-        this.drawCaption(ctx, cap, t, state.captionStyle || 'hormozi', W, H);
+    // Global Timed Captions (skipped when isolating a clip for Freeze Frame)
+    if (!isolateClipId) {
+      for (const cap of (snap.captions || [])) {
+        if (t >= cap.start && t < cap.end) {
+          this.drawCaption(ctx, cap, t, baseW, baseH, snap);
+        }
       }
     }
 
     ctx.restore();
-    if (drawOverlay) this.renderOverlay(state, selectedBounds, W, H);
+
+    if (!opts.hideGuides && !isExport && !isolateClipId) {
+      this.renderOverlayGuides(t);
+    }
   }
 
-  applyMaskClip(ctx, clip, dw, dh) {
-    const m = clip.maskType || 'none';
-    if (m === 'none') return;
-    const size = (clip.maskSize ?? 55) / 100;
-    const mx = ((clip.maskX ?? 0) / 100) * dw;
-    const my = ((clip.maskY ?? 0) / 100) * dh;
-    const rot = ((clip.maskRot ?? 0) * Math.PI) / 180;
+  _mediaDims(el) {
+    if (!el) return { w: 0, h: 0 };
+    if (el instanceof HTMLVideoElement) return { w: el.videoWidth, h: el.videoHeight };
+    if (el instanceof HTMLImageElement) return { w: el.naturalWidth, h: el.naturalHeight };
+    return { w: 0, h: 0 };
+  }
+
+  /** Real A->B transition between adjacent clips on the same track */
+  drawABTransition(ctx, clipA, clipB, t, p, baseW, baseH, snap, isExport) {
+    const ease = evalEasing('easeInOut', p);
+    const kind = clipB.transIn;
+
+    // Render clipA into layerCanvas and clipB into layerCanvasB for clean scoped blending
+    this._ensureCanvasSize(this.layerCanvas, baseW, baseH);
+    this._ensureCanvasSize(this.layerCanvasB, baseW, baseH);
+    this.layerCtx.clearRect(0, 0, baseW, baseH);
+    this.layerCtxB.clearRect(0, 0, baseW, baseH);
+
+    // Outgoing clipA evaluated cleanly at t - clipA.start (uses handle if available or holds last frame)
+    this.drawMediaClip(this.layerCtx, clipA, t - clipA.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true);
+    this.drawMediaClip(this.layerCtxB, clipB, t - clipB.start, baseW, baseH, snap, isExport, 1, 0, 0, 1, true);
 
     ctx.save();
-    ctx.translate(mx, my);
-    ctx.rotate(rot);
-    ctx.beginPath();
-    if (clip.maskInvert) {
-      ctx.rect(-dw * 2, -dh * 2, dw * 4, dh * 4);
-    }
-    if (m === 'circle') {
-      const r = Math.min(dw, dh) * 0.5 * size;
-      ctx.arc(0, 0, Math.max(10, r), 0, Math.PI * 2, Boolean(clip.maskInvert));
-    } else if (m === 'rect') {
-      const rw = dw * size, rh = dh * size;
-      if (clip.maskInvert) {
-        ctx.moveTo(-rw / 2, -rh / 2); ctx.lineTo(-rw / 2, rh / 2); ctx.lineTo(rw / 2, rh / 2); ctx.lineTo(rw / 2, -rh / 2); ctx.closePath();
+    if (kind === 'crossfade') {
+      ctx.globalAlpha = 1 - ease;
+      ctx.drawImage(this.layerCanvas, 0, 0);
+      ctx.globalAlpha = ease;
+      ctx.drawImage(this.layerCanvasB, 0, 0);
+    } else if (kind === 'slide-left') {
+      ctx.drawImage(this.layerCanvas, -baseW * ease, 0);
+      ctx.drawImage(this.layerCanvasB, baseW * (1 - ease), 0);
+    } else if (kind === 'slide-up') {
+      ctx.drawImage(this.layerCanvas, 0, -baseH * ease);
+      ctx.drawImage(this.layerCanvasB, 0, baseH * (1 - ease));
+    } else if (kind === 'wipe-left') {
+      ctx.drawImage(this.layerCanvas, 0, 0);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, baseW * ease, baseH);
+      ctx.clip();
+      ctx.drawImage(this.layerCanvasB, 0, 0);
+      ctx.restore();
+    } else if (kind === 'zoom-in') {
+      const sA = 1 + ease * 0.28;
+      ctx.save();
+      ctx.globalAlpha = 1 - ease;
+      ctx.translate(baseW / 2, baseH / 2); ctx.scale(sA, sA);
+      ctx.drawImage(this.layerCanvas, -baseW / 2, -baseH / 2);
+      ctx.restore();
+      const sB = 0.8 + ease * 0.2;
+      ctx.save();
+      ctx.globalAlpha = ease;
+      ctx.translate(baseW / 2, baseH / 2); ctx.scale(sB, sB);
+      ctx.drawImage(this.layerCanvasB, -baseW / 2, -baseH / 2);
+      ctx.restore();
+    } else if (kind === 'blur-dissolve') {
+      const bAmt = Math.sin(ease * Math.PI) * 18;
+      ctx.save();
+      ctx.filter = `blur(${bAmt.toFixed(1)}px)`;
+      ctx.globalAlpha = 1 - ease;
+      ctx.drawImage(this.layerCanvas, 0, 0);
+      ctx.globalAlpha = ease;
+      ctx.drawImage(this.layerCanvasB, 0, 0);
+      ctx.restore();
+    } else if (kind === 'dip-black') {
+      if (ease < 0.5) {
+        ctx.globalAlpha = 1 - ease * 2;
+        ctx.drawImage(this.layerCanvas, 0, 0);
       } else {
-        ctx.rect(-rw / 2, -rh / 2, rw, rh);
+        ctx.globalAlpha = (ease - 0.5) * 2;
+        ctx.drawImage(this.layerCanvasB, 0, 0);
       }
-    } else if (m === 'split') {
-      ctx.rect(-dw * 2, -dh * 2, dw * 2, dh * 4);
-    } else if (m === 'mirror') {
-      const band = dh * size;
-      ctx.rect(-dw * 2, -band / 2, dw * 4, band);
+    } else if (kind === 'flash') {
+      ctx.drawImage(ease < 0.5 ? this.layerCanvas : this.layerCanvasB, 0, 0);
+      const peak = 1 - Math.abs(ease - 0.5) * 2;
+      // Scoped white flash using clip alpha (via source-atop on offscreen or bounded rect)
+      ctx.fillStyle = `rgba(255,255,255,${(peak * 0.92).toFixed(3)})`;
+      ctx.fillRect(0, 0, baseW, baseH);
+    } else {
+      ctx.drawImage(this.layerCanvasB, 0, 0);
     }
     ctx.restore();
-    ctx.clip(clip.maskInvert ? 'evenodd' : 'nonzero');
   }
 
-  getChromaKeyedSource(el, cL, cT, cw, ch, clip) {
-    const maxDim = 640;
-    const scale = Math.min(1, maxDim / Math.max(cw, ch));
-    const pw = Math.max(16, Math.round(cw * scale));
-    const ph = Math.max(16, Math.round(ch * scale));
-    this.chromaCanvas.width = pw;
-    this.chromaCanvas.height = ph;
-    this.chromaCtx.clearRect(0, 0, pw, ph);
-    this.chromaCtx.drawImage(el, cL, cT, cw, ch, 0, 0, pw, ph);
-    const imgData = this.chromaCtx.getImageData(0, 0, pw, ph);
+  _ensureCanvasSize(c, w, h) {
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  }
+
+  applyFeatheredMask(targetCtx, clip, localT, W, H) {
+    const mask = clip.mask;
+    if (!mask || mask.type === 'none') return;
+    const mx = evalKeyframe(clip, 'maskX', localT, mask.x ?? 0.5) * W;
+    const my = evalKeyframe(clip, 'maskY', localT, mask.y ?? 0.5) * H;
+    const ms = evalKeyframe(clip, 'maskScale', localT, mask.scale ?? 0.48);
+    const rot = ((mask.rotation || 0) * Math.PI) / 180;
+    const feather = Math.max(0, Number(mask.feather || 0));
+
+    this._ensureCanvasSize(this.maskCanvas, W, H);
+    const mctx = this.maskCtx;
+    mctx.save();
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.clearRect(0, 0, W, H);
+    if (feather > 0.5) mctx.filter = `blur(${feather.toFixed(1)}px)`;
+
+    const drawShape = () => {
+      mctx.beginPath();
+      if (mask.type === 'circle') {
+        const r = Math.min(W, H) * ms * 0.55;
+        mctx.ellipse(mx, my, r, r, rot, 0, Math.PI * 2);
+      } else if (mask.type === 'rect') {
+        const rw = W * ms, rh = H * ms;
+        mctx.save();
+        mctx.translate(mx, my); mctx.rotate(rot);
+        mctx.roundRect(-rw / 2, -rh / 2, rw, rh, 18);
+        mctx.restore();
+      } else if (mask.type === 'split') {
+        mctx.save();
+        mctx.translate(mx, my); mctx.rotate(rot);
+        mctx.rect(-W * 2, -H * 2, W * 2, H * 4);
+        mctx.restore();
+      } else if (mask.type === 'mirror') {
+        const halfH = H * ms * 0.45;
+        mctx.save();
+        mctx.translate(mx, my); mctx.rotate(rot);
+        mctx.rect(-W * 2, -halfH, W * 4, halfH * 2);
+        mctx.restore();
+      }
+      mctx.fill();
+    };
+
+    if (mask.invert) {
+      mctx.fillStyle = '#ffffff';
+      mctx.fillRect(0, 0, W, H);
+      mctx.globalCompositeOperation = 'destination-out';
+      drawShape();
+    } else {
+      mctx.fillStyle = '#ffffff';
+      drawShape();
+    }
+    mctx.restore();
+
+    targetCtx.save();
+    targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+    targetCtx.globalCompositeOperation = 'destination-in';
+    targetCtx.drawImage(this.maskCanvas, 0, 0);
+    targetCtx.restore();
+  }
+
+  getChromaKeyedSource(el, clip, isExport) {
+    const dims = this._mediaDims(el);
+    if (!dims.w || !dims.h) return el;
+    // Full resolution during export (up to 1920px), fast 640px cap only during live interactive preview
+    const maxDim = isExport ? 1920 : 640;
+    const ratio = Math.min(1, maxDim / Math.max(dims.w, dims.h));
+    const cw = Math.max(2, Math.round(dims.w * ratio));
+    const ch = Math.max(2, Math.round(dims.h * ratio));
+    this._ensureCanvasSize(this.chromaCanvas, cw, ch);
+    this.chromaCtx.clearRect(0, 0, cw, ch);
+    this.chromaCtx.drawImage(el, 0, 0, cw, ch);
+    const imgData = this.chromaCtx.getImageData(0, 0, cw, ch);
     const d = imgData.data;
-    const [kr, kg, kb] = hexToRgb(clip.chromaColor || '#00ff00');
-    const sim = (clip.chromaSimilarity ?? 36) * 2.6;
-    const smooth = Math.max(1, (clip.chromaSmoothness ?? 14) * 2.2);
+    const hex = clip.chromaKey.color || '#00ff00';
+    const kr = parseInt(hex.slice(1, 3), 16) || 0;
+    const kg = parseInt(hex.slice(3, 5), 16) || 255;
+    const kb = parseInt(hex.slice(5, 7), 16) || 0;
+    const tol = (clip.chromaKey.strength ?? 0.36) * 210;
+    const feather = Math.max(6, (clip.chromaKey.feather ?? 0.14) * 140);
     for (let i = 0; i < d.length; i += 4) {
-      const dr = d[i] - kr, dg = d[i + 1] - kg, db = d[i + 2] - kb;
-      const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-      if (dist < sim) d[i + 3] = 0;
-      else if (dist < sim + smooth) d[i + 3] = Math.round(((dist - sim) / smooth) * d[i + 3]);
+      const dist = Math.hypot(d[i] - kr, d[i + 1] - kg, d[i + 2] - kb);
+      if (dist < tol) d[i + 3] = 0;
+      else if (dist < tol + feather) d[i + 3] = Math.round(((dist - tol) / feather) * d[i + 3]);
     }
     this.chromaCtx.putImageData(imgData, 0, 0);
     return this.chromaCanvas;
   }
 
-  drawClip(ctx, state, clip, localT, W, H, globalT) {
-    const posX = evalClipProp(clip, 'x', localT) || 0;
-    const posY = evalClipProp(clip, 'y', localT) || 0;
-    const scalePct = evalClipProp(clip, 'scale', localT) ?? 100;
-    const rotDeg = evalClipProp(clip, 'rotation', localT) || 0;
-    let opacity = (evalClipProp(clip, 'opacity', localT) ?? 100) / 100;
+  drawMediaClip(ctx, clip, localT, W, H, snap, isExport, extraAlpha = 1, extraX = 0, extraY = 0, extraScale = 1, skipTransIn = false) {
+    const el = this.getOrCreateElement(clip, snap);
+    const dims = this._mediaDims(el);
+    if (!el || dims.w === 0 || dims.h === 0) {
+      if (clip.mediaId && this.erroredMedia.has(clip.mediaId)) {
+        ctx.save();
+        ctx.fillStyle = '#2a1218';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ff4f6d';
+        ctx.font = '700 34px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Media Offline: ${clip.name || clip.mediaId}`, W / 2, H / 2);
+        ctx.restore();
+      }
+      return;
+    }
 
-    // Normalize effects map (supports stackable multi-VFX!)
-    const fx = clip.effects || {};
-    let trScale = 1, trX = 0, trY = 0, flashWhite = 0, fadeBlack = 0, wipeFrac = 1, glitchAmt = 0;
-    const trDur = Math.min(clip.transitionDur || 0.4, clip.duration * 0.45);
-    const applyTrans = (kind, p) => {
-      const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-      if (kind === 'fade') opacity *= e;
-      else if (kind === 'flashWhite') { flashWhite = Math.max(flashWhite, 1 - e); opacity *= Math.min(1, p * 2.5); }
-      else if (kind === 'fadeBlack') fadeBlack = Math.max(fadeBlack, 1 - e);
-      else if (kind === 'zoomIn') { trScale *= 0.65 + 0.35 * e; opacity *= e; }
-      else if (kind === 'zoomOut') { trScale *= 1.45 - 0.45 * e; opacity *= e; }
-      else if (kind === 'slideLeft') trX += (1 - e) * W;
-      else if (kind === 'slideRight') trX -= (1 - e) * W;
-      else if (kind === 'wipeRight') wipeFrac = Math.min(wipeFrac, e);
-      else if (kind === 'glitchCut') glitchAmt = Math.max(glitchAmt, 1 - e);
-    };
-    if (clip.transitionIn && clip.transitionIn !== 'none' && localT < trDur) applyTrans(clip.transitionIn, localT / trDur);
-    if (clip.transitionOut && clip.transitionOut !== 'none' && (clip.duration - localT) < trDur) applyTrans(clip.transitionOut, (clip.duration - localT) / trDur);
+    let opacity = evalKeyframe(clip, 'opacity', localT, clip.opacity ?? 1) * extraAlpha;
+    let x = evalKeyframe(clip, 'x', localT, clip.x || 0) + extraX;
+    let y = evalKeyframe(clip, 'y', localT, clip.y || 0) + extraY;
+    let scale = evalKeyframe(clip, 'scale', localT, clip.scale ?? 1) * extraScale;
+    let rot = evalKeyframe(clip, 'rotation', localT, clip.rotation || 0);
 
-    if (fx.zoomPulse) {
-      const beat = (globalT * 2.0) % 1;
-      trScale *= 1 + (0.09 * (fx.zoomPulse / 100)) * Math.exp(-beat * 7);
+    // Standalone Intro/Outro transitions (when NOT already rendered via A->B overlap)
+    let transFilterExtra = '';
+    let flashOverlay = 0;
+    let dipOverlay = 0;
+    let wipeProgress = null;
+
+    if (!skipTransIn && clip.transIn && clip.transIn !== 'none' && localT < (clip.transInDur || 0.5)) {
+      const p = Math.max(0, Math.min(1, localT / Math.max(0.05, clip.transInDur || 0.5)));
+      const e = evalEasing('easeInOut', p);
+      if (clip.transIn === 'crossfade') opacity *= e;
+      else if (clip.transIn === 'dip-black') dipOverlay = 1 - e;
+      else if (clip.transIn === 'flash') flashOverlay = 1 - e;
+      else if (clip.transIn === 'slide-left') x += (1 - e) * W;
+      else if (clip.transIn === 'slide-up') y += (1 - e) * H;
+      else if (clip.transIn === 'zoom-in') scale *= (0.55 + 0.45 * e);
+      else if (clip.transIn === 'wipe-left') wipeProgress = e;
+      else if (clip.transIn === 'blur-dissolve') { opacity *= e; transFilterExtra = ` blur(${((1 - e) * 18).toFixed(1)}px)`; }
+    }
+    const rem = clip.duration - localT;
+    if (clip.transOut && clip.transOut !== 'none' && rem < (clip.transOutDur || 0.5)) {
+      const p = Math.max(0, Math.min(1, rem / Math.max(0.05, clip.transOutDur || 0.5)));
+      const e = evalEasing('easeInOut', p);
+      if (clip.transOut === 'crossfade') opacity *= e;
+      else if (clip.transOut === 'dip-black') dipOverlay = Math.max(dipOverlay, 1 - e);
+      else if (clip.transOut === 'flash') flashOverlay = Math.max(flashOverlay, 1 - e);
+      else if (clip.transOut === 'slide-left') x -= (1 - e) * W;
+      else if (clip.transOut === 'zoom-in') scale *= (1 + (1 - e) * 0.35);
+      else if (clip.transOut === 'blur-dissolve') { opacity *= e; transFilterExtra = ` blur(${((1 - e) * 18).toFixed(1)}px)`; }
+    }
+
+    const fxList = Array.isArray(clip.effects) ? clip.effects : [];
+    const fxInt = (id) => (clip.effectIntensity?.[id] ?? 0.65);
+
+    if (fxList.includes('shake')) {
+      const k = fxInt('shake');
+      x += Math.sin(localT * 42) * 18 * k;
+      y += Math.cos(localT * 51) * 12 * k;
+      rot += Math.sin(localT * 33) * 1.4 * k;
+    }
+    if (fxList.includes('zoom-pulse')) {
+      const k = fxInt('zoom-pulse');
+      scale *= (1 + Math.pow(Math.abs(Math.sin(localT * Math.PI * 2)), 4) * 0.14 * k);
+    }
+
+    const fit = clip.fitMode || 'contain';
+    const srcCrop = clip.cropRect;
+    const sx = srcCrop ? srcCrop.x : 0;
+    const sy = srcCrop ? srcCrop.y : 0;
+    const sw = srcCrop ? srcCrop.w : dims.w;
+    const sh = srcCrop ? srcCrop.h : dims.h;
+
+    let drawW, drawH;
+    const srcAR = sw / Math.max(1, sh);
+    const dstAR = W / H;
+    if (fit === 'cover') {
+      if (srcAR > dstAR) { drawH = H; drawW = H * srcAR; } else { drawW = W; drawH = W / srcAR; }
+    } else if (fit === 'stretch') {
+      drawW = W; drawH = H;
+    } else {
+      if (srcAR > dstAR) { drawW = W; drawH = W / srcAR; } else { drawH = H; drawW = H * srcAR; }
+    }
+
+    const srcObj = clip.chromaKey?.enabled ? this.getChromaKeyedSource(el, clip, isExport) : el;
+    const sRatioX = srcObj === el ? 1 : (srcObj.width / dims.w);
+    const sRatioY = srcObj === el ? 1 : (srcObj.height / dims.h);
+
+    // Use isolated offscreen layer whenever mask, VFX, or scoped flash/dip is active so opacity & blendMode ALWAYS hold!
+    const needsOffscreen = (clip.mask && clip.mask.type !== 'none') || fxList.length > 0 || flashOverlay > 0 || dipOverlay > 0;
+    let drawTarget = ctx;
+    if (needsOffscreen && ctx !== this.layerCtx && ctx !== this.layerCtxB) {
+      this._ensureCanvasSize(this.layerCanvas, W, H);
+      this.layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+      this.layerCtx.clearRect(0, 0, W, H);
+      drawTarget = this.layerCtx;
+    }
+
+    drawTarget.save();
+    if (drawTarget === ctx) {
+      drawTarget.globalAlpha = Math.max(0, Math.min(1, opacity));
+      drawTarget.globalCompositeOperation = clip.blendMode || 'source-over';
+    }
+    if (wipeProgress !== null) {
+      drawTarget.beginPath();
+      drawTarget.rect(0, 0, W * wipeProgress, H);
+      drawTarget.clip();
+    }
+
+    drawTarget.translate(W / 2 + x, H / 2 + y);
+    drawTarget.rotate((rot * Math.PI) / 180);
+    drawTarget.scale(scale * (clip.flipH ? -1 : 1), scale * (clip.flipV ? -1 : 1));
+    const baseFilter = this.buildCssFilter(clip);
+    drawTarget.filter = baseFilter === 'none' ? (transFilterExtra.trim() || 'none') : (baseFilter + transFilterExtra);
+
+    if (fxList.includes('pixelate')) {
+      const k = fxInt('pixelate');
+      const pxScale = Math.max(0.03, 0.25 - k * 0.2);
+      const pw = Math.max(16, Math.round(drawW * pxScale));
+      const ph = Math.max(16, Math.round(drawH * pxScale));
+      this._ensureCanvasSize(this.chromaCanvas, pw, ph);
+      this.chromaCtx.imageSmoothingEnabled = false;
+      this.chromaCtx.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, 0, 0, pw, ph);
+      drawTarget.imageSmoothingEnabled = false;
+      drawTarget.drawImage(this.chromaCanvas, 0, 0, pw, ph, -drawW / 2, -drawH / 2, drawW, drawH);
+      drawTarget.imageSmoothingEnabled = true;
+    } else if (fxList.includes('mirror-h')) {
+      drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, (sw / 2) * sRatioX, sh * sRatioY, -drawW / 2, -drawH / 2, drawW / 2, drawH);
+      drawTarget.save();
+      drawTarget.scale(-1, 1);
+      drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, (sw / 2) * sRatioX, sh * sRatioY, -drawW / 2, -drawH / 2, drawW / 2, drawH);
+      drawTarget.restore();
+    } else {
+      drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, -drawW / 2, -drawH / 2, drawW, drawH);
+    }
+
+    if (fxList.includes('chromatic') || fxList.includes('glitch')) {
+      const k = fxInt(fxList.includes('glitch') ? 'glitch' : 'chromatic');
+      const shift = (fxList.includes('glitch') ? (Math.sin(localT * 60) * 18) : 12) * k;
+      drawTarget.globalCompositeOperation = 'screen';
+      drawTarget.globalAlpha = 0.42 * k;
+      drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, -drawW / 2 + shift, -drawH / 2, drawW, drawH);
+      drawTarget.drawImage(srcObj, sx * sRatioX, sy * sRatioY, sw * sRatioX, sh * sRatioY, -drawW / 2 - shift, -drawH / 2, drawW, drawH);
+    }
+    drawTarget.restore();
+
+    // Post-FX inside the isolated offscreen layer (respecting opacity + blendMode!)
+    if (fxList.length > 0) {
+      this.applyClipVFX(drawTarget, fxList, fxInt, localT, W, H);
+    }
+    if (clip.mask && clip.mask.type !== 'none') {
+      this.applyFeatheredMask(drawTarget, clip, localT, W, H);
+    }
+    if (flashOverlay > 0.01) {
+      drawTarget.save();
+      drawTarget.globalCompositeOperation = 'source-atop';
+      drawTarget.fillStyle = `rgba(255,255,255,${(flashOverlay * 0.92).toFixed(3)})`;
+      drawTarget.fillRect(0, 0, W, H);
+      drawTarget.restore();
+    }
+    if (dipOverlay > 0.01) {
+      drawTarget.save();
+      drawTarget.globalCompositeOperation = 'source-atop';
+      drawTarget.fillStyle = `rgba(0,0,0,${dipOverlay.toFixed(3)})`;
+      drawTarget.fillRect(0, 0, W, H);
+      drawTarget.restore();
+    }
+
+    if (drawTarget !== ctx) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
+      ctx.globalCompositeOperation = clip.blendMode || 'source-over';
+      ctx.drawImage(drawTarget.canvas, 0, 0);
+      ctx.restore();
+    }
+  }
+
+  applyClipVFX(ctx, fxList, fxInt, localT, W, H) {
+    ctx.save();
+    if (fxList.includes('vhs')) {
+      const k = fxInt('vhs');
+      ctx.fillStyle = `rgba(0,0,0,${(0.26 * k).toFixed(3)})`;
+      for (let sy = 0; sy < H; sy += 6) ctx.fillRect(0, sy, W, 2);
+      const bandY = ((localT * 210) % (H + 120)) - 60;
+      ctx.fillStyle = `rgba(255,255,255,${(0.11 * k).toFixed(3)})`;
+      ctx.fillRect(0, bandY, W, 22);
+    }
+    if (fxList.includes('glitch')) {
+      const k = fxInt('glitch');
+      const slices = Math.max(2, Math.round(6 * k));
+      for (let i = 0; i < slices; i++) {
+        const seed = Math.sin(localT * 40 + i * 19.3);
+        if (seed > 0.25) {
+          const gy = ((Math.abs(Math.sin(localT * 17 + i * 7.1)) * H) | 0);
+          const gh = 8 + ((i * 11) % 34);
+          ctx.fillStyle = i % 2 === 0 ? `rgba(0,229,195,${(0.24 * k).toFixed(2)})` : `rgba(255,79,109,${(0.24 * k).toFixed(2)})`;
+          ctx.fillRect(0, gy, W, gh);
+        }
+      }
+    }
+    if (fxList.includes('bloom')) {
+      const k = fxInt('bloom');
+      const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.1, W / 2, H / 2, Math.max(W, H) * 0.62);
+      g.addColorStop(0, `rgba(255,244,225,${(0.26 * k).toFixed(3)})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.globalCompositeOperation = 'screen';
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    if (fxList.includes('vignette')) {
+      const k = fxInt('vignette');
+      const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.26, W / 2, H / 2, Math.max(W, H) * 0.72);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(1, `rgba(0,0,0,${(0.82 * k).toFixed(3)})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (fxList.includes('letterbox')) {
+      const barH = Math.round(H * 0.12 * Math.max(0.4, fxInt('letterbox')));
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, barH);
+      ctx.fillRect(0, H - barH, W, barH);
+    }
+    if (fxList.includes('bw-flash') && Math.sin(localT * 26) > 0.86) {
+      ctx.fillStyle = `rgba(255,255,255,${(0.32 * fxInt('bw-flash')).toFixed(2)})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    ctx.restore();
+  }
+
+  drawGraphicClip(ctx, clip, localT, globalT, W, H, snap) {
+    const x = evalKeyframe(clip, 'x', localT, clip.x || 0);
+    const y = evalKeyframe(clip, 'y', localT, clip.y || 0);
+    const sc = evalKeyframe(clip, 'scale', localT, clip.scale ?? 1);
+    const rot = evalKeyframe(clip, 'rotation', localT, clip.rotation || 0);
+    const op = evalKeyframe(clip, 'opacity', localT, clip.opacity ?? 1);
+
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, op));
+    ctx.globalCompositeOperation = clip.blendMode || 'source-over';
+    ctx.translate(W / 2 + x, H / 2 + y);
+    ctx.rotate((rot * Math.PI) / 180);
+    ctx.scale(sc, sc);
+
+    const k = clip.graphicKind || 'rec-badge';
+    if (k === 'rec-badge') {
+      const blink = Math.floor(globalT * 2) % 2 === 0;
+      ctx.fillStyle = 'rgba(10,12,16,0.74)';
+      ctx.beginPath(); ctx.roundRect(-130, -34, 260, 68, 12); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = blink ? '#ff3355' : 'rgba(255,51,85,0.25)';
+      ctx.beginPath(); ctx.arc(-92, 0, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 32px "JetBrains Mono", monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      const sec = Math.floor(globalT);
+      const ms = Math.floor((globalT - sec) * 100);
+      ctx.fillText(`REC ${String(sec).padStart(2, '0')}:${String(ms).padStart(2, '0')}`, -66, 2);
+    } else if (k === 'viewfinder') {
+      const bw = W * 0.88, bh = H * 0.86, arm = 54;
+      ctx.strokeStyle = 'rgba(255,255,255,0.84)'; ctx.lineWidth = 4;
+      for (const [cx, cy, dx, dy] of [[-bw / 2, -bh / 2, 1, 1], [bw / 2, -bh / 2, -1, 1], [-bw / 2, bh / 2, 1, -1], [bw / 2, bh / 2, -1, -1]]) {
+        ctx.beginPath(); ctx.moveTo(cx, cy + dy * arm); ctx.lineTo(cx, cy); ctx.lineTo(cx + dx * arm, cy); ctx.stroke();
+      }
+      ctx.beginPath(); ctx.moveTo(-24, 0); ctx.lineTo(24, 0); ctx.moveTo(0, -24); ctx.lineTo(0, 24); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.font = '700 22px "JetBrains Mono", monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`RAW · ${snap.fps}FPS · ${W}×${H}`, -bw / 2 + 24, bh / 2 - 26);
+    } else if (k === 'progress-bar') {
+      const total = Math.max(0.5, getSnapshotDuration(snap));
+      const pct = Math.min(1, Math.max(0, globalT / total));
+      const bw = W * 0.86, bh = 14;
+      ctx.fillStyle = 'rgba(255,255,255,0.22)';
+      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, bw, bh, 7); ctx.fill();
+      const grad = ctx.createLinearGradient(-bw / 2, 0, bw / 2, 0);
+      grad.addColorStop(0, '#00e5c3'); grad.addColorStop(1, '#00b8ff');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, bw * pct, bh, 7); ctx.fill();
+    } else if (k === 'lower-third') {
+      const ease = Math.min(1, localT / 0.35);
+      const slide = (1 - Math.pow(1 - ease, 3)) * 1;
+      ctx.translate(-(1 - slide) * 180, 0);
+      ctx.fillStyle = 'rgba(11,14,20,0.88)';
+      ctx.beginPath(); ctx.roundRect(-290, -54, 580, 108, 12); ctx.fill();
+      ctx.fillStyle = '#00e5c3';
+      ctx.fillRect(-290, -54, 10, 108);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 36px Inter, sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(clip.text || 'MOTIONVIZ STUDIO', -260, -14);
+      ctx.fillStyle = '#00e5c3';
+      ctx.font = '600 22px "JetBrains Mono", monospace';
+      ctx.fillText(clip.subText || 'AI WORKFLOWS & VFX', -260, 26);
+    } else if (k === 'arrow-callout') {
+      ctx.strokeStyle = '#00e5c3'; ctx.fillStyle = '#00e5c3'; ctx.lineWidth = 10; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(-110, 40); ctx.quadraticCurveTo(-20, -40, 95, -20); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(110, -22); ctx.lineTo(68, -46); ctx.lineTo(76, 4); ctx.closePath(); ctx.fill();
+    } else if (k === 'gradient-matte') {
+      const g = ctx.createLinearGradient(0, -H * 0.25, 0, H * 0.25);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(1, 'rgba(0,0,0,0.88)');
+      ctx.fillStyle = g;
+      ctx.fillRect(-W / 2, -H * 0.25, W, H * 0.5);
+    }
+    ctx.restore();
+  }
+
+  _wrapTextLines(ctx, rawText, maxWidth) {
+    const paragraphs = String(rawText || '').split('\n');
+    const lines = [];
+    for (const para of paragraphs) {
+      if (!maxWidth || maxWidth <= 0) { lines.push(para); continue; }
+      const words = para.split(/\s+/);
+      let current = '';
+      for (const w of words) {
+        const test = current ? `${current} ${w}` : w;
+        if (ctx.measureText(test).width > maxWidth && current) {
+          lines.push(current);
+          current = w;
+        } else {
+          current = test;
+        }
+      }
+      lines.push(current);
+    }
+    return lines;
+  }
+
+  drawTextClip(ctx, clip, localT, W, H) {
+    let opacity = evalKeyframe(clip, 'opacity', localT, clip.opacity ?? 1);
+    let x = evalKeyframe(clip, 'x', localT, clip.x || 0);
+    let y = evalKeyframe(clip, 'y', localT, clip.y || 0);
+    let scale = evalKeyframe(clip, 'scale', localT, clip.scale ?? 1);
+    let rot = evalKeyframe(clip, 'rotation', localT, clip.rotation || 0);
+
+    // Intro animation
+    const anim = clip.animIn || 'none';
+    const ad = Math.min(0.45, clip.duration * 0.4);
+    let visibleText = clip.text || 'Text';
+    if (anim !== 'none' && localT < ad) {
+      const p = Math.max(0, Math.min(1, localT / Math.max(0.05, ad)));
+      const ease = 1 - Math.pow(1 - p, 3);
+      if (anim === 'pop') { scale *= (0.4 + 0.6 * ease); opacity *= ease; }
+      else if (anim === 'slide-up') { y += (1 - ease) * 90; opacity *= ease; }
+      else if (anim === 'fade') { opacity *= ease; }
+      else if (anim === 'typewriter') { visibleText = visibleText.slice(0, Math.max(1, Math.ceil(visibleText.length * p))); }
+    }
+
+    // Outro animation
+    const animOut = clip.animOut || 'none';
+    const rem = clip.duration - localT;
+    if (animOut !== 'none' && rem < ad) {
+      const p = Math.max(0, Math.min(1, rem / Math.max(0.05, ad)));
+      const ease = 1 - Math.pow(1 - p, 3);
+      if (animOut === 'fade') opacity *= ease;
+      else if (animOut === 'pop') { scale *= (0.4 + 0.6 * ease); opacity *= ease; }
+      else if (animOut === 'slide-down') { y += (1 - ease) * 90; opacity *= ease; }
+      else if (animOut === 'zoom-out') { scale *= (1 + (1 - ease) * 0.4); opacity *= ease; }
     }
 
     ctx.save();
     ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
-    if (clip.blendMode && clip.blendMode !== 'source-over') {
-      ctx.globalCompositeOperation = clip.blendMode;
-    }
-    if (wipeFrac < 0.999) {
-      ctx.beginPath(); ctx.rect(0, 0, W * wipeFrac, H); ctx.clip();
-    }
-
-    let bounds = null;
-
-    if (clip.type === 'text') {
-      bounds = this.drawTextClip(ctx, clip, localT, W, H, posX + trX, posY + trY, (scalePct / 100) * trScale, rotDeg);
-    } else if (clip.type === 'graphic') {
-      bounds = this.drawGraphicClip(ctx, clip, localT, W, H, posX + trX, posY + trY, (scalePct / 100) * trScale, rotDeg, globalT, state.getProjectDuration());
-    } else {
-      const media = state.library.find(m => m.id === clip.mediaId);
-      const el = this.ensureMediaElement(clip, media);
-      if (el && ((clip.type === 'video' && el.readyState >= 2) || (clip.type === 'image' && el.complete && el.naturalWidth > 0))) {
-        const sw = el.videoWidth || el.naturalWidth;
-        const sh = el.videoHeight || el.naturalHeight;
-        const cL = ((clip.cropLeft || 0) / 100) * sw;
-        const cR = ((clip.cropRight || 0) / 100) * sw;
-        const cT = ((clip.cropTop || 0) / 100) * sh;
-        const cB = ((clip.cropBottom || 0) / 100) * sh;
-        const cw = Math.max(8, sw - cL - cR);
-        const ch = Math.max(8, sh - cT - cB);
-
-        let dw = W, dh = H;
-        const fit = clip.fitMode || 'contain';
-        if (fit === 'contain') { const s = Math.min(W / cw, H / ch); dw = cw * s; dh = ch * s; }
-        else if (fit === 'cover') { const s = Math.max(W / cw, H / ch); dw = cw * s; dh = ch * s; }
-        dw *= (scalePct / 100) * trScale;
-        dh *= (scalePct / 100) * trScale;
-
-        const cx = W / 2 + posX + trX;
-        const cy = H / 2 + posY + trY;
-
-        ctx.translate(cx, cy);
-        ctx.rotate((rotDeg * Math.PI) / 180);
-        ctx.scale(clip.flipH ? -1 : 1, clip.flipV ? -1 : 1);
-
-        // Apply CapCut Mask inside local clip space!
-        this.applyMaskClip(ctx, clip, dw, dh);
-
-        const br = clip.brightness ?? 100;
-        const ct = clip.contrast ?? 100;
-        const sat = clip.saturate ?? 100;
-        const hue = (clip.hue ?? 0) + (fx.halftone ? (fx.halftone * 1.4) : 0);
-        const bl = clip.blur ?? 0;
-        const inv = fx.negative ? fx.negative : 0;
-        ctx.filter = `brightness(${br}%) contrast(${ct}%) saturate(${sat}%) hue-rotate(${hue}deg) blur(${bl}px) invert(${inv}%)`;
-
-        // Optional real per-pixel Chroma Key!
-        let srcEl = el, sx = cL, sy = cT, sWidth = cw, sHeight = ch;
-        if (clip.chromaEnabled) {
-          srcEl = this.getChromaKeyedSource(el, cL, cT, cw, ch, clip);
-          sx = 0; sy = 0; sWidth = srcEl.width; sHeight = srcEl.height;
-        }
-
-        if (fx.pixelate) {
-          const factor = Math.max(4, Math.round(4 + (fx.pixelate / 100) * 24));
-          const pw = Math.max(24, Math.round(dw / factor));
-          const ph = Math.max(14, Math.round(dh / factor));
-          this.offscreen.width = pw; this.offscreen.height = ph;
-          this.offCtx.drawImage(srcEl, sx, sy, sWidth, sHeight, 0, 0, pw, ph);
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(this.offscreen, -dw / 2, -dh / 2, dw, dh);
-          ctx.imageSmoothingEnabled = true;
-        } else {
-          ctx.drawImage(srcEl, sx, sy, sWidth, sHeight, -dw / 2, -dh / 2, dw, dh);
-        }
-
-        ctx.filter = 'none';
-        if (fx.rgbSplit || glitchAmt > 0.05) {
-          const amt = fx.rgbSplit ? (fx.rgbSplit / 100) * 26 : glitchAmt * 38;
-          ctx.save();
-          ctx.globalCompositeOperation = 'screen';
-          ctx.globalAlpha = 0.42 * (fx.rgbSplit ? fx.rgbSplit / 100 : 1);
-          ctx.drawImage(srcEl, sx, sy, sWidth, sHeight, -dw / 2 - amt, -dh / 2, dw, dh);
-          ctx.drawImage(srcEl, sx, sy, sWidth, sHeight, -dw / 2 + amt, -dh / 2, dw, dh);
-          ctx.restore();
-        }
-        if (fx.softGlow) {
-          ctx.save();
-          ctx.globalCompositeOperation = 'screen';
-          ctx.filter = `blur(${Math.round(8 + (fx.softGlow / 100) * 22)}px) brightness(1.15)`;
-          ctx.globalAlpha = (fx.softGlow / 100) * 0.48;
-          ctx.drawImage(srcEl, sx, sy, sWidth, sHeight, -dw / 2, -dh / 2, dw, dh);
-          ctx.restore();
-        }
-        if (fx.vhsGlitch || glitchAmt > 0.05) {
-          const strength = fx.vhsGlitch ? fx.vhsGlitch / 100 : glitchAmt;
-          for (let i = 0; i < 7; i++) {
-            const sy2 = Math.floor(Math.sin(globalT * 29 + i * 7.3) * 0.5 * sHeight + sHeight * 0.5);
-            const shs = Math.max(8, Math.floor(sHeight * 0.055));
-            const offx = Math.sin(globalT * 61 + i * 13) * 34 * strength;
-            ctx.drawImage(srcEl, sx, sy + Math.min(sHeight - shs, Math.max(0, sy2)), sWidth, shs,
-              -dw / 2 + offx, -dh / 2 + (sy2 / sHeight) * dh, dw, (shs / sHeight) * dh);
-          }
-        }
-        if (fx.scannerBar) {
-          const scanU = (globalT * 0.45) % 1;
-          const bx = -dw / 2 + scanU * dw;
-          const a = fx.scannerBar / 100;
-          const grad = ctx.createLinearGradient(bx - 55, 0, bx + 45, 0);
-          grad.addColorStop(0, 'rgba(0,40,255,0)');
-          grad.addColorStop(0.35, `rgba(0,60,255,${0.7 * a})`);
-          grad.addColorStop(0.55, `rgba(0,245,255,${0.9 * a})`);
-          grad.addColorStop(0.75, `rgba(255,255,255,${0.98 * a})`);
-          grad.addColorStop(1, 'rgba(255,255,255,0)');
-          ctx.fillStyle = grad;
-          ctx.fillRect(bx - 55, -dh / 2, 100, dh);
-        }
-        if (fx.crt) {
-          ctx.fillStyle = `rgba(0,0,0,${(fx.crt / 100) * 0.42})`;
-          for (let y = -dh / 2; y < dh / 2; y += 6) ctx.fillRect(-dw / 2, y, dw, 2);
-        }
-        if (fx.grain) {
-          ctx.fillStyle = `rgba(255,255,255,${(fx.grain / 100) * 0.14})`;
-          for (let i = 0; i < 420; i++) {
-            const gx = ((Math.sin(i * 12.9898 + globalT * 91) * 43758.5453) % 1 + 1) % 1;
-            const gy = ((Math.sin(i * 78.233 + globalT * 53) * 43758.5453) % 1 + 1) % 1;
-            ctx.fillRect(-dw / 2 + gx * dw, -dh / 2 + gy * dh, 3, 3);
-          }
-        }
-
-        bounds = { cx, cy, w: dw, h: dh, rot: rotDeg };
-      }
-    }
-
-    ctx.restore();
-
-    if ((clip.vignette || 0) > 0) {
-      const vig = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.28, W / 2, H / 2, Math.max(W, H) * 0.72);
-      vig.addColorStop(0, 'rgba(0,0,0,0)');
-      vig.addColorStop(1, `rgba(0,0,0,${(clip.vignette / 100) * 0.85})`);
-      ctx.fillStyle = vig;
-      ctx.fillRect(0, 0, W, H);
-    }
-    if (flashWhite > 0.01) { ctx.fillStyle = `rgba(255,255,255,${flashWhite})`; ctx.fillRect(0, 0, W, H); }
-    if (fadeBlack > 0.01)  { ctx.fillStyle = `rgba(0,0,0,${fadeBlack})`;        ctx.fillRect(0, 0, W, H); }
-    return bounds;
-  }
-
-  drawGraphicClip(ctx, clip, localT, W, H, posX, posY, scale, rotDeg, globalT, totalDur) {
-    const cx = W / 2 + posX, cy = H / 2 + posY;
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate((rotDeg * Math.PI) / 180);
+    ctx.translate(W / 2 + x, H / 2 + y);
+    ctx.rotate((rot * Math.PI) / 180);
     ctx.scale(scale, scale);
 
-    let bw = 360, bh = 120;
-    const k = clip.graphicType || 'recBadge';
-    if (k === 'recBadge') {
-      bw = 230; bh = 68;
-      ctx.fillStyle = 'rgba(10,12,18,0.72)';
-      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, bw, bh, 12); ctx.fill();
-      ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.lineWidth = 2; ctx.stroke();
-      const blink = Math.floor(globalT * 2) % 2 === 0;
-      if (blink) { ctx.fillStyle = '#ff3b5c'; ctx.beginPath(); ctx.arc(-68, 0, 12, 0, Math.PI * 2); ctx.fill(); }
-      ctx.fillStyle = '#ffffff'; ctx.font = '700 32px SF Mono, Menlo, monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText('REC', -42, 2);
-    } else if (k === 'viewfinder') {
-      bw = W * 0.82; bh = H * 0.82;
-      ctx.strokeStyle = 'rgba(255,255,255,0.78)'; ctx.lineWidth = 4;
-      const c = 48;
-      for (const [sx, sy] of [[-1,-1],[1,-1],[-1,1],[1,1]]) {
-        const x = sx * bw / 2, y = sy * bh / 2;
-        ctx.beginPath(); ctx.moveTo(x, y - sy * c); ctx.lineTo(x, y); ctx.lineTo(x - sx * c, y); ctx.stroke();
-      }
-      ctx.beginPath(); ctx.moveTo(-18, 0); ctx.lineTo(18, 0); ctx.moveTo(0, -18); ctx.lineTo(0, 18); ctx.stroke();
-    } else if (k === 'progressBar') {
-      bw = W * 0.86; bh = 18;
-      const pct = Math.min(1, globalT / Math.max(0.5, totalDur));
-      ctx.fillStyle = 'rgba(255,255,255,0.18)';
-      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, bw, bh, 9); ctx.fill();
-      ctx.fillStyle = '#00e5c3';
-      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, Math.max(16, bw * pct), bh, 9); ctx.fill();
-    } else if (k === 'lowerThird') {
-      bw = 560; bh = 112;
-      ctx.fillStyle = 'rgba(10,12,18,0.82)';
-      ctx.beginPath(); ctx.roundRect(-bw / 2, -bh / 2, bw, bh, 10); ctx.fill();
-      ctx.fillStyle = '#00e5c3'; ctx.fillRect(-bw / 2, -bh / 2, 10, bh);
-      ctx.fillStyle = '#ffffff'; ctx.font = '800 34px -apple-system, Inter, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(clip.graphicTitle || 'MOTIONVIZ STUDIO', -bw / 2 + 30, -14);
-      ctx.fillStyle = '#9aa6bd'; ctx.font = '600 22px SF Mono, Menlo, monospace';
-      ctx.fillText(clip.graphicSub || 'NEON × FLORA × BLENDER MCP', -bw / 2 + 30, 24);
-    } else if (k === 'arrowRight') {
-      bw = 220; bh = 100;
-      ctx.strokeStyle = '#00e5c3'; ctx.lineWidth = 14; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      ctx.beginPath(); ctx.moveTo(-90, 0); ctx.lineTo(72, 0); ctx.moveTo(30, -38); ctx.lineTo(76, 0); ctx.lineTo(30, 38); ctx.stroke();
-    } else {
-      bw = W; bh = H;
-      const g = ctx.createLinearGradient(-bw / 2, -bh / 2, bw / 2, bh / 2);
-      g.addColorStop(0, '#071b24'); g.addColorStop(0.5, '#0b1021'); g.addColorStop(1, '#260b24');
-      ctx.fillStyle = g; ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
-    }
-    ctx.restore();
-    return { cx, cy, w: bw * scale, h: bh * scale, rot: rotDeg };
-  }
-
-  drawTextClip(ctx, clip, localT, W, H, posX, posY, scale, rotDeg) {
-    let raw = clip.text || 'TEXT';
-    let animAlpha = 1, animY = 0, animScale = 1, glitchX = 0;
-    const u = Math.min(1, localT / 0.45);
-    const ease = 1 - Math.pow(1 - u, 3);
-
-    if (clip.textAnim === 'fade') animAlpha = ease;
-    else if (clip.textAnim === 'pop') animScale = 0.35 + 0.65 * (u < 0.75 ? (u / 0.75) * 1.12 : 1.12 - ((u - 0.75) / 0.25) * 0.12);
-    else if (clip.textAnim === 'slideUp') { animY = (1 - ease) * 90; animAlpha = ease; }
-    else if (clip.textAnim === 'typewriter') raw = raw.slice(0, Math.max(1, Math.ceil(raw.length * Math.min(1, localT / 1.1))));
-    else if (clip.textAnim === 'glitch' && localT < 0.55) glitchX = Math.sin(localT * 95) * 18 * (1 - localT / 0.55);
-
-    const cx = W / 2 + posX + glitchX;
-    const cy = H / 2 + posY + animY;
-    const fontSize = (clip.fontSize || 76) * scale * animScale;
-    const lines = raw.split('\n');
-    const lineH = fontSize * (clip.lineHeight || 1.15);
-
-    ctx.save();
-    ctx.globalAlpha *= animAlpha;
-    ctx.translate(cx, cy);
-    ctx.rotate((rotDeg * Math.PI) / 180);
-    ctx.font = `${clip.fontItalic ? 'italic ' : ''}${clip.fontWeight || 800} ${fontSize}px ${clip.fontFamily || 'DIN Condensed, sans-serif'}`;
-    ctx.textAlign = clip.textAlign || 'center';
+    const fontSize = clip.fontSize || 76;
+    const weight = clip.fontWeight || '900';
+    const align = clip.align || 'center';
+    const fontFamily = clip.fontFamily || 'Inter, -apple-system, sans-serif';
+    ctx.font = `${weight} ${fontSize}px ${fontFamily}`;
+    if ('letterSpacing' in ctx) ctx.letterSpacing = `${Number(clip.spacing || 0)}px`;
+    ctx.textAlign = align;
     ctx.textBaseline = 'middle';
 
-    let maxW = 0;
-    for (const ln of lines) maxW = Math.max(maxW, ctx.measureText(ln).width);
+    const maxWrapW = clip.maxWidth > 0 ? clip.maxWidth : W * 0.86;
+    const lines = this._wrapTextLines(ctx, visibleText, maxWrapW);
+    const lineH = fontSize * 1.18;
     const totalH = lines.length * lineH;
+    const maxW = Math.max(...lines.map(l => ctx.measureText(l).width), 40);
 
-    if (clip.textBg && clip.textBg !== 'transparent' && (clip.textBgAlpha || 0) > 0) {
-      const padX = fontSize * 0.42, padY = fontSize * 0.24;
+    const anchorX = align === 'left' ? -maxW / 2 : (align === 'right' ? maxW / 2 : 0);
+
+    if (clip.bgAlpha > 0) {
       ctx.save();
-      ctx.globalAlpha *= clip.textBgAlpha;
-      ctx.fillStyle = clip.textBg;
+      ctx.fillStyle = clip.bgColor || '#000000';
+      ctx.globalAlpha *= clip.bgAlpha;
+      const padX = fontSize * 0.42;
+      const padY = fontSize * 0.24;
       ctx.beginPath();
-      ctx.roundRect(-maxW / 2 - padX, -totalH / 2 - padY, maxW + padX * 2, totalH + padY * 2, Math.min(20, fontSize * 0.25));
+      ctx.roundRect(-maxW / 2 - padX, -totalH / 2 - padY, maxW + padX * 2, totalH + padY * 2, 16);
       ctx.fill();
       ctx.restore();
     }
 
-    ctx.shadowColor = 'rgba(0,0,0,0.48)';
-    ctx.shadowBlur = 10;
-    ctx.shadowOffsetY = 3;
+    if ((clip.shadowBlur || 0) > 0) {
+      ctx.shadowColor = clip.shadowColor || 'rgba(0,0,0,0.85)';
+      ctx.shadowBlur = clip.shadowBlur;
+      ctx.shadowOffsetY = Math.round(clip.shadowBlur * 0.25);
+    }
 
-    lines.forEach((ln, idx) => {
-      const ly = -totalH / 2 + lineH * (idx + 0.5);
-      if ((clip.strokeWidth || 0) > 0 && clip.strokeColor && clip.strokeColor !== 'transparent') {
-        ctx.lineWidth = clip.strokeWidth * scale;
-        ctx.strokeStyle = clip.strokeColor;
+    lines.forEach((line, i) => {
+      const ly = -totalH / 2 + lineH * (i + 0.5);
+      if (clip.strokeWidth > 0) {
+        ctx.lineWidth = clip.strokeWidth;
+        ctx.strokeStyle = clip.strokeColor || '#000000';
         ctx.lineJoin = 'round';
-        ctx.strokeText(ln, 0, ly);
+        ctx.strokeText(line, anchorX, ly);
       }
-      ctx.fillStyle = clip.textColor || '#ffffff';
-      ctx.fillText(ln, 0, ly);
+      ctx.fillStyle = clip.color || '#ffffff';
+      ctx.fillText(line, anchorX, ly);
     });
-
     ctx.restore();
-    return { cx, cy, w: Math.max(120, maxW + 44), h: Math.max(60, totalH + 30), rot: rotDeg };
   }
 
-  drawCaption(ctx, cap, t, style, W, H) {
+  /** Multi-line auto-wrapping captions safe for both 16:9 and 9:16 */
+  drawCaption(ctx, cap, t, W, H, snap) {
     const words = (cap.text || '').trim().split(/\s+/).filter(Boolean);
     if (!words.length) return;
-    const u = Math.max(0, Math.min(0.999, (t - cap.start) / Math.max(0.1, cap.end - cap.start)));
-    const activeIdx = Math.floor(u * words.length);
-    const fontSize = Math.round(Math.min(W, H) * 0.052);
-    const y = H * 0.84;
+    const style = snap.captionStyle || 'hormozi';
+    const progress = Math.max(0, Math.min(0.999, (t - cap.start) / Math.max(0.1, cap.end - cap.start)));
+    const activeIdx = Math.floor(progress * words.length);
+    const fontSize = Math.round((snap.captionFontSize || 56) * (W < H ? 0.92 : 1));
+    const yCenter = H * ((snap.captionYPos ?? 80) / 100);
+    const maxLineW = W * 0.86;
 
     ctx.save();
-    ctx.font = `900 ${fontSize}px -apple-system, Inter, Impact, sans-serif`;
+    ctx.font = `900 ${fontSize}px Inter, -apple-system, sans-serif`;
     ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
 
-    if (style === 'hormozi') {
-      const spaceW = ctx.measureText(' ').width;
-      const widths = words.map(w => ctx.measureText(w.toUpperCase()).width);
-      const totalW = widths.reduce((a, b) => a + b, 0) + spaceW * (words.length - 1);
-      let x = (W - totalW) / 2;
-      words.forEach((w, i) => {
-        const up = w.toUpperCase();
-        const isAct = i === activeIdx;
-        ctx.save();
-        ctx.translate(x + widths[i] / 2, y);
-        if (isAct) ctx.scale(1.14, 1.14);
-        ctx.textAlign = 'center';
-        ctx.lineWidth = fontSize * 0.16;
-        ctx.strokeStyle = '#000000';
-        ctx.lineJoin = 'round';
-        ctx.strokeText(up, 0, 0);
-        ctx.fillStyle = isAct ? '#00ffaa' : '#ffffff';
-        ctx.fillText(up, 0, 0);
-        ctx.restore();
-        x += widths[i] + spaceW;
-      });
-    } else if (style === 'pill') {
-      const full = cap.text;
-      const tw = ctx.measureText(full).width;
-      ctx.fillStyle = 'rgba(0, 229, 195, 0.94)';
-      ctx.beginPath(); ctx.roundRect((W - tw) / 2 - 26, y - fontSize * 0.72, tw + 52, fontSize * 1.44, 14); ctx.fill();
-      ctx.fillStyle = '#071012'; ctx.textAlign = 'center';
-      ctx.fillText(full, W / 2, y + 2);
-    } else {
-      const full = cap.text;
-      const tw = ctx.measureText(full).width;
-      ctx.fillStyle = 'rgba(0,0,0,0.68)';
-      ctx.beginPath(); ctx.roundRect((W - tw) / 2 - 22, y - fontSize * 0.68, tw + 44, fontSize * 1.36, 10); ctx.fill();
-      ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center';
-      ctx.fillText(full, W / 2, y + 2);
+    const displayWords = style === 'hormozi' ? words.map(w => w.toUpperCase()) : words;
+    const spaceW = ctx.measureText(' ').width * 1.15;
+
+    // Word-wrap into lines while tracking each word's original index
+    const lines = [];
+    let curLine = [];
+    let curW = 0;
+    displayWords.forEach((w, idx) => {
+      const ww = ctx.measureText(w).width;
+      if (curLine.length > 0 && curW + spaceW + ww > maxLineW) {
+        lines.push({ items: curLine, width: curW });
+        curLine = [{ word: w, idx, ww }];
+        curW = ww;
+      } else {
+        if (curLine.length > 0) curW += spaceW;
+        curLine.push({ word: w, idx, ww });
+        curW += ww;
+      }
+    });
+    if (curLine.length) lines.push({ items: curLine, width: curW });
+
+    const lineH = fontSize * 1.26;
+    const totalH = lines.length * lineH;
+    const maxActualW = Math.max(...lines.map(l => l.width));
+
+    if (style === 'pill') {
+      ctx.fillStyle = 'rgba(8, 10, 14, 0.84)';
+      ctx.beginPath();
+      ctx.roundRect(W / 2 - maxActualW / 2 - 28, yCenter - totalH / 2 - 14, maxActualW + 56, totalH + 28, 18);
+      ctx.fill();
     }
+
+    lines.forEach((line, li) => {
+      const ly = yCenter - totalH / 2 + lineH * (li + 0.5);
+      if (style === 'hormozi') {
+        let curX = W / 2 - line.width / 2;
+        for (const item of line.items) {
+          const isAct = item.idx === activeIdx;
+          const cx = curX + item.ww / 2;
+          ctx.save();
+          ctx.translate(cx, ly);
+          if (isAct) ctx.scale(1.13, 1.13);
+          ctx.lineWidth = Math.max(8, fontSize * 0.19);
+          ctx.strokeStyle = '#000000';
+          ctx.lineJoin = 'round';
+          ctx.strokeText(item.word, 0, 0);
+          ctx.fillStyle = isAct ? '#00e5c3' : '#ffffff';
+          ctx.fillText(item.word, 0, 0);
+          ctx.restore();
+          curX += item.ww + spaceW;
+        }
+      } else {
+        const lineText = line.items.map(i => i.word).join(' ');
+        ctx.lineWidth = style === 'clean' ? 6 : 0;
+        ctx.strokeStyle = 'rgba(0,0,0,0.88)';
+        if (style === 'clean') ctx.strokeText(lineText, W / 2, ly);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(lineText, W / 2, ly);
+      }
+    });
     ctx.restore();
   }
 
-  renderOverlay(state, bounds, W, H) {
-    const octx = this.octx;
-    octx.clearRect(0, 0, W, H);
+  getClipBoundingBox(clip, t) {
+    const W = this.state.canvasWidth;
+    const H = this.state.canvasHeight;
+    const localT = Math.max(0, t - clip.start);
+    const x = evalKeyframe(clip, 'x', localT, clip.x || 0);
+    const y = evalKeyframe(clip, 'y', localT, clip.y || 0);
+    const sc = evalKeyframe(clip, 'scale', localT, clip.scale ?? 1);
+    const rot = evalKeyframe(clip, 'rotation', localT, clip.rotation || 0);
 
-    if (this.showGuides) {
-      octx.save();
-      octx.strokeStyle = 'rgba(255,255,255,0.18)'; octx.lineWidth = 2;
-      octx.beginPath();
-      octx.moveTo(W / 3, 0); octx.lineTo(W / 3, H);
-      octx.moveTo((2 * W) / 3, 0); octx.lineTo((2 * W) / 3, H);
-      octx.moveTo(0, H / 3); octx.lineTo(W, H / 3);
-      octx.moveTo(0, (2 * H) / 3); octx.lineTo(W, (2 * H) / 3);
-      octx.stroke();
-      octx.strokeStyle = 'rgba(0,229,195,0.32)'; octx.setLineDash([10, 8]);
-      octx.strokeRect(W * 0.08, H * 0.08, W * 0.84, H * 0.84);
-      octx.restore();
+    let bw = W * 0.42, bh = H * 0.2;
+    if (clip.type === 'text') {
+      const fs = clip.fontSize || 76;
+      const lines = (clip.text || 'Text').split('\n');
+      bw = Math.max(220, Math.min(W * 0.88, Math.max(...lines.map(l => l.length)) * fs * 0.62));
+      bh = Math.max(fs * 1.4, lines.length * fs * 1.26);
+    } else if (clip.type === 'graphic') {
+      bw = clip.graphicKind === 'lower-third' ? 580 : (clip.graphicKind === 'rec-badge' ? 280 : W * 0.85);
+      bh = clip.graphicKind === 'lower-third' ? 120 : (clip.graphicKind === 'rec-badge' ? 84 : H * 0.25);
+    } else {
+      bw = W * 0.96; bh = H * 0.96;
     }
-
-    // Dynamic center-axis alignment snap crosshairs while dragging!
-    if (this.snapLines.x || this.snapLines.y) {
-      octx.save();
-      octx.strokeStyle = '#00e5c3'; octx.lineWidth = 2; octx.setLineDash([8, 6]);
-      if (this.snapLines.x) { octx.beginPath(); octx.moveTo(W / 2, 0); octx.lineTo(W / 2, H); octx.stroke(); }
-      if (this.snapLines.y) { octx.beginPath(); octx.moveTo(0, H / 2); octx.lineTo(W, H / 2); octx.stroke(); }
-      octx.restore();
-    }
-
-    // Interactive Transform Gizmo (4 corner scale handles + top rotation knob!)
-    if (bounds) {
-      octx.save();
-      octx.translate(bounds.cx, bounds.cy);
-      octx.rotate((bounds.rot * Math.PI) / 180);
-      octx.strokeStyle = '#00e5c3'; octx.lineWidth = 3;
-      octx.strokeRect(-bounds.w / 2, -bounds.h / 2, bounds.w, bounds.h);
-      // Rotation stem + circular knob above top edge
-      const rotY = -bounds.h / 2 - 44;
-      octx.beginPath(); octx.moveTo(0, -bounds.h / 2); octx.lineTo(0, rotY); octx.stroke();
-      octx.fillStyle = '#00e5c3'; octx.beginPath(); octx.arc(0, rotY, 11, 0, Math.PI * 2); octx.fill();
-      octx.strokeStyle = '#071210'; octx.lineWidth = 2; octx.stroke();
-      // 4 corner scale squares
-      const hs = 16;
-      octx.fillStyle = '#ffffff'; octx.strokeStyle = '#00e5c3'; octx.lineWidth = 3;
-      for (const [hx, hy] of [[-bounds.w / 2, -bounds.h / 2], [bounds.w / 2, -bounds.h / 2], [-bounds.w / 2, bounds.h / 2], [bounds.w / 2, bounds.h / 2]]) {
-        octx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
-        octx.strokeRect(hx - hs / 2, hy - hs / 2, hs, hs);
-      }
-      octx.restore();
-    }
+    return { cx: W / 2 + x, cy: H / 2 + y, w: bw * sc, h: bh * sc, rot };
   }
 
-  // Hit-test gizmo handles (rotate / scale / move / layer pick)
-  hitTestCanvas(px, py, selectedClipId) {
-    const sel = this.lastLayerBounds.find(b => b.clipId === selectedClipId);
-    if (sel) {
-      const ang = -(sel.rot * Math.PI) / 180;
-      const dx = px - sel.cx, dy = py - sel.cy;
-      const lx = dx * Math.cos(ang) - dy * Math.sin(ang);
-      const ly = dx * Math.sin(ang) + dy * Math.cos(ang);
-      if (Math.hypot(lx, ly - (-sel.h / 2 - 44)) < 28) return { mode: 'rotate', clipId: sel.clipId, bounds: sel };
-      for (const [hx, hy] of [[-sel.w / 2, -sel.h / 2], [sel.w / 2, -sel.h / 2], [-sel.w / 2, sel.h / 2], [sel.w / 2, sel.h / 2]]) {
-        if (Math.hypot(lx - hx, ly - hy) < 28) return { mode: 'scale', clipId: sel.clipId, bounds: sel };
-      }
-      if (Math.abs(lx) <= sel.w / 2 && Math.abs(ly) <= sel.h / 2) return { mode: 'move', clipId: sel.clipId, bounds: sel };
+  /** Computes handle points clamped inside visible canvas edges so full-frame clips stay draggable! */
+  getHandlePoints(box) {
+    const W = this.state.canvasWidth;
+    const H = this.state.canvasHeight;
+    const rad = (box.rot * Math.PI) / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    const toWorld = (lx, ly) => ({
+      x: Math.max(18, Math.min(W - 18, box.cx + lx * cos - ly * sin)),
+      y: Math.max(18, Math.min(H - 18, box.cy + lx * sin + ly * cos)),
+    });
+    const hw = Math.min(box.w / 2, W / 2 - 22);
+    const hh = Math.min(box.h / 2, H / 2 - 22);
+    const corners = [
+      { id: 'tl', ...toWorld(-hw, -hh) },
+      { id: 'tr', ...toWorld(hw, -hh) },
+      { id: 'br', ...toWorld(hw, hh) },
+      { id: 'bl', ...toWorld(-hw, hh) },
+    ];
+    const rawRot = {
+      x: box.cx - (-hh - 46) * sin,
+      y: box.cy + (-hh - 46) * cos,
+    };
+    const rotHandle = {
+      x: Math.max(24, Math.min(W - 24, rawRot.x)),
+      y: Math.max(24, Math.min(H - 24, rawRot.y)),
+    };
+    return { corners, rotHandle, hw, hh };
+  }
+
+  renderOverlayGuides(t) {
+    const octx = this.octx;
+    const W = this.state.canvasWidth;
+    const H = this.state.canvasHeight;
+    if (this.overlay.width !== W || this.overlay.height !== H) {
+      this.overlay.width = W; this.overlay.height = H;
     }
-    // Check topmost layer under cursor
-    for (let i = this.lastLayerBounds.length - 1; i >= 0; i--) {
-      const b = this.lastLayerBounds[i];
-      const ang = -(b.rot * Math.PI) / 180;
-      const dx = px - b.cx, dy = py - b.cy;
-      const lx = dx * Math.cos(ang) - dy * Math.sin(ang);
-      const ly = dx * Math.sin(ang) + dy * Math.cos(ang);
-      if (Math.abs(lx) <= b.w / 2 && Math.abs(ly) <= b.h / 2) return { mode: 'move', clipId: b.clipId, bounds: b };
+    octx.clearRect(0, 0, W, H);
+
+    if (this.state.showGuides) {
+      octx.save();
+      octx.strokeStyle = 'rgba(0, 229, 195, 0.35)';
+      octx.lineWidth = 2;
+      octx.setLineDash([10, 8]);
+      octx.strokeRect(W * 0.08, H * 0.08, W * 0.84, H * 0.84);
+      octx.strokeStyle = 'rgba(255,255,255,0.2)';
+      octx.beginPath();
+      octx.moveTo(W / 3, 0); octx.lineTo(W / 3, H);
+      octx.moveTo((W * 2) / 3, 0); octx.lineTo((W * 2) / 3, H);
+      octx.moveTo(0, H / 3); octx.lineTo(W, H / 3);
+      octx.moveTo(0, (H * 2) / 3); octx.lineTo(W, (H * 2) / 3);
+      octx.stroke();
+      octx.restore();
+    }
+
+    if (this.snapXGuide !== null) {
+      octx.save(); octx.strokeStyle = '#ffb020'; octx.lineWidth = 2;
+      octx.beginPath(); octx.moveTo(this.snapXGuide, 0); octx.lineTo(this.snapXGuide, H); octx.stroke();
+      octx.restore();
+    }
+    if (this.snapYGuide !== null) {
+      octx.save(); octx.strokeStyle = '#ffb020'; octx.lineWidth = 2;
+      octx.beginPath(); octx.moveTo(0, this.snapYGuide); octx.lineTo(W, this.snapYGuide); octx.stroke();
+      octx.restore();
+    }
+
+    const sel = this.findSelectedClip();
+    if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return;
+    const box = this.getClipBoundingBox(sel, t);
+    const { corners, rotHandle, hw, hh } = this.getHandlePoints(box);
+
+    octx.save();
+    octx.translate(box.cx, box.cy);
+    octx.rotate((box.rot * Math.PI) / 180);
+    octx.strokeStyle = '#00e5c3';
+    octx.lineWidth = 3;
+    octx.strokeRect(-hw, -hh, hw * 2, hh * 2);
+    octx.restore();
+
+    // Draw inset corner handles + top rotate handle in screen/project space
+    octx.save();
+    octx.strokeStyle = '#00e5c3';
+    octx.lineWidth = 2.5;
+    octx.beginPath();
+    octx.moveTo((corners[0].x + corners[1].x) / 2, (corners[0].y + corners[1].y) / 2);
+    octx.lineTo(rotHandle.x, rotHandle.y);
+    octx.stroke();
+
+    octx.fillStyle = '#00e5c3';
+    octx.beginPath();
+    octx.arc(rotHandle.x, rotHandle.y, 13, 0, Math.PI * 2);
+    octx.fill();
+    octx.strokeStyle = '#051014'; octx.lineWidth = 3; octx.stroke();
+
+    for (const c of corners) {
+      octx.fillStyle = '#ffffff';
+      octx.strokeStyle = '#00e5c3';
+      octx.lineWidth = 3;
+      octx.fillRect(c.x - 10, c.y - 10, 20, 20);
+      octx.strokeRect(c.x - 10, c.y - 10, 20, 20);
+    }
+    octx.restore();
+  }
+
+  hitTestGizmo(px, py, t) {
+    const sel = this.findSelectedClip();
+    if (!sel || sel.type === 'audio' || t < sel.start || t >= sel.start + sel.duration) return null;
+    const box = this.getClipBoundingBox(sel, t);
+    const { corners, rotHandle } = this.getHandlePoints(box);
+
+    if (Math.hypot(px - rotHandle.x, py - rotHandle.y) < 30) return { mode: 'rotate', clip: sel, box };
+    for (const c of corners) {
+      if (Math.hypot(px - c.x, py - c.y) < 28) return { mode: 'scale', clip: sel, box };
+    }
+    const dx = px - box.cx, dy = py - box.cy;
+    const rad = (-box.rot * Math.PI) / 180;
+    const lx = dx * Math.cos(rad) - dy * Math.sin(rad);
+    const ly = dx * Math.sin(rad) + dy * Math.cos(rad);
+    if (Math.abs(lx) <= box.w / 2 && Math.abs(ly) <= box.h / 2) return { mode: 'move', clip: sel, box };
+    return null;
+  }
+
+  hitTestAnyClip(px, py, t) {
+    const layers = [...this.state.tracks].filter(tr => !tr.hidden && tr.type !== 'audio').reverse();
+    for (const tr of layers) {
+      for (const clip of tr.clips) {
+        if (t < clip.start || t >= clip.start + clip.duration) continue;
+        const box = this.getClipBoundingBox(clip, t);
+        if (Math.abs(px - box.cx) <= box.w / 2 && Math.abs(py - box.cy) <= box.h / 2) return clip;
+      }
     }
     return null;
   }
 
-  // TRUE Deterministic Frame-Accurate FFmpeg MP4 Export (Zero Dropped Frames + Real FFmpeg Multi-Track Audio Mix!)
-  async exportDeterministicMP4(state, opts, onProgress) {
-    const { width, height, fps, crf, name } = opts;
-    const totalDuration = Math.max(0.5, state.getProjectDuration());
-    const totalFrames = Math.max(1, Math.ceil(totalDuration * fps));
-    const prevW = state.canvasWidth, prevH = state.canvasHeight;
-    state.canvasWidth = width;
-    state.canvasHeight = height;
-
-    // Collect all unmuted audio-bearing clips for native FFmpeg multi-track amix
-    const audioClips = [];
-    for (const c of state.clips) {
-      const tr = state.tracks.find(t => t.id === c.trackId);
-      if (tr?.muted || c.muted || state.masterMute) continue;
-      if (c.type === 'audio' || (c.type === 'video' && !c.audioDetached)) {
-        const m = state.library.find(x => x.id === c.mediaId);
-        if (m && m.hasAudio && !m.url.startsWith('blob:')) {
-          audioClips.push({
-            mediaId: c.mediaId, start: c.start, duration: c.duration, trimStart: c.trimStart || 0,
-            speed: c.speed || 1, volume: c.volume ?? 1, fadeIn: c.fadeIn || 0, fadeOut: c.fadeOut || 0,
-            eqBass: c.eqBass || 0, eqTreble: c.eqTreble || 0,
-          });
-        }
-      }
+  findSelectedClip() {
+    for (const tr of this.state.tracks) {
+      const c = tr.clips.find(x => x.id === this.state.selectedClipId);
+      if (c) return c;
     }
+    return null;
+  }
 
-    onProgress(2, 'Starting local FFmpeg H.264 encoder...');
-    const startResp = await fetch('/api/export-frames/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ width, height, fps, crf, name, totalDuration, audioClips }),
+  /** Render ONLY the selected clip (no text, captions, or other overlays) for clean Freeze Frame PNG */
+  async captureIsolatedClipBlob(clip, t) {
+    const off = document.createElement('canvas');
+    off.width = this.state.canvasWidth;
+    off.height = this.state.canvasHeight;
+    const octx = off.getContext('2d');
+    const snap = structuredClone({
+      canvasWidth: this.state.canvasWidth,
+      canvasHeight: this.state.canvasHeight,
+      fps: this.state.fps,
+      bgMode: 'black',
+      tracks: this.state.tracks,
+      captions: [],
+      library: this.state.library,
     });
-    const startData = await startResp.json();
-    if (!startResp.ok || !startData.ok) throw new Error(startData.error || 'Could not start FFmpeg job');
-    const jobId = startData.jobId;
+    await this.seekAllExact(snap, t);
+    this.renderFrame(t, {
+      snapshot: snap,
+      targetCanvas: off,
+      targetCtx: octx,
+      renderW: off.width,
+      renderH: off.height,
+      hideGuides: true,
+      isolateClipId: clip.id,
+      isExport: true,
+    });
+    return new Promise((resolve) => off.toBlob(resolve, 'image/png'));
+  }
 
-    // Stream exact frames in small concatenated MJPEG batches (super fast & deterministic!)
-    const BATCH_SIZE = 8;
-    let batch = [];
-    const flushBatch = async () => {
-      if (!batch.length) return;
-      const merged = new Blob(batch, { type: 'application/octet-stream' });
-      batch = [];
-      const r = await fetch(`/api/export-frames/push/${jobId}`, { method: 'POST', body: merged });
-      if (!r.ok) throw new Error('Frame push failed');
-    };
+  async cancelExport() {
+    if (this.exportAbortCtrl) {
+      this.exportAbortCtrl.abort();
+    }
+    if (this.activeExportJobId) {
+      const jid = this.activeExportJobId;
+      this.activeExportJobId = null;
+      try {
+        await fetch(`/api/export-frames/cancel/${jid}`, {
+          method: 'POST',
+          headers: getApiTokenHeaders(),
+        });
+      } catch {}
+    }
+  }
 
-    try {
-      for (let f = 0; f < totalFrames; f++) {
-        const t = f / fps;
-        await this.seekAllExact(state, t);
-        this.renderFrame(state, t, false);
-        const jpegBlob = await new Promise(res => this.canvas.toBlob(res, 'image/jpeg', 0.94));
-        batch.push(jpegBlob);
-        if (batch.length >= BATCH_SIZE) {
-          await flushBatch();
-          const pct = Math.min(88, Math.round(5 + ((f + 1) / totalFrames) * 83));
-          onProgress(pct, `Rendering frame ${f + 1} / ${totalFrames} (${width}×${height} @ ${fps}fps)...`);
+  /**
+   * Deterministic Frame-Accurate MP4 Export:
+   * - Renders from a deep-cloned immutable snapshot on a SEPARATE offscreen canvas
+   * - Zero state mutation, zero seek races, resolution-independent scaling
+   * - Supports cancellation + ETA + full audio parity (reverse, ramps, voiceFx, EQ, volume KFs)
+   */
+  async exportDeterministicMP4({ width, height, fps, crf, name, onProgress }) {
+    this.pauseAllMedia();
+    this.isExporting = true;
+    this.exportAbortCtrl = new AbortController();
+    const signal = this.exportAbortCtrl.signal;
+
+    // Immutable project snapshot so edits/state never corrupt export
+    const snap = structuredClone({
+      canvasWidth: this.state.canvasWidth,
+      canvasHeight: this.state.canvasHeight,
+      fps: this.state.fps,
+      bgMode: this.state.bgMode,
+      captionStyle: this.state.captionStyle,
+      captionYPos: this.state.captionYPos,
+      captionFontSize: this.state.captionFontSize,
+      tracks: this.state.tracks,
+      captions: this.state.captions,
+      library: this.state.library,
+    });
+
+    const rawDur = getSnapshotDuration(snap);
+    const totalDur = Math.max(1 / fps, rawDur);
+    const totalFrames = Math.max(1, Math.round(totalDur * fps));
+
+    // Separate offscreen export canvas (never mutates live preview!)
+    const expCanvas = document.createElement('canvas');
+    expCanvas.width = width;
+    expCanvas.height = height;
+    const expCtx = expCanvas.getContext('2d', { willReadFrequently: false });
+
+    const audioClips = [];
+    for (const tr of snap.tracks) {
+      if (tr.muted) continue;
+      for (const c of tr.clips) {
+        if (!c.mediaId || c.muted) continue;
+        const m = snap.library.find(x => x.id === c.mediaId);
+        if (!m || !m.hasAudio) continue;
+        // Include A->B crossfade durations into fadeIn / fadeOut if adjacent on track
+        let fadeIn = c.fadeIn || 0;
+        let fadeOut = c.fadeOut || 0;
+        if ((tr.type === 'video' || tr.type === 'overlay') && c.transIn && c.transIn !== 'none') {
+          const prev = tr.clips.find(p => p.id !== c.id && Math.abs((p.start + p.duration) - c.start) <= 0.06);
+          if (prev) fadeIn = Math.max(fadeIn, Math.min(c.transInDur || 0.5, c.duration * 0.5));
         }
+        if (tr.type === 'video' || tr.type === 'overlay') {
+          const next = tr.clips.find(n => n.id !== c.id && n.transIn && n.transIn !== 'none' && Math.abs((c.start + c.duration) - n.start) <= 0.06);
+          if (next) fadeOut = Math.max(fadeOut, Math.min(next.transInDur || 0.5, next.duration * 0.5));
+        }
+        audioClips.push({
+          mediaId: c.mediaId,
+          start: c.start,
+          duration: c.duration,
+          trimStart: c.trimStart || 0,
+          speed: c.speed || 1,
+          speedCurve: c.speedCurve || 'none',
+          reverse: Boolean(c.reverse),
+          volume: c.volume ?? 1,
+          volumeKeyframes: c.keyframes?.volume || [],
+          fadeIn,
+          fadeOut,
+          eqBass: c.eqBass || 0,
+          eqTreble: c.eqTreble || 0,
+          voiceFx: c.voiceFx || 'none',
+        });
       }
-      await flushBatch();
-    } finally {
-      state.canvasWidth = prevW;
-      state.canvasHeight = prevH;
     }
 
-    onProgress(92, 'Muxing multi-track audio & finalizing H.264 MP4...');
-    const finResp = await fetch(`/api/export-frames/finish/${jobId}`, { method: 'POST' });
-    const finData = await finResp.json();
-    if (!finResp.ok || !finData.ok) throw new Error(finData.error || 'Finalize failed');
-    onProgress(100, 'Studio MP4 export complete!');
-    return finData;
+    let jobId = null;
+    try {
+      const startRes = await fetch('/api/export-frames/start', {
+        method: 'POST',
+        headers: getApiTokenHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ width, height, fps, crf, name, totalDuration: totalDur, audioClips }),
+        signal,
+      });
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.error || 'Failed to start export job');
+      jobId = startData.jobId;
+      this.activeExportJobId = jobId;
+
+      const t0 = performance.now();
+      for (let f = 0; f < totalFrames; f++) {
+        if (signal.aborted) throw new Error('Export cancelled');
+        const t = Math.min(totalDur - 0.001, f / fps);
+        await this.seekAllExact(snap, t);
+        if (signal.aborted) throw new Error('Export cancelled');
+
+        this.renderFrame(t, {
+          snapshot: snap,
+          targetCanvas: expCanvas,
+          targetCtx: expCtx,
+          renderW: width,
+          renderH: height,
+          hideGuides: true,
+          isExport: true,
+        });
+
+        const blob = await new Promise(r => expCanvas.toBlob(r, 'image/jpeg', 0.94));
+        if (!blob) throw new Error(`Failed to encode frame ${f}`);
+        const pushRes = await fetch(`/api/export-frames/push/${jobId}`, {
+          method: 'POST',
+          headers: getApiTokenHeaders({ 'Content-Type': 'image/jpeg' }),
+          body: blob,
+          signal,
+        });
+        if (!pushRes.ok) {
+          const errData = await pushRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Failed pushing frame ${f}`);
+        }
+        if (f % 2 === 0 || f === totalFrames - 1) {
+          const elapsed = (performance.now() - t0) / 1000;
+          const rate = (f + 1) / Math.max(0.05, elapsed);
+          const etaSec = Math.max(0, Math.round((totalFrames - (f + 1)) / Math.max(0.1, rate)));
+          onProgress?.(
+            Math.round(((f + 1) / totalFrames) * 88),
+            `Rendering frame ${f + 1}/${totalFrames} · ETA ${etaSec}s...`
+          );
+        }
+      }
+
+      onProgress?.(93, 'Encoding H.264 + mixing multi-track AAC audio...');
+      const finRes = await fetch(`/api/export-frames/finish/${jobId}`, {
+        method: 'POST',
+        headers: getApiTokenHeaders(),
+        signal,
+      });
+      const finData = await finRes.json();
+      if (!finRes.ok) throw new Error(finData.error || 'FFmpeg finalization failed');
+      this.activeExportJobId = null;
+      onProgress?.(100, 'Export complete!');
+      return finData;
+    } catch (err) {
+      if (jobId) {
+        try {
+          await fetch(`/api/export-frames/cancel/${jobId}`, {
+            method: 'POST',
+            headers: getApiTokenHeaders(),
+          });
+        } catch {}
+      }
+      this.activeExportJobId = null;
+      throw err;
+    } finally {
+      this.isExporting = false;
+      this.exportAbortCtrl = null;
+    }
   }
 }

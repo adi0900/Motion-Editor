@@ -1,1575 +1,3175 @@
-/**
- * MotionCut Pro v2 — CapCut-Style Application Controller
- * Features: Drag-Drop Media->Timeline, Select/Razor Blade Tools, Multi-Frame Filmstrips,
- * Live Stereo VU Meter, Right-Click Context Menu, On-Canvas Move/Scale/Rotate + Double-Click Inline Text,
- * Multi-Effect Stack + Intensity, Masks, Chroma Key, Speed Curves, Captions (.SRT), Ripple Delete, Keyframe Stepper.
- */
 import {
-  CompositorEngine,
-  TEXT_PRESETS,
-  GRAPHIC_PRESETS,
-  EFFECT_PRESETS,
-  TRANSITION_PRESETS,
-  FILTER_PRESETS,
-  SPEED_CURVES,
-  SFX_PRESETS,
-  synthSfxWavUrl,
-  evalClipProp,
-} from '/engine.js';
+  VideoEngine, LUT_FILTERS, EFFECT_PRESETS, TRANSITION_PRESETS,
+  SPEED_CURVES, GRAPHICS_PRESETS, EASING_TYPES,
+  evalKeyframe, getSourceTime, getClipSourceSpan, getSnapshotDuration,
+} from './engine.js';
 
-const $ = sel => document.querySelector(sel);
-const $$ = sel => [...document.querySelectorAll(sel)];
-const uid = (p = 'c') => `${p}_${Math.random().toString(36).slice(2, 9)}`;
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+
+const AUTOSAVE_KEY = 'motioncut_autosave_v3';
+
+function uid(prefix = 'c') {
+  return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function apiHeaders(extra = {}) {
+  return { 'X-MC-Token': window.__MC_TOKEN__ || '', ...extra };
+}
+
+function formatTC(sec, fps = 30) {
+  const s = Math.max(0, Number(sec) || 0);
+  const totalFrames = Math.round(s * fps);
+  const ff = totalFrames % fps;
+  const totalSec = Math.floor(totalFrames / fps);
+  const mins = Math.floor(totalSec / 60);
+  const remSec = totalSec % 60;
+  return `${String(mins).padStart(2, '0')}:${String(remSec).padStart(2, '0')}:${String(ff).padStart(2, '0')}`;
+}
+
+function parseTC(input, fps = 30) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  if (/^\d+(\.\d+)?$/.test(raw)) return Number(raw);
+  const parts = raw.split(':').map(Number);
+  if (parts.some(n => !Number.isFinite(n) || n < 0)) return null;
+  if (parts.length === 3) return parts[0] * 60 + parts[1] + parts[2] / fps;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return null;
+}
 
 const state = {
-  title: 'Scanner_16x9_Edit',
+  title: 'Untitled_Project',
   aspect: '16:9',
   canvasWidth: 1920,
   canvasHeight: 1080,
   fps: 30,
   bgMode: 'black',
-  playhead: 0,
+  showGuides: false,
   playing: false,
   loop: true,
-  masterMute: false,
+  masterMuted: false,
+  currentTime: 0,
+  zoom: 72,
   snap: true,
-  tool: 'select', // select | razor
-  pxPerSec: 72,
+  magnetMain: true,
+  linkedSelection: true,
+  activeTool: 'select',
+  mediaFilter: 'all',
+  selectedMediaId: null,
   selectedClipId: null,
+  selectedClipIds: new Set(),
+  selectedCaptionId: null,
   activeInspectorTab: 'basic',
   transSide: 'in',
-  mediaFilter: 'all',
   captionStyle: 'hormozi',
+  captionYPos: 80,
+  captionFontSize: 56,
   copiedAttrs: null,
+  copiedClips: null,
+  exportMode: 'deterministic',
   library: [],
   waveforms: new Map(),
   markers: [],
   captions: [],
   tracks: [
-    { id: 't_text1', name: 'Text 1',     type: 'text',  muted: false, hidden: false, locked: false },
-    { id: 't_vid2',  name: 'Overlay 1',  type: 'video', muted: false, hidden: false, locked: false },
-    { id: 't_vid1',  name: 'Main Video', type: 'video', muted: false, hidden: false, locked: false },
-    { id: 't_aud1',  name: 'Audio 1',    type: 'audio', muted: false, hidden: false, locked: false },
+    { id: 't_text1', name: 'Text T1', type: 'text', color: '#f09b3a', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_ov1', name: 'Overlay V2', type: 'overlay', color: '#7c5dfa', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_vid1', name: 'Main V1', type: 'video', color: '#3898d4', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_aud1', name: 'Audio A1', type: 'audio', color: '#1fc496', muted: false, hidden: false, locked: false, clips: [] },
   ],
-  clips: [],
   history: [],
-  future: [],
-  getProjectDuration() {
-    const clipEnd = this.clips.length ? Math.max(...this.clips.map(c => c.start + c.duration)) : 0;
-    const capEnd = this.captions.length ? Math.max(...this.captions.map(c => c.end)) : 0;
-    return Math.max(5, clipEnd, capEnd);
-  },
+  historyIdx: -1,
 };
 
-const engine = new CompositorEngine($('#previewCanvas'), $('#overlayCanvas'), () => {
-  if (!state.playing) renderNow();
-});
+function quantize(t) {
+  const fps = Math.max(1, state.fps || 30);
+  return Math.max(0, Math.round(t * fps) / fps);
+}
 
-function toast(msg, dur = 2400) {
+const TEXT_PRESETS = [
+  { id: 'bold-hook', name: 'Viral Hook', text: 'THIS CHANGED EVERYTHING', color: '#ffffff', strokeColor: '#000000', strokeWidth: 10, bgColor: '#000000', bgAlpha: 0, fontSize: 84, fontWeight: '900', spacing: 1, animIn: 'pop', animOut: 'fade' },
+  { id: 'pill-badge', name: 'CapCut Pill', text: 'NEW WORKFLOW', color: '#041315', strokeColor: '#000000', strokeWidth: 0, bgColor: '#00e5c3', bgAlpha: 0.96, fontSize: 58, fontWeight: '800', spacing: 2, animIn: 'slide-up', animOut: 'fade' },
+  { id: 'cinema-sub', name: 'Cinema Title', text: 'MOTIONVIZ STUDIO', color: '#f4f0e6', strokeColor: '#000000', strokeWidth: 2, bgColor: '#000000', bgAlpha: 0, fontSize: 64, fontWeight: '700', spacing: 8, animIn: 'fade', animOut: 'fade' },
+  { id: 'neon-cyber', name: 'Cyber Neon', text: 'BLENDER × FLORA', color: '#00e5c3', strokeColor: '#041315', strokeWidth: 8, bgColor: '#07141b', bgAlpha: 0.72, fontSize: 74, fontWeight: '900', spacing: 3, animIn: 'pop', animOut: 'zoom-out' },
+  { id: 'subtitle-bar', name: 'Subtitle Box', text: 'Type your caption here', color: '#ffffff', strokeColor: '#000000', strokeWidth: 0, bgColor: '#000000', bgAlpha: 0.76, fontSize: 48, fontWeight: '700', spacing: 0, animIn: 'fade', animOut: 'fade', y: 360 },
+  { id: 'typewriter', name: 'Typewriter', text: 'LIVE CAPTURE // 01', color: '#ffb020', strokeColor: '#000000', strokeWidth: 4, bgColor: '#000000', bgAlpha: 0.5, fontSize: 54, fontWeight: '700', spacing: 2, animIn: 'typewriter', animOut: 'none' },
+];
+
+const SFX_PRESETS = [
+  { id: 'whoosh', name: 'Fast Whoosh', dur: 0.55 },
+  { id: 'boom', name: 'Cinema Boom', dur: 1.4 },
+  { id: 'riser', name: 'Tension Riser', dur: 1.8 },
+  { id: 'pop', name: 'UI Click Pop', dur: 0.16 },
+  { id: 'shutter', name: 'Camera Shutter', dur: 0.22 },
+  { id: 'glitch-zap', name: 'Glitch Zap', dur: 0.35 },
+];
+
+let toastTimer = null;
+function showToast(msg, ms = 2400) {
   const el = $('#toast');
   el.textContent = msg;
   el.classList.remove('hidden');
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => el.classList.add('hidden'), dur);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
 }
 
-function fmtTC(sec) {
-  const s = Math.max(0, sec);
-  const mins = Math.floor(s / 60);
-  const rem = s % 60;
-  const whole = Math.floor(rem);
-  const cs = Math.floor((rem - whole) * 100);
-  return `${String(mins).padStart(2, '0')}:${String(whole).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+function setSaveStatus(text, cls = '') {
+  const el = $('#saveIndicator');
+  if (!el) return;
+  el.textContent = text;
+  el.className = `save-ind ${cls}`.trim();
 }
 
-function snapshotHistory() {
-  const snap = JSON.stringify({
-    tracks: state.tracks, clips: state.clips, markers: state.markers,
-    captions: state.captions, captionStyle: state.captionStyle,
-    aspect: state.aspect, canvasWidth: state.canvasWidth, canvasHeight: state.canvasHeight, bgMode: state.bgMode,
-  });
-  if (state.history[state.history.length - 1] !== snap) {
-    state.history.push(snap);
-    if (state.history.length > 60) state.history.shift();
-    state.future = [];
-  }
-  $('#saveIndicator').textContent = 'Saved';
-  try { localStorage.setItem('motioncut_autosave_v2', snap); } catch {}
+const engine = new VideoEngine(state, $('#previewCanvas'), $('#overlayCanvas'), {
+  onMediaReady: () => { if (!state.playing && !engine.isExporting) renderNow(); },
+  onMediaError: (media) => {
+    showToast(`Media offline or unreadable: ${media.name}`, 3400);
+    renderNow();
+  },
+});
+
+function getProjectDuration() {
+  return Math.max(0, getSnapshotDuration(state));
 }
 
-function undo() {
-  if (state.history.length <= 1) return toast('Nothing to undo');
-  state.future.push(state.history.pop());
-  applySnapshot(state.history[state.history.length - 1]);
-  toast('Undid last action');
-}
-
-function redo() {
-  if (!state.future.length) return toast('Nothing to redo');
-  const next = state.future.pop();
-  state.history.push(next);
-  applySnapshot(next);
-  toast('Redid action');
-}
-
-function applySnapshot(jsonStr) {
-  const d = JSON.parse(jsonStr);
-  state.tracks = d.tracks;
-  state.clips = d.clips;
-  state.markers = d.markers || [];
-  state.captions = d.captions || [];
-  state.captionStyle = d.captionStyle || 'hormozi';
-  state.aspect = d.aspect || '16:9';
-  state.canvasWidth = d.canvasWidth || 1920;
-  state.canvasHeight = d.canvasHeight || 1080;
-  state.bgMode = d.bgMode || 'black';
-  updateAspectUI();
-  renderTimeline();
-  renderInspector();
-  renderCaptionsList();
-  renderEffectIntensityPanel();
-  renderNow();
-}
-
-function getSelectedClip() { return state.clips.find(c => c.id === state.selectedClipId) || null; }
-
-function selectClip(id) {
-  state.selectedClipId = id;
-  const clip = getSelectedClip();
-  if (clip) {
-    if (clip.type === 'text') state.activeInspectorTab = 'text';
-    else if (clip.type === 'audio') state.activeInspectorTab = 'audio';
-    else if (state.activeInspectorTab === 'text') state.activeInspectorTab = 'basic';
-    syncInspectorTabUI();
-  }
-  renderTimeline();
-  renderInspector();
-  renderEffectIntensityPanel();
-  renderNow();
-}
-
-function makeDefaultClip(media, trackId, start) {
-  return {
-    id: uid('clip'), mediaId: media.id, name: media.name, type: media.type,
-    trackId, start, duration: media.duration, trimStart: 0,
-    maxDuration: media.type === 'image' ? 60 : media.duration,
-    x: 0, y: 0, scale: 100, rotation: 0, opacity: 100,
-    fitMode: 'contain', blendMode: 'source-over', flipH: false, flipV: false,
-    cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0,
-    maskType: 'none', maskSize: 55, maskX: 0, maskY: 0, maskRot: 0, maskInvert: false,
-    chromaEnabled: false, chromaColor: '#00ff00', chromaSimilarity: 36, chromaSmoothness: 14,
-    speed: 1, speedCurve: 'normal', reverse: false,
-    volume: 1, fadeIn: 0, fadeOut: 0, eqBass: 0, eqTreble: 0, voiceFx: 'normal', muted: false, audioDetached: false,
-    brightness: 100, contrast: 100, saturate: 100, hue: 0, blur: 0, vignette: 0,
-    effects: {},
-    transitionIn: 'none', transitionOut: 'none', transitionDur: 0.4,
-    keyframes: {},
-  };
-}
-
-function addMediaToTimeline(media, atTime = null, explicitTrackId = null) {
-  let targetTrack = explicitTrackId ? state.tracks.find(t => t.id === explicitTrackId) : null;
-  if (!targetTrack) {
-    targetTrack = media.type === 'audio'
-      ? state.tracks.find(t => t.type === 'audio')
-      : state.tracks.find(t => t.id === 't_vid1') || state.tracks.find(t => t.type === 'video');
-  }
-  if (!targetTrack) return;
-  let start = atTime;
-  if (start === null) {
-    const onTrack = state.clips.filter(c => c.trackId === targetTrack.id);
-    start = onTrack.length ? Math.max(...onTrack.map(c => c.start + c.duration)) : 0;
-  }
-  const clip = makeDefaultClip(media, targetTrack.id, Math.max(0, start));
-  state.clips.push(clip);
-  if (media.hasAudio && !state.waveforms.has(media.id)) loadWaveform(media);
-  snapshotHistory();
-  selectClip(clip.id);
-  toast(`Added "${media.name}"`);
-}
-
-function addTextClip(preset) {
-  const track = state.tracks.find(t => t.type === 'text');
-  if (!track) return;
-  const clip = {
-    id: uid('txt'), mediaId: null, name: preset.name, type: 'text',
-    trackId: track.id, start: state.playhead, duration: 3.5, trimStart: 0, maxDuration: 60,
-    x: 0, y: preset.y || 0, scale: 100, rotation: 0, opacity: 100, blendMode: 'source-over',
-    text: preset.text, fontFamily: preset.font, fontSize: preset.size, fontWeight: 800, fontItalic: false, lineHeight: 1.15,
-    textColor: preset.color, strokeColor: preset.stroke, strokeWidth: preset.strokeW,
-    textBg: preset.bg, textBgAlpha: preset.bgAlpha, textAlign: 'center', textAnim: preset.anim,
-    transitionIn: 'none', transitionOut: 'none', transitionDur: 0.35, keyframes: {},
-  };
-  state.clips.push(clip);
-  snapshotHistory();
-  selectClip(clip.id);
-  toast(`Added text: ${preset.name}`);
-}
-
-function addGraphicClip(preset) {
-  const track = state.tracks.find(t => t.id === 't_vid2') || state.tracks.find(t => t.type === 'video');
-  if (!track) return;
-  const clip = {
-    id: uid('gfx'), mediaId: null, name: preset.name, type: 'graphic', graphicType: preset.id,
-    graphicTitle: 'MOTIONVIZ STUDIO', graphicSub: 'NEON × FLORA × BLENDER MCP',
-    trackId: track.id, start: state.playhead, duration: 4.0, trimStart: 0, maxDuration: 60,
-    x: preset.id === 'recBadge' ? -720 : 0,
-    y: preset.id === 'recBadge' ? -420 : preset.id === 'progressBar' ? 480 : preset.id === 'lowerThird' ? 350 : 0,
-    scale: 100, rotation: 0, opacity: 100, blendMode: 'source-over',
-    transitionIn: 'fade', transitionOut: 'fade', transitionDur: 0.3, keyframes: {},
-  };
-  state.clips.push(clip);
-  snapshotHistory();
-  selectClip(clip.id);
-  toast(`Added graphic: ${preset.name}`);
-}
-
-async function loadWaveform(media) {
-  if (!media.hasAudio || media.url.startsWith('blob:')) return;
-  try {
-    const r = await fetch(`/api/waveform/${media.id}?bins=110`);
-    const d = await r.json();
-    if (d.peaks?.length) { state.waveforms.set(media.id, d); renderTimeline(); }
-  } catch {}
-}
-
-// ── PREVIEW SIZING, PLAYBACK & LIVE STEREO VU METER ─────────────────────────
-function fitPreviewCanvas() {
-  const stage = $('#viewportStage'), shell = $('#canvasShell');
-  const aw = Math.max(120, stage.clientWidth - 28), ah = Math.max(120, stage.clientHeight - 28);
-  const ar = state.canvasWidth / state.canvasHeight;
-  let w = aw, h = aw / ar;
-  if (h > ah) { h = ah; w = ah * ar; }
-  shell.style.width = `${Math.floor(w)}px`;
-  shell.style.height = `${Math.floor(h)}px`;
-  $('#canvasResBadge').textContent = `${state.canvasWidth} × ${state.canvasHeight} · ${state.aspect}`;
-}
-
-function updateAspectUI() {
-  $$('.aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === state.aspect));
-  fitPreviewCanvas();
+function getTimelineViewDuration() {
+  return Math.max(12, getProjectDuration() + 6);
 }
 
 function renderNow() {
-  engine.syncMediaForTime(state, state.playhead, state.playing);
-  engine.renderFrame(state, state.playhead, true);
-  $('#timecodeDisplay').textContent = fmtTC(state.playhead);
-  $('#durationDisplay').textContent = fmtTC(state.getProjectDuration());
-  $('#playhead').style.left = `${state.playhead * state.pxPerSec}px`;
+  if (engine.isExporting) return;
+  engine.syncMediaForTime(state.currentTime, state.playing);
+  engine.renderFrame(state.currentTime);
+  const tcInput = $('#timecodeInput');
+  if (document.activeElement !== tcInput) {
+    tcInput.value = formatTC(state.currentTime, state.fps);
+  }
+  $('#durationDisplay').textContent = formatTC(getProjectDuration(), state.fps);
+  updatePlayheadDOM();
 }
 
-let lastTick = 0;
-function playbackLoop(now) {
-  if (!state.playing) {
-    $('#vuL').style.width = '0%'; $('#vuR').style.width = '0%';
-    return;
+function buildProjectPayload() {
+  const manifest = {};
+  for (const tr of state.tracks) {
+    for (const c of tr.clips) {
+      if (c.mediaId) {
+        const m = state.library.find(x => x.id === c.mediaId);
+        if (m) manifest[m.id] = { id: m.id, name: m.name, type: m.type, duration: m.duration };
+      }
+    }
   }
-  const dt = Math.min(0.1, (now - lastTick) / 1000);
-  lastTick = now;
-  const dur = state.getProjectDuration();
-  state.playhead += dt;
-  if (state.playhead >= dur) {
-    if (state.loop) state.playhead = 0;
-    else { state.playhead = dur; togglePlay(false); return; }
+  return {
+    version: 3,
+    title: state.title,
+    aspect: state.aspect,
+    canvasWidth: state.canvasWidth,
+    canvasHeight: state.canvasHeight,
+    fps: state.fps,
+    bgMode: state.bgMode,
+    captionStyle: state.captionStyle,
+    captionYPos: state.captionYPos,
+    captionFontSize: state.captionFontSize,
+    tracks: state.tracks,
+    captions: state.captions,
+    markers: state.markers,
+    assetManifest: manifest,
+  };
+}
+
+function snapshotHistory() {
+  const payload = buildProjectPayload();
+  const snap = JSON.stringify(payload);
+  if (state.history[state.historyIdx] === snap) return;
+  state.history = state.history.slice(0, state.historyIdx + 1);
+  state.history.push(snap);
+  if (state.history.length > 60) state.history.shift();
+  state.historyIdx = state.history.length - 1;
+  try {
+    localStorage.setItem(AUTOSAVE_KEY, snap);
+    setSaveStatus('Saved');
+  } catch (err) {
+    setSaveStatus('Storage Full', 'error');
+    showToast('Browser localStorage full — use Save button to export .mcut.json');
+  }
+}
+
+function applySnapshot(snapStr, checkRelink = false) {
+  const d = JSON.parse(snapStr);
+  state.title = d.title || 'Untitled_Project';
+  state.aspect = d.aspect || '16:9';
+  state.canvasWidth = d.canvasWidth || 1920;
+  state.canvasHeight = d.canvasHeight || 1080;
+  state.fps = Number(d.fps) || 30;
+  state.bgMode = d.bgMode || 'black';
+  state.captionStyle = d.captionStyle || 'hormozi';
+  state.captionYPos = d.captionYPos ?? 80;
+  state.captionFontSize = d.captionFontSize ?? 56;
+  state.tracks = Array.isArray(d.tracks) && d.tracks.length ? d.tracks : makeEmptyTracks();
+  state.captions = Array.isArray(d.captions) ? d.captions : [];
+  state.markers = Array.isArray(d.markers) ? d.markers : [];
+  state.selectedClipId = null;
+  state.selectedClipIds.clear();
+  state.selectedCaptionId = null;
+
+  $('#projectTitle').value = state.title;
+  $('#fpsSelect').value = String(state.fps);
+  $('#capYPos').value = String(state.captionYPos);
+  $('#capFontSize').value = String(state.captionFontSize);
+  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === state.aspect));
+  $$('#captionStyleRow button').forEach(b => b.classList.toggle('active', b.dataset.cstyle === state.captionStyle));
+  $$('.bg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.bg === state.bgMode));
+  updateCanvasResBadge();
+  engine.pruneUnusedElements();
+  renderTimeline();
+  renderCaptionsUI();
+  renderInspector();
+  renderNow();
+
+  if (checkRelink) checkMissingMediaAndPrompt(d.assetManifest || {});
+}
+
+function makeEmptyTracks() {
+  return [
+    { id: 't_text1', name: 'Text T1', type: 'text', color: '#f09b3a', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_ov1', name: 'Overlay V2', type: 'overlay', color: '#7c5dfa', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_vid1', name: 'Main V1', type: 'video', color: '#3898d4', muted: false, hidden: false, locked: false, clips: [] },
+    { id: 't_aud1', name: 'Audio A1', type: 'audio', color: '#1fc496', muted: false, hidden: false, locked: false, clips: [] },
+  ];
+}
+
+function undo() {
+  if (state.historyIdx <= 0) return showToast('Nothing to undo');
+  state.historyIdx--;
+  applySnapshot(state.history[state.historyIdx]);
+  try { localStorage.setItem(AUTOSAVE_KEY, state.history[state.historyIdx]); } catch {}
+  showToast('Undo');
+}
+function redo() {
+  if (state.historyIdx >= state.history.length - 1) return showToast('Nothing to redo');
+  state.historyIdx++;
+  applySnapshot(state.history[state.historyIdx]);
+  try { localStorage.setItem(AUTOSAVE_KEY, state.history[state.historyIdx]); } catch {}
+  showToast('Redo');
+}
+
+function findClipAndTrack(id) {
+  for (const tr of state.tracks) {
+    const c = tr.clips.find(x => x.id === id);
+    if (c) return { clip: c, track: tr };
+  }
+  return null;
+}
+
+function getSelectedClips() {
+  const list = [];
+  for (const id of state.selectedClipIds) {
+    const found = findClipAndTrack(id);
+    if (found) list.push(found);
+  }
+  if (!list.length && state.selectedClipId) {
+    const found = findClipAndTrack(state.selectedClipId);
+    if (found) list.push(found);
+  }
+  return list;
+}
+
+function selectSingleClip(clipId, addToSelection = false) {
+  state.selectedCaptionId = null;
+  if (!addToSelection) state.selectedClipIds.clear();
+  if (clipId) {
+    state.selectedClipId = clipId;
+    state.selectedClipIds.add(clipId);
+    // Include linked partner if linked selection is enabled
+    if (state.linkedSelection) {
+      const f = findClipAndTrack(clipId);
+      if (f?.clip.linkGroupId) {
+        for (const tr of state.tracks) {
+          for (const c of tr.clips) {
+            if (c.linkGroupId === f.clip.linkGroupId) state.selectedClipIds.add(c.id);
+          }
+        }
+      }
+    }
+  } else {
+    state.selectedClipId = null;
+  }
+}
+
+function isTrackLocked(track) {
+  return Boolean(track && track.locked);
+}
+
+function isClipLocked(clipId) {
+  const f = findClipAndTrack(clipId);
+  return Boolean(f && f.track.locked);
+}
+
+function createDefaultClip(overrides) {
+  return {
+    id: uid('clip'),
+    mediaId: null,
+    name: 'Clip',
+    type: 'video',
+    start: 0,
+    duration: 4,
+    trimStart: 0,
+    sourceDuration: 4,
+    x: 0, y: 0, scale: 1, rotation: 0, opacity: 1,
+    flipH: false, flipV: false,
+    fitMode: 'contain',
+    blendMode: 'source-over',
+    mask: { type: 'none', x: 0.5, y: 0.5, scale: 0.48, rotation: 0, feather: 0, invert: false },
+    chromaKey: { enabled: false, color: '#00ff00', strength: 0.36, feather: 0.14 },
+    cropRect: null,
+    speed: 1,
+    speedCurve: 'none',
+    reverse: false,
+    volume: 1, muted: false, fadeIn: 0, fadeOut: 0, eqBass: 0, eqTreble: 0, voiceFx: 'none',
+    filter: 'none', brightness: 0, contrast: 0, saturation: 0, temperature: 0, blur: 0,
+    effects: [],
+    effectIntensity: {},
+    transIn: 'none', transInDur: 0.5,
+    transOut: 'none', transOutDur: 0.5,
+    text: '', subText: '', fontSize: 72, fontWeight: '900', align: 'center', spacing: 0,
+    color: '#ffffff', strokeColor: '#000000', strokeWidth: 4, bgColor: '#000000', bgAlpha: 0,
+    shadowBlur: 0, shadowColor: '#000000', maxWidth: 0,
+    animIn: 'pop', animOut: 'none',
+    graphicKind: null,
+    linkGroupId: null,
+    audioDetached: false,
+    keyframes: {},
+    ...overrides,
+  };
+}
+
+/** Prevent overlaps on a track (or return next non-overlapping start) */
+function hasOverlap(track, start, duration, ignoreIds = new Set()) {
+  const end = start + duration;
+  for (const c of track.clips) {
+    if (ignoreIds.has(c.id)) continue;
+    if (start < c.start + c.duration - 0.002 && end > c.start + 0.002) return true;
+  }
+  return false;
+}
+
+function resolveNonOverlappingStart(track, desiredStart, duration, ignoreIds = new Set()) {
+  let s = quantize(Math.max(0, desiredStart));
+  const others = track.clips.filter(c => !ignoreIds.has(c.id)).sort((a, b) => a.start - b.start);
+  for (const o of others) {
+    if (s < o.start + o.duration - 0.002 && s + duration > o.start + 0.002) {
+      // Push cleanly after the blocking clip
+      s = quantize(o.start + o.duration);
+    }
+  }
+  return s;
+}
+
+/** Magnetic Main Track: close gaps on Main V1 sequentially */
+function compactMainTrackIfMagnetic() {
+  if (!state.magnetMain) return;
+  const main = state.tracks.find(tr => tr.type === 'video');
+  if (!main || main.locked) return;
+  main.clips.sort((a, b) => a.start - b.start);
+  let cursor = 0;
+  for (const c of main.clips) {
+    const delta = quantize(cursor - c.start);
+    if (Math.abs(delta) > 0.001) {
+      c.start = quantize(cursor);
+      // Keep linked audio in sync with main track magnet!
+      if (c.linkGroupId) {
+        for (const tr of state.tracks) {
+          if (tr.id === main.id || tr.locked) continue;
+          for (const partner of tr.clips) {
+            if (partner.linkGroupId === c.linkGroupId) {
+              partner.start = quantize(Math.max(0, partner.start + delta));
+            }
+          }
+        }
+      }
+    }
+    cursor = c.start + c.duration;
+  }
+}
+
+function findOrCreateFreeTrack(preferredType, start, duration) {
+  const candidates = state.tracks.filter(t => t.type === preferredType && !t.locked);
+  for (const tr of candidates) {
+    if (!hasOverlap(tr, start, duration)) return tr;
+  }
+  // Auto-create a new unlocked track of that type so clips never stack invisibly!
+  const count = state.tracks.filter(t => t.type === preferredType).length + 1;
+  const colors = { video: '#3898d4', overlay: '#7c5dfa', text: '#f09b3a', audio: '#1fc496' };
+  const labels = { video: `Video V${count}`, overlay: `Overlay V${count + 1}`, text: `Text T${count}`, audio: `Audio A${count}` };
+  const newTr = {
+    id: uid('tr'),
+    name: labels[preferredType] || `Track ${count}`,
+    type: preferredType,
+    color: colors[preferredType] || '#7c5dfa',
+    muted: false, hidden: false, locked: false, clips: [],
+  };
+  if (preferredType === 'audio') state.tracks.push(newTr);
+  else state.tracks.unshift(newTr);
+  return newTr;
+}
+
+function addMediaToTimeline(media, targetTrackId = null, dropTime = null) {
+  let track = targetTrackId ? state.tracks.find(t => t.id === targetTrackId) : null;
+  if (track && track.locked) {
+    showToast(`Track "${track.name}" is locked`);
+    return null;
+  }
+  const desiredType = media.type === 'audio' ? 'audio' : (media.type === 'image' ? 'overlay' : 'video');
+  if (track) {
+    const compat = (desiredType === 'audio' && track.type === 'audio') ||
+      (desiredType !== 'audio' && (track.type === 'video' || track.type === 'overlay'));
+    if (!compat) track = null;
+  }
+
+  let start;
+  const dur = quantize(Math.max(0.2, media.duration || 5));
+  if (!track) {
+    if (desiredType === 'video') {
+      track = state.tracks.find(t => t.type === 'video' && !t.locked) || findOrCreateFreeTrack('video', 0, dur);
+      start = dropTime !== null ? quantize(dropTime) : quantize(track.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0));
+    } else {
+      start = dropTime !== null ? quantize(dropTime) : quantize(state.currentTime);
+      track = findOrCreateFreeTrack(desiredType, start, dur);
+    }
+  } else {
+    start = dropTime !== null ? quantize(dropTime) : quantize(track.clips.reduce((m, c) => Math.max(m, c.start + c.duration), 0));
+  }
+
+  if (hasOverlap(track, start, dur)) {
+    start = resolveNonOverlappingStart(track, start, dur);
+  }
+
+  const clip = createDefaultClip({
+    mediaId: media.id,
+    name: media.name,
+    type: media.type,
+    start,
+    duration: dur,
+    sourceDuration: media.duration || 5,
+    fitMode: (media.width === state.canvasWidth && media.height === state.canvasHeight) ? 'contain' : 'cover',
+  });
+  track.clips.push(clip);
+  compactMainTrackIfMagnetic();
+  selectSingleClip(clip.id);
+  snapshotHistory();
+  if (media.hasAudio && !state.waveforms.has(media.id)) fetchWaveform(media.id);
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  return clip;
+}
+
+function addTextClip(preset = TEXT_PRESETS[0]) {
+  const start = quantize(state.currentTime);
+  const dur = 3.0;
+  const tr = findOrCreateFreeTrack('text', start, dur);
+  const clip = createDefaultClip({
+    name: preset.name,
+    type: 'text',
+    start,
+    duration: dur,
+    sourceDuration: 60,
+    text: preset.text,
+    color: preset.color,
+    strokeColor: preset.strokeColor,
+    strokeWidth: preset.strokeWidth,
+    bgColor: preset.bgColor,
+    bgAlpha: preset.bgAlpha,
+    fontSize: preset.fontSize,
+    fontWeight: preset.fontWeight || '900',
+    spacing: preset.spacing || 0,
+    animIn: preset.animIn,
+    animOut: preset.animOut || 'none',
+    y: preset.y || 0,
+  });
+  tr.clips.push(clip);
+  selectSingleClip(clip.id);
+  state.activeInspectorTab = 'text';
+  snapshotHistory();
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast(`Added "${preset.name}" on ${tr.name}`);
+}
+
+function addGraphicClip(preset) {
+  const start = quantize(state.currentTime);
+  const dur = 4.0;
+  const tr = findOrCreateFreeTrack('overlay', start, dur);
+  const clip = createDefaultClip({
+    name: preset.name,
+    type: 'graphic',
+    graphicKind: preset.id,
+    start,
+    duration: dur,
+    sourceDuration: 60,
+    x: preset.id === 'rec-badge' ? -state.canvasWidth * 0.34 : 0,
+    y: preset.id === 'rec-badge' ? -state.canvasHeight * 0.38 : (preset.id === 'progress-bar' ? state.canvasHeight * 0.44 : (preset.id === 'lower-third' ? state.canvasHeight * 0.32 : 0)),
+    text: 'MOTIONVIZ STUDIO',
+    subText: 'AI WORKFLOWS & VFX',
+  });
+  tr.clips.push(clip);
+  selectSingleClip(clip.id);
+  state.activeInspectorTab = 'basic';
+  snapshotHistory();
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast(`Added "${preset.name}"`);
+}
+
+async function fetchWaveform(mediaId) {
+  try {
+    const r = await fetch(`/api/waveform/${mediaId}?bins=200`);
+    if (!r.ok) return;
+    const data = await r.json();
+    state.waveforms.set(mediaId, data);
+    renderTimeline();
+  } catch {}
+}
+
+/** Synthesize WAV bytes & persist to server via /api/upload so SFX survive reload AND export cleanly! */
+async function addProceduralSfx(preset) {
+  const sr = 44100;
+  const n = Math.floor(sr * preset.dur);
+  const buf = new ArrayBuffer(44 + n * 2);
+  const dv = new DataView(buf);
+  const wStr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  wStr(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); wStr(8, 'WAVE');
+  wStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  wStr(36, 'data'); dv.setUint32(40, n * 2, true);
+
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const u = t / preset.dur;
+    let s = 0;
+    if (preset.id === 'whoosh') s = (Math.random() * 2 - 1) * Math.sin(u * Math.PI) * Math.sin(2 * Math.PI * (220 + 900 * u) * t) * 0.7;
+    else if (preset.id === 'boom') s = Math.sin(2 * Math.PI * (110 * Math.exp(-3 * u) + 32) * t) * Math.exp(-2.8 * u) * 0.92;
+    else if (preset.id === 'riser') s = Math.sin(2 * Math.PI * (120 + 1800 * u * u) * t) * Math.pow(u, 1.5) * 0.65;
+    else if (preset.id === 'pop') s = Math.sin(2 * Math.PI * (760 * Math.exp(-10 * u) + 180) * t) * Math.exp(-16 * u) * 0.88;
+    else if (preset.id === 'shutter') s = ((Math.random() * 2 - 1) * Math.exp(-28 * u) + (u > 0.4 ? (Math.random() * 2 - 1) * Math.exp(-32 * (u - 0.4)) : 0)) * 0.78;
+    else if (preset.id === 'glitch-zap') s = (Math.sign(Math.sin(2 * Math.PI * (420 + 900 * Math.sin(u * 40)) * t)) * 0.5) * (1 - u);
+    dv.setInt16(44 + i * 2, Math.max(-32767, Math.min(32767, Math.floor(s * 32767))), true);
+  }
+
+  showToast(`Generating ${preset.name}...`);
+  try {
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: apiHeaders({
+        'X-Filename': encodeURIComponent(`SFX_${preset.id}.wav`),
+        'X-Source-Tag': 'sfx',
+      }),
+      body: new Blob([buf], { type: 'audio/wav' }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'SFX save failed');
+    if (!state.library.find(m => m.id === data.item.id)) state.library.push(data.item);
+    renderMediaLibrary();
+    addMediaToTimeline(data.item, null, state.currentTime);
+    showToast(`Added export-ready SFX: ${preset.name}`);
+  } catch (err) {
+    showToast(`SFX error: ${err.message}`);
+  }
+}
+
+// ── PLAYBACK LOOP (Smooth 60fps + VU Meter) ─────────────────────────────────
+let rafId = null;
+let lastFrameTs = 0;
+
+function tick(ts) {
+  if (!state.playing) return;
+  if (!lastFrameTs) lastFrameTs = ts;
+  const dt = Math.min(0.05, (ts - lastFrameTs) / 1000);
+  lastFrameTs = ts;
+  state.currentTime += dt;
+  const maxDur = getProjectDuration();
+  if (maxDur > 0 && state.currentTime >= maxDur) {
+    if (state.loop) state.currentTime = 0;
+    else { state.currentTime = maxDur; togglePlay(false); return; }
   }
   renderNow();
   const [vl, vr] = engine.getVULevels();
   $('#vuL').style.width = `${Math.round(vl * 100)}%`;
   $('#vuR').style.width = `${Math.round(vr * 100)}%`;
-
-  const scroll = $('#timelineScroll');
-  const px = state.playhead * state.pxPerSec;
-  if (px > scroll.scrollLeft + scroll.clientWidth - 40) scroll.scrollLeft = px - 80;
-  requestAnimationFrame(playbackLoop);
+  rafId = requestAnimationFrame(tick);
 }
 
-function togglePlay(force = null) {
-  const next = force !== null ? force : !state.playing;
+function togglePlay(forceState = null) {
+  const next = forceState !== null ? forceState : !state.playing;
   state.playing = next;
   $('#btnPlayPause').textContent = next ? '❚❚' : '▶';
   if (next) {
-    engine.ensureAudioContext();
-    lastTick = performance.now();
-    requestAnimationFrame(playbackLoop);
+    engine.ensureAudioCtx();
+    lastFrameTs = 0;
+    rafId = requestAnimationFrame(tick);
   } else {
-    engine.syncMediaForTime(state, state.playhead, false);
-    $('#vuL').style.width = '0%'; $('#vuR').style.width = '0%';
+    cancelAnimationFrame(rafId);
+    engine.pauseAllMedia();
+    $('#vuL').style.width = '0%';
+    $('#vuR').style.width = '0%';
     renderNow();
   }
 }
 
-// ── TIMELINE RENDERING (Filmstrips, Waveforms, Keyframes, Drag-Drop, Razor) ─
+// ── TIMELINE RENDERING (Source-Aligned Filmstrips, Sliced Waveforms, Caption Lane, Draggable KFs) ──
+function updatePlayheadDOM() {
+  $('#playhead').style.left = `${state.currentTime * state.zoom}px`;
+}
+
 function drawRuler() {
-  const dur = Math.max(state.getProjectDuration() + 8, 25);
-  const totalW = Math.max($('#timelineScroll').clientWidth, Math.ceil(dur * state.pxPerSec));
-  $('#timelineWrap').style.width = `${totalW}px`;
-  const rc = $('#rulerCanvas');
-  rc.width = totalW; rc.height = 28;
-  const ctx = rc.getContext('2d');
-  ctx.fillStyle = '#12141b'; ctx.fillRect(0, 0, totalW, 28);
+  const canvas = $('#rulerCanvas');
+  const totalSec = getTimelineViewDuration();
+  const width = Math.max($('#timelineScroll').clientWidth, Math.ceil(totalSec * state.zoom));
+  canvas.width = width;
+  canvas.height = 28;
+  $('#timelineWrap').style.width = `${width}px`;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, width, 28);
+  ctx.fillStyle = '#12141a';
+  ctx.fillRect(0, 0, width, 28);
 
-  const step = state.pxPerSec >= 100 ? 1 : state.pxPerSec >= 45 ? 2 : 5;
-  ctx.strokeStyle = '#343c52'; ctx.fillStyle = '#8b95ab'; ctx.font = '10px SF Mono, Menlo, monospace';
+  const step = state.zoom >= 150 ? 0.5 : (state.zoom >= 80 ? 1 : (state.zoom >= 40 ? 2 : 5));
+  const subDivs = state.zoom >= 150 ? Math.min(state.fps, 10) : 5;
+  ctx.font = '600 10px "JetBrains Mono", monospace';
+  ctx.fillStyle = '#8b93a7';
+  ctx.strokeStyle = '#343b4d';
 
-  for (let s = 0; s <= dur; s += step) {
-    const x = Math.round(s * state.pxPerSec) + 0.5;
-    ctx.beginPath(); ctx.moveTo(x, 14); ctx.lineTo(x, 28); ctx.stroke();
-    ctx.fillText(fmtTC(s).slice(0, 5), x + 4, 11);
-    for (let k = 1; k < 4; k++) {
-      const sx = Math.round((s + (step / 4) * k) * state.pxPerSec) + 0.5;
-      ctx.beginPath(); ctx.moveTo(sx, 21); ctx.lineTo(sx, 28); ctx.stroke();
+  for (let s = 0; s <= totalSec; s += step) {
+    const x = Math.round(s * state.zoom) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, 28); ctx.stroke();
+    ctx.fillText(formatTC(s, state.fps), x + 4, 11);
+    for (let k = 1; k < subDivs; k++) {
+      const mx = Math.round((s + (step * k) / subDivs) * state.zoom) + 0.5;
+      ctx.beginPath(); ctx.moveTo(mx, 21); ctx.lineTo(mx, 28); ctx.stroke();
     }
   }
 
-  const ml = $('#markerLayer');
-  ml.innerHTML = '';
-  for (const m of state.markers) {
-    const el = document.createElement('div');
-    el.className = 'beat-marker';
-    el.style.left = `${m * state.pxPerSec}px`;
-    ml.appendChild(el);
-  }
+  const mLayer = $('#markerLayer');
+  mLayer.innerHTML = '';
+  state.markers.forEach((mSec, idx) => {
+    const mk = document.createElement('div');
+    mk.className = 'beat-marker';
+    mk.style.left = `${mSec * state.zoom}px`;
+    mk.title = `Marker ${formatTC(mSec, state.fps)} (Click: jump · Right-click: remove)`;
+    mk.addEventListener('click', (e) => { e.stopPropagation(); state.currentTime = quantize(mSec); renderNow(); });
+    mk.addEventListener('contextmenu', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      state.markers.splice(idx, 1);
+      snapshotHistory();
+      drawRuler();
+      showToast('Marker removed');
+    });
+    mLayer.appendChild(mk);
+  });
 }
 
 function renderTimeline() {
   drawRuler();
-  const hList = $('#trackHeaderList'), container = $('#tracksContainer');
-  hList.innerHTML = ''; container.innerHTML = '';
+  const hdrList = $('#trackHeaderList');
+  const tracksEl = $('#tracksContainer');
+  hdrList.innerHTML = '';
+  tracksEl.innerHTML = '';
 
-  for (const tr of state.tracks) {
-    const th = document.createElement('div');
-    th.className = `track-head ${tr.type}`;
-    th.innerHTML = `
-      <span class="track-label"><span class="track-dot ${tr.type}"></span>${tr.name}</span>
-      <div class="track-ctrls">
-        ${tr.type !== 'audio' ? `<button class="tk-btn ${tr.hidden ? 'active' : ''}" data-act="hide" title="Hide Track">👁</button>` : ''}
-        <button class="tk-btn ${tr.muted ? 'active' : ''}" data-act="mute" title="Mute Track">🔇</button>
-        <button class="tk-btn ${tr.locked ? 'active' : ''}" data-act="lock" title="Lock Track">🔒</button>
+  state.tracks.forEach((tr) => {
+    const h = document.createElement('div');
+    h.className = 'track-header';
+    const canDelete = state.tracks.filter(x => x.type === tr.type).length > 1 || (tr.type !== 'video' && tr.type !== 'audio');
+    h.innerHTML = `
+      <div class="track-name" title="${escHtml(tr.name)}">
+        <span class="track-dot" style="background:${escHtml(tr.color)}"></span>
+        <span>${escHtml(tr.name)}</span>
       </div>
-    `;
-    th.querySelectorAll('.tk-btn').forEach(btn => {
-      btn.onclick = () => {
-        if (btn.dataset.act === 'hide') tr.hidden = !tr.hidden;
-        if (btn.dataset.act === 'mute') tr.muted = !tr.muted;
-        if (btn.dataset.act === 'lock') tr.locked = !tr.locked;
-        snapshotHistory(); renderTimeline(); renderNow();
+      <div class="track-ctrls">
+        <button class="track-ctrl ${tr.muted ? 'on' : ''}" data-act="mute" title="Mute Track">M</button>
+        <button class="track-ctrl ${tr.hidden ? 'on' : ''}" data-act="hide" title="Hide Track">👁</button>
+        <button class="track-ctrl ${tr.locked ? 'on' : ''}" data-act="lock" title="Lock Track">🔒</button>
+        ${canDelete ? `<button class="track-ctrl" data-act="delTrack" title="Delete Track">✕</button>` : ''}
+      </div>`;
+    h.querySelector('[data-act="mute"]').onclick = () => { tr.muted = !tr.muted; snapshotHistory(); renderTimeline(); renderNow(); };
+    h.querySelector('[data-act="hide"]').onclick = () => { tr.hidden = !tr.hidden; snapshotHistory(); renderTimeline(); renderNow(); };
+    h.querySelector('[data-act="lock"]').onclick = () => { tr.locked = !tr.locked; snapshotHistory(); renderTimeline(); renderInspector(); };
+    const delBtn = h.querySelector('[data-act="delTrack"]');
+    if (delBtn) {
+      delBtn.onclick = () => {
+        if (tr.locked) return showToast('Unlock track before deleting');
+        state.tracks = state.tracks.filter(x => x.id !== tr.id);
+        snapshotHistory();
+        renderTimeline();
+        renderInspector();
+        renderNow();
       };
-    });
-    hList.appendChild(th);
+    }
+    hdrList.appendChild(h);
 
     const lane = document.createElement('div');
-    lane.className = `track-lane ${tr.type} ${tr.muted || tr.hidden ? 'muted' : ''}`;
+    lane.className = `track-lane ${tr.locked ? 'locked-lane' : ''}`;
     lane.dataset.trackId = tr.id;
 
-    // Accept direct Drag-and-Drop from Media Library onto any track!
-    lane.ondragover = e => {
-      if (!e.dataTransfer.types.includes('application/x-motioncut-media')) return;
+    // Drag-and-drop Media from Library -> Timeline
+    lane.addEventListener('dragover', (e) => {
+      if (tr.locked) return;
       e.preventDefault();
-      lane.classList.add('drop-hover');
-    };
-    lane.ondragleave = () => lane.classList.remove('drop-hover');
-    lane.ondrop = e => {
-      lane.classList.remove('drop-hover');
-      const mediaId = e.dataTransfer.getData('application/x-motioncut-media');
+      lane.classList.add('drop-target');
+    });
+    lane.addEventListener('dragleave', () => lane.classList.remove('drop-target'));
+    lane.addEventListener('drop', (e) => {
+      e.preventDefault();
+      lane.classList.remove('drop-target');
+      if (tr.locked) return showToast(`Track "${tr.name}" is locked`);
+      const mediaId = e.dataTransfer.getData('text/motioncut-media-id');
       if (!mediaId) return;
-      e.preventDefault();
       const media = state.library.find(m => m.id === mediaId);
       if (!media) return;
-      const rect = $('#timelineWrap').getBoundingClientRect();
-      const dropT = Math.max(0, (e.clientX - rect.left) / state.pxPerSec);
-      const snapped = snapTime(dropT, getSnapTargets(null));
-      const compatTrack = (media.type === 'audio' && tr.type === 'audio') || (media.type !== 'audio' && tr.type === 'video') ? tr.id : null;
-      addMediaToTimeline(media, snapped, compatTrack);
-    };
+      const rect = lane.getBoundingClientRect();
+      const dropSec = Math.max(0, (e.clientX - rect.left) / state.zoom);
+      addMediaToTimeline(media, tr.id, dropSec);
+    });
 
-    for (const clip of state.clips.filter(c => c.trackId === tr.id)) {
+    const sortedClips = [...tr.clips].sort((a, b) => a.start - b.start);
+    sortedClips.forEach((clip) => {
       const el = document.createElement('div');
-      el.className = `tl-clip type-${clip.type} ${clip.id === state.selectedClipId ? 'selected' : ''}`;
-      el.style.left = `${clip.start * state.pxPerSec}px`;
-      el.style.width = `${Math.max(18, clip.duration * state.pxPerSec)}px`;
+      const isSelected = state.selectedClipIds.has(clip.id) || clip.id === state.selectedClipId;
+      const isMissing = clip.mediaId && (!state.library.some(m => m.id === clip.mediaId) || engine.erroredMedia.has(clip.mediaId));
+      el.className = `tl-clip type-${clip.type} ${isSelected ? 'selected' : ''} ${isMissing ? 'missing-clip' : ''}`;
       el.dataset.clipId = clip.id;
+      const clipW = Math.max(14, clip.duration * state.zoom);
+      el.style.left = `${clip.start * state.zoom}px`;
+      el.style.width = `${clipW}px`;
 
-      const media = state.library.find(m => m.id === clip.mediaId);
-      // Real multi-frame FFmpeg filmstrip on video clips!
-      if (clip.type === 'video' && media?.filmstripUrl) {
-        const bg = document.createElement('div');
-        bg.className = 'clip-filmstrip';
-        bg.style.backgroundImage = `url(${media.filmstripUrl})`;
-        el.appendChild(bg);
-      } else if (clip.type === 'image' && media?.thumbUrl) {
-        const bg = document.createElement('div');
-        bg.className = 'clip-filmstrip';
-        bg.style.backgroundImage = `url(${media.thumbUrl})`;
-        el.appendChild(bg);
+      // Source-aligned filmstrip background!
+      const media = clip.mediaId ? state.library.find(m => m.id === clip.mediaId) : null;
+      if (media && media.filmstripUrl && clip.type === 'video') {
+        const fsDiv = document.createElement('div');
+        fsDiv.className = 'clip-filmstrip';
+        const srcDur = Math.max(0.2, media.duration || clip.sourceDuration || 5);
+        const span = getClipSourceSpan(clip);
+        const fullPx = Math.max(clipW, (srcDur / Math.max(0.05, span)) * clipW);
+        const offsetPx = ((clip.trimStart || 0) / srcDur) * fullPx;
+        fsDiv.style.backgroundImage = `url('${media.filmstripUrl}')`;
+        fsDiv.style.backgroundSize = `${Math.round(fullPx)}px 100%`;
+        fsDiv.style.backgroundPosition = `${-Math.round(offsetPx)}px 0px`;
+        el.appendChild(fsDiv);
       }
 
-      const wf = media && state.waveforms.get(media.id);
-      if (wf?.peaks?.length && (clip.type === 'audio' || (clip.type === 'video' && !clip.audioDetached))) {
-        const wc = document.createElement('canvas');
-        wc.className = 'clip-wave-canvas';
-        const cw = Math.max(24, Math.floor(clip.duration * state.pxPerSec));
-        wc.width = cw; wc.height = 44;
-        const wctx = wc.getContext('2d');
-        wctx.fillStyle = clip.type === 'audio' ? 'rgba(0,229,195,0.72)' : 'rgba(255,255,255,0.22)';
-        const bars = wf.peaks.length;
-        for (let i = 0; i < bars; i++) {
-          const h = Math.max(2, wf.peaks[i] * (clip.type === 'audio' ? 36 : 15));
-          wctx.fillRect((i / bars) * cw, 44 - h, Math.max(1.2, cw / bars - 1), h);
-        }
-        el.appendChild(wc);
+      // Source-aligned & trimmed waveform!
+      const wf = clip.mediaId ? state.waveforms.get(clip.mediaId) : null;
+      if (wf && wf.peaks && wf.peaks.length && (clip.type === 'audio' || clip.type === 'video')) {
+        const wCan = document.createElement('canvas');
+        wCan.className = 'clip-wave';
+        wCan.width = Math.max(30, Math.min(1800, Math.round(clipW)));
+        wCan.height = 22;
+        const wctx = wCan.getContext('2d');
+        wctx.fillStyle = clip.type === 'audio' ? 'rgba(0, 229, 195, 0.78)' : 'rgba(130, 214, 255, 0.56)';
+        const srcDur = Math.max(0.1, media?.duration || clip.sourceDuration || clip.duration);
+        const span = getClipSourceSpan(clip);
+        const startRatio = Math.max(0, Math.min(1, (clip.trimStart || 0) / srcDur));
+        const endRatio = Math.max(startRatio + 0.005, Math.min(1, ((clip.trimStart || 0) + span) / srcDur));
+        const i0 = Math.floor(startRatio * wf.peaks.length);
+        const i1 = Math.max(i0 + 1, Math.ceil(endRatio * wf.peaks.length));
+        let slice = wf.peaks.slice(i0, i1);
+        if (clip.reverse) slice = slice.reverse();
+        const barW = wCan.width / Math.max(1, slice.length);
+        slice.forEach((pk, i) => {
+          const bh = Math.max(2, pk * 20);
+          wctx.fillRect(i * barW, 22 - bh, Math.max(1, barW - 0.5), bh);
+        });
+        el.appendChild(wCan);
       }
 
-      const title = document.createElement('div');
-      title.className = 'clip-title';
-      title.textContent = clip.type === 'text' ? `T  ${(clip.text || '').replace(/\n/g, ' ')}` : clip.name;
-      el.appendChild(title);
+      const badges = [];
+      if (isMissing) badges.push('<span class="clip-badge warn">OFFLINE</span>');
+      if (clip.speed !== 1 || (clip.speedCurve && clip.speedCurve !== 'none')) {
+        badges.push(`<span class="clip-badge">${clip.speedCurve !== 'none' ? escHtml(clip.speedCurve) : `${clip.speed.toFixed(1)}×`}</span>`);
+      }
+      if (clip.reverse) badges.push('<span class="clip-badge">REV</span>');
+      if (clip.linkGroupId) badges.push('<span class="clip-badge">🔗</span>');
+      if (clip.effects?.length) badges.push(`<span class="clip-badge">FX×${clip.effects.length}</span>`);
+      if (clip.mask?.type && clip.mask.type !== 'none') badges.push('<span class="clip-badge">MASK</span>');
 
-      const badges = document.createElement('div');
-      badges.className = 'clip-badges';
-      if ((clip.speed || 1) !== 1) badges.innerHTML += `<span class="clip-pill">${clip.speed}x</span>`;
-      if (clip.speedCurve && clip.speedCurve !== 'normal') badges.innerHTML += `<span class="clip-pill">${clip.speedCurve}</span>`;
-      const fxCount = Object.keys(clip.effects || {}).length;
-      if (fxCount > 0) badges.innerHTML += `<span class="clip-pill">FX×${fxCount}</span>`;
-      if (clip.maskType && clip.maskType !== 'none') badges.innerHTML += `<span class="clip-pill">Mask</span>`;
-      if (clip.chromaEnabled) badges.innerHTML += `<span class="clip-pill">Key</span>`;
-      if (clip.transitionIn && clip.transitionIn !== 'none') badges.innerHTML += `<span class="clip-pill">In:${clip.transitionIn}</span>`;
-      el.appendChild(badges);
+      const lblBar = document.createElement('div');
+      lblBar.className = 'clip-label-bar';
+      lblBar.innerHTML = `<span class="clip-label">${escHtml(clip.type === 'text' ? (clip.text || clip.name) : clip.name)}</span><span class="clip-badges">${badges.join('')}</span>`;
+      el.appendChild(lblBar);
 
-      // Clickable keyframe diamonds!
-      const allKfTimes = new Set();
-      Object.values(clip.keyframes || {}).forEach(arr => arr.forEach(k => allKfTimes.add(Math.round(k.t * 100) / 100)));
-      for (const kt of allKfTimes) {
-        if (kt >= 0 && kt <= clip.duration) {
-          const kd = document.createElement('div');
-          kd.className = 'clip-kf-dot';
-          kd.style.left = `${kt * state.pxPerSec}px`;
-          kd.title = `Jump to keyframe ${fmtTC(kt)}`;
-          kd.onmousedown = ev => { ev.stopPropagation(); state.playhead = clip.start + kt; selectClip(clip.id); };
-          el.appendChild(kd);
+      // A->B transition badge at cut junction
+      if (clip.transIn && clip.transIn !== 'none') {
+        const tp = document.createElement('div');
+        tp.className = 'clip-trans-pill';
+        tp.title = `Transition In: ${clip.transIn} (${clip.transInDur}s)`;
+        tp.textContent = '⇄';
+        el.appendChild(tp);
+      }
+
+      // Draggable keyframe diamonds
+      const kfMap = new Map();
+      for (const [prop, list] of Object.entries(clip.keyframes || {})) {
+        for (const k of list) {
+          const rk = Math.round(k.t * state.fps);
+          if (!kfMap.has(rk)) kfMap.set(rk, []);
+          kfMap.get(rk).push({ prop, kf: k });
         }
+      }
+      for (const [, entries] of kfMap.entries()) {
+        const kt = entries[0].kf.t;
+        const d = document.createElement('div');
+        d.className = 'kf-diamond';
+        d.style.left = `${kt * state.zoom}px`;
+        d.title = `Keyframe @ ${formatTC(kt, state.fps)} (${entries.map(e => e.prop).join(', ')}) — Drag to retime`;
+        d.addEventListener('mousedown', (e) => {
+          e.stopPropagation();
+          if (tr.locked) return showToast('Track is locked');
+          const startX = e.clientX;
+          const origT = kt;
+          const onMove = (ev) => {
+            const nt = quantize(Math.max(0, Math.min(clip.duration, origT + (ev.clientX - startX) / state.zoom)));
+            for (const entry of entries) entry.kf.t = nt;
+            d.style.left = `${nt * state.zoom}px`;
+            state.currentTime = quantize(clip.start + nt);
+            renderNow();
+          };
+          const onUp = () => {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            snapshotHistory();
+            renderTimeline();
+          };
+          window.addEventListener('mousemove', onMove);
+          window.addEventListener('mouseup', onUp);
+        });
+        el.appendChild(d);
       }
 
       const hL = document.createElement('div'); hL.className = 'trim-handle left';
       const hR = document.createElement('div'); hR.className = 'trim-handle right';
       el.appendChild(hL); el.appendChild(hR);
 
-      // Right-click CapCut context menu!
-      el.addEventListener('contextmenu', e => {
-        e.preventDefault(); e.stopPropagation();
-        selectClip(clip.id);
-        openContextMenu(e.clientX, e.clientY);
-      });
-
-      attachClipDrag(el, clip, tr, hL, hR);
+      attachClipInteractions(el, clip, tr, hL, hR);
       lane.appendChild(el);
-    }
+    });
 
-    container.appendChild(lane);
-  }
-  $('#playhead').style.left = `${state.playhead * state.pxPerSec}px`;
+    tracksEl.appendChild(lane);
+  });
+
+  // ── DEDICATED CAPTION LANE ON TIMELINE ───────────────────────────────────
+  const capHdr = document.createElement('div');
+  capHdr.className = 'track-header caption-hdr';
+  capHdr.innerHTML = `<div class="track-name"><span class="track-dot" style="background:#e066e6"></span><span>Captions CC</span></div>
+    <div class="track-ctrls"><button class="track-ctrl" id="btnQuickAddCap" title="Add Caption Line at Playhead">+</button></div>`;
+  capHdr.querySelector('#btnQuickAddCap').onclick = addCaptionAtPlayhead;
+  hdrList.appendChild(capHdr);
+
+  const capLane = document.createElement('div');
+  capLane.className = 'track-lane caption-lane';
+  capLane.dataset.trackId = '__captions__';
+  state.captions.forEach((cap) => {
+    const cel = document.createElement('div');
+    cel.className = `tl-clip caption-clip ${state.selectedCaptionId === cap.id ? 'selected' : ''}`;
+    cel.style.left = `${cap.start * state.zoom}px`;
+    cel.style.width = `${Math.max(14, (cap.end - cap.start) * state.zoom)}px`;
+    cel.innerHTML = `<div class="clip-label-bar"><span class="clip-label">${escHtml(cap.text)}</span></div>
+      <div class="trim-handle left"></div><div class="trim-handle right"></div>`;
+    attachCaptionClipInteractions(cel, cap);
+    capLane.appendChild(cel);
+  });
+  tracksEl.appendChild(capLane);
+
+  updatePlayheadDOM();
 }
 
-function getSnapTargets(excludeClipId) {
-  if (!state.snap) return [];
-  const pts = [0, state.playhead, ...state.markers];
-  for (const c of state.clips) {
-    if (c.id === excludeClipId) continue;
-    pts.push(c.start, c.start + c.duration);
+function getSnapPoints(excludeClipIds = new Set()) {
+  const pts = [0, state.currentTime, ...state.markers];
+  for (const tr of state.tracks) {
+    for (const c of tr.clips) {
+      if (excludeClipIds.has(c.id)) continue;
+      pts.push(c.start, c.start + c.duration);
+    }
   }
+  for (const cap of state.captions) pts.push(cap.start, cap.end);
   return pts;
 }
 
-function snapTime(t, targets, showGuide = false) {
-  const thresh = 10 / state.pxPerSec;
-  let best = t, bestD = thresh, snapped = false;
-  for (const p of targets) {
-    const d = Math.abs(t - p);
-    if (d < bestD) { best = p; bestD = d; snapped = true; }
+function snapBothEdges(rawStart, duration, excludeIds) {
+  if (!state.snap) { $('#snapGuide').classList.add('hidden'); return quantize(rawStart); }
+  const thresh = 9 / state.zoom;
+  const pts = getSnapPoints(excludeIds);
+  let bestStart = quantize(rawStart);
+  let bestDist = thresh;
+  let guideAt = null;
+  for (const p of pts) {
+    const dStart = Math.abs(rawStart - p);
+    if (dStart < bestDist) { bestDist = dStart; bestStart = p; guideAt = p; }
+    const dEnd = Math.abs((rawStart + duration) - p);
+    if (dEnd < bestDist) { bestDist = dEnd; bestStart = p - duration; guideAt = p; }
   }
-  if (showGuide) {
-    const sg = $('#snapGuide');
-    if (snapped) { sg.style.left = `${best * state.pxPerSec}px`; sg.classList.remove('hidden'); }
-    else sg.classList.add('hidden');
+  const sg = $('#snapGuide');
+  if (guideAt !== null) {
+    sg.style.left = `${guideAt * state.zoom}px`;
+    sg.classList.remove('hidden');
+  } else {
+    sg.classList.add('hidden');
   }
-  return Math.max(0, best);
+  return quantize(Math.max(0, bestStart));
 }
 
-function attachClipDrag(el, clip, track, hL, hR) {
-  const beginDrag = (mode, e) => {
-    if (e.button !== 0) return;
+function showDragHud(pxLeft, pxTop, text) {
+  const hud = $('#dragHud');
+  hud.textContent = text;
+  hud.style.left = `${Math.max(4, pxLeft)}px`;
+  hud.style.top = `${Math.max(30, pxTop)}px`;
+  hud.classList.remove('hidden');
+}
+function hideDragHud() { $('#dragHud').classList.add('hidden'); }
+
+function attachCaptionClipInteractions(cel, cap) {
+  const hL = cel.querySelector('.trim-handle.left');
+  const hR = cel.querySelector('.trim-handle.right');
+
+  cel.addEventListener('mousedown', (e) => {
     e.stopPropagation();
-    // Razor Blade Mode: clicking anywhere on clip slices immediately at clicked time!
-    if (state.tool === 'razor' && mode === 'move') {
-      const rect = $('#timelineWrap').getBoundingClientRect();
-      const clickT = Math.max(0, (e.clientX - rect.left) / state.pxPerSec);
-      state.playhead = clickT;
-      selectClip(clip.id);
-      splitSelectedClip();
-      return;
-    }
-
-    selectClip(clip.id);
-    if (track.locked) return toast('Track is locked');
+    state.selectedCaptionId = cap.id;
+    state.selectedClipId = null;
+    state.selectedClipIds.clear();
     const startX = e.clientX;
-    const origStart = clip.start, origDur = clip.duration, origTrim = clip.trimStart || 0;
-    const targets = getSnapTargets(clip.id);
+    const origStart = cap.start;
+    const origEnd = cap.end;
+    const dur = origEnd - origStart;
+    const mode = e.target === hL ? 'trimL' : (e.target === hR ? 'trimR' : 'move');
 
-    const onMove = ev => {
-      const dx = (ev.clientX - startX) / state.pxPerSec;
+    const onMove = (ev) => {
+      const dt = (ev.clientX - startX) / state.zoom;
       if (mode === 'move') {
-        clip.start = snapTime(Math.max(0, origStart + dx), targets, true);
-        const under = document.elementsFromPoint(ev.clientX, ev.clientY).find(n => n.classList?.contains('track-lane'));
-        if (under) {
-          const targetTr = state.tracks.find(tr => tr.id === under.dataset.trackId);
-          if (targetTr && !targetTr.locked) {
-            const ok = (clip.type === 'audio' && targetTr.type === 'audio')
-              || (clip.type === 'text' && targetTr.type === 'text')
-              || ((clip.type === 'video' || clip.type === 'image' || clip.type === 'graphic') && targetTr.type === 'video');
-            if (ok) clip.trackId = targetTr.id;
-          }
-        }
-      } else if (mode === 'left') {
-        const speed = clip.speed || 1;
-        const delta = Math.max(-origTrim / speed, Math.min(origDur - 0.15, dx));
-        const snapped = snapTime(origStart + delta, targets, true) - origStart;
-        const clamped = Math.max(-origTrim / speed, Math.min(origDur - 0.15, snapped));
-        clip.start = origStart + clamped;
-        clip.trimStart = Math.max(0, origTrim + clamped * speed);
-        clip.duration = origDur - clamped;
-      } else if (mode === 'right') {
-        const speed = clip.speed || 1;
-        const maxDur = (clip.type === 'image' || clip.type === 'text' || clip.type === 'graphic')
-          ? 120 : Math.max(0.2, (clip.maxDuration - origTrim) / speed);
-        const newEnd = snapTime(origStart + Math.max(0.15, Math.min(maxDur, origDur + dx)), targets, true);
-        clip.duration = Math.max(0.15, Math.min(maxDur, newEnd - origStart));
+        cap.start = quantize(Math.max(0, origStart + dt));
+        cap.end = quantize(cap.start + dur);
+      } else if (mode === 'trimL') {
+        cap.start = quantize(Math.max(0, Math.min(origEnd - 0.15, origStart + dt)));
+      } else {
+        cap.end = quantize(Math.max(origStart + 0.15, origEnd + dt));
       }
-      renderTimeline();
+      cel.style.left = `${cap.start * state.zoom}px`;
+      cel.style.width = `${Math.max(14, (cap.end - cap.start) * state.zoom)}px`;
+      showDragHud(cap.start * state.zoom, cel.parentElement.offsetTop, `${formatTC(cap.start, state.fps)} – ${formatTC(cap.end, state.fps)}`);
       renderNow();
     };
     const onUp = () => {
-      $('#snapGuide').classList.add('hidden');
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      hideDragHud();
       snapshotHistory();
+      renderTimeline();
+      renderCaptionsUI();
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
-  };
-
-  el.addEventListener('mousedown', e => beginDrag('move', e));
-  hL.addEventListener('mousedown', e => beginDrag('left', e));
-  hR.addEventListener('mousedown', e => beginDrag('right', e));
+  });
 }
 
-// ── TIMELINE OPERATIONS ─────────────────────────────────────────────────────
-function splitSelectedClip() {
-  const clip = getSelectedClip();
-  if (!clip) return toast('Select a clip to split');
-  const t = state.playhead;
-  if (t <= clip.start + 0.06 || t >= clip.start + clip.duration - 0.06) return toast('Place playhead inside the clip to split');
-  const leftDur = t - clip.start, rightDur = clip.duration - leftDur, speed = clip.speed || 1;
-  const rightClip = JSON.parse(JSON.stringify(clip));
-  rightClip.id = uid(clip.type === 'text' ? 'txt' : 'clip');
+function attachClipInteractions(el, clip, track, hL, hR) {
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!state.selectedClipIds.has(clip.id)) selectSingleClip(clip.id);
+    renderTimeline();
+    renderInspector();
+    openContextMenu(e.clientX, e.clientY);
+  });
+
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+
+    // Razor Blade tool respects track lock!
+    if (state.activeTool === 'razor') {
+      if (track.locked) return showToast(`Track "${track.name}" is locked`);
+      const rect = el.parentElement.getBoundingClientRect();
+      const clickSec = quantize(Math.max(0, (e.clientX - rect.left) / state.zoom));
+      selectSingleClip(clip.id);
+      splitClipAt(clip, track, clickSec);
+      return;
+    }
+
+    if (e.shiftKey) {
+      if (state.selectedClipIds.has(clip.id)) state.selectedClipIds.delete(clip.id);
+      else { state.selectedClipIds.add(clip.id); state.selectedClipId = clip.id; }
+      renderTimeline();
+      renderInspector();
+      return;
+    }
+
+    if (!state.selectedClipIds.has(clip.id)) {
+      selectSingleClip(clip.id);
+      $$('.tl-clip').forEach(node => node.classList.toggle('selected', state.selectedClipIds.has(node.dataset.clipId)));
+      renderInspector();
+      renderNow();
+    }
+
+    if (track.locked) return showToast(`Track "${track.name}" is locked`);
+
+    const startX = e.clientX;
+    const mode = e.target === hL ? 'trimL' : (e.target === hR ? 'trimR' : 'move');
+    const selectedEntries = getSelectedClips().filter(x => !x.track.locked);
+    const excludeIds = new Set(selectedEntries.map(x => x.clip.id));
+    const initMap = new Map(selectedEntries.map(x => [x.clip.id, {
+      clip: x.clip,
+      track: x.track,
+      el: $(`.tl-clip[data-clip-id="${x.clip.id}"]`),
+      start: x.clip.start,
+      duration: x.clip.duration,
+      trimStart: x.clip.trimStart || 0,
+      keyframes: structuredClone(x.clip.keyframes || {}),
+    }]));
+
+    let moved = false;
+    const scrollBox = $('#timelineScroll');
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      if (Math.abs(dx) > 2) moved = true;
+      const dt = dx / state.zoom;
+
+      // Drag-edge autoscroll
+      const sRect = scrollBox.getBoundingClientRect();
+      if (ev.clientX > sRect.right - 36) scrollBox.scrollLeft += 14;
+      else if (ev.clientX < sRect.left + 36) scrollBox.scrollLeft = Math.max(0, scrollBox.scrollLeft - 14);
+
+      if (mode === 'move') {
+        const primary = initMap.get(clip.id);
+        const snappedStart = snapBothEdges(Math.max(0, primary.start + dt), primary.duration, excludeIds);
+        const appliedDt = snappedStart - primary.start;
+        for (const item of initMap.values()) {
+          item.clip.start = quantize(Math.max(0, item.start + appliedDt));
+          if (item.el) item.el.style.left = `${item.clip.start * state.zoom}px`;
+        }
+        showDragHud(clip.start * state.zoom, el.parentElement.offsetTop, `${formatTC(clip.start, state.fps)} (${initMap.size > 1 ? `${initMap.size} clips` : `${clip.duration.toFixed(2)}s`})`);
+      } else if (mode === 'trimL') {
+        const orig = initMap.get(clip.id);
+        const maxTrim = orig.duration - 0.12;
+        let delta = Math.max(-orig.trimStart / (clip.speed || 1), Math.min(maxTrim, dt));
+        const snappedStart = snapBothEdges(Math.max(0, orig.start + delta), orig.duration - delta, excludeIds);
+        delta = snappedStart - orig.start;
+        delta = Math.max(-orig.trimStart / (clip.speed || 1), Math.min(maxTrim, delta));
+        clip.start = quantize(orig.start + delta);
+        clip.duration = quantize(orig.duration - delta);
+        clip.trimStart = Math.max(0, orig.trimStart + delta * (clip.speed || 1));
+        // Rebase keyframes smoothly on left-trim!
+        const rebased = {};
+        for (const [prop, list] of Object.entries(orig.keyframes)) {
+          const shifted = list.map(k => ({ ...k, t: quantize(k.t - delta) })).filter(k => k.t >= 0 && k.t <= clip.duration);
+          if (shifted.length) rebased[prop] = shifted;
+        }
+        clip.keyframes = rebased;
+        el.style.left = `${clip.start * state.zoom}px`;
+        el.style.width = `${Math.max(14, clip.duration * state.zoom)}px`;
+        showDragHud(clip.start * state.zoom, el.parentElement.offsetTop, `In ${formatTC(clip.start, state.fps)} · Dur ${clip.duration.toFixed(2)}s`);
+      } else if (mode === 'trimR') {
+        const orig = initMap.get(clip.id);
+        const maxDur = (clip.type === 'text' || clip.type === 'image' || clip.type === 'graphic')
+          ? 300 : Math.max(0.2, (clip.sourceDuration - (clip.trimStart || 0)) / (clip.speed || 1));
+        let nextDur = quantize(Math.max(0.12, Math.min(maxDur, orig.duration + dt)));
+        if (state.snap) {
+          const snappedEnd = snapBothEdges(orig.start + nextDur, 0, excludeIds);
+          if (Math.abs(snappedEnd - (orig.start + nextDur)) < 9 / state.zoom) {
+            nextDur = quantize(Math.max(0.12, Math.min(maxDur, snappedEnd - orig.start)));
+          }
+        }
+        clip.duration = nextDur;
+        el.style.width = `${Math.max(14, clip.duration * state.zoom)}px`;
+        showDragHud((clip.start + clip.duration) * state.zoom, el.parentElement.offsetTop, `Out ${formatTC(clip.start + clip.duration, state.fps)} · Dur ${clip.duration.toFixed(2)}s`);
+      }
+      renderNow();
+    };
+
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      $('#snapGuide').classList.add('hidden');
+      hideDragHud();
+      if (moved) {
+        if (mode === 'move') {
+          // Resolve accidental same-track overlaps cleanly
+          for (const item of initMap.values()) {
+            const others = new Set(item.track.clips.filter(c => excludeIds.has(c.id)).map(c => c.id));
+            if (hasOverlap(item.track, item.clip.start, item.clip.duration, others)) {
+              item.clip.start = resolveNonOverlappingStart(item.track, item.clip.start, item.clip.duration, others);
+            }
+          }
+        }
+        compactMainTrackIfMagnetic();
+        snapshotHistory();
+        renderTimeline();
+        renderInspector();
+        renderNow();
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+}
+
+// ── CONTEXT MENU ────────────────────────────────────────────────────────────
+function openContextMenu(x, y) {
+  const m = $('#clipContextMenu');
+  m.style.left = `${Math.min(window.innerWidth - 220, x)}px`;
+  m.style.top = `${Math.min(window.innerHeight - 310, y)}px`;
+  m.classList.remove('hidden');
+}
+function closeContextMenu() { $('#clipContextMenu').classList.add('hidden'); }
+window.addEventListener('click', closeContextMenu);
+$('#clipContextMenu').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  closeContextMenu();
+  const act = btn.dataset.act;
+  if (act === 'split') splitSelectedClip();
+  else if (act === 'duplicate') duplicateSelectedClip();
+  else if (act === 'copyClip') copySelectedClips();
+  else if (act === 'copyAttrs') copyClipAttrs();
+  else if (act === 'pasteAttrs') pasteClipAttrs();
+  else if (act === 'autoCrop') runAutoCrop();
+  else if (act === 'freeze') freezeFrameAtPlayhead();
+  else if (act === 'detach') detachAudioFromSelected();
+  else if (act === 'unlink') unlinkSelectedClips();
+  else if (act === 'rippleDelete') deleteSelectedClips(true);
+  else if (act === 'delete') deleteSelectedClips(false);
+});
+
+// ── EDITING OPERATIONS (100% LOCK-ENFORCED + KEYFRAME/SOURCE CONTINUITY) ────
+function splitClipAt(clip, track, splitTime) {
+  if (track.locked) return showToast(`Track "${track.name}" is locked`);
+  const t = quantize(splitTime);
+  if (t <= clip.start + 0.06 || t >= clip.start + clip.duration - 0.06) {
+    return showToast('Move playhead inside the selected clip to split');
+  }
+  const leftDur = quantize(t - clip.start);
+  const rightDur = quantize(clip.duration - leftDur);
+  const media = clip.mediaId ? state.library.find(m => m.id === clip.mediaId) : null;
+  const srcAtCut = getSourceTime(clip, leftDur, media?.duration || clip.sourceDuration);
+
+  // Partition & shift keyframes cleanly across the split!
+  const leftKf = {};
+  const rightKf = {};
+  for (const [prop, list] of Object.entries(clip.keyframes || {})) {
+    const lList = list.filter(k => k.t <= leftDur + 0.001).map(k => ({ ...k }));
+    const rList = list.filter(k => k.t >= leftDur - 0.001).map(k => ({ ...k, t: quantize(Math.max(0, k.t - leftDur)) }));
+    if (lList.length) leftKf[prop] = lList;
+    if (rList.length) rightKf[prop] = rList;
+  }
+
+  const rightClip = structuredClone(clip);
+  rightClip.id = uid('clip');
   rightClip.start = t;
   rightClip.duration = rightDur;
-  rightClip.trimStart = (clip.trimStart || 0) + leftDur * speed;
-  rightClip.transitionIn = 'none';
-  rightClip.keyframes = {};
+  rightClip.keyframes = rightKf;
+  rightClip.transIn = 'none';
+  rightClip.linkGroupId = null;
+
+  if (clip.reverse) {
+    // Reversed clip plays backwards from (trimStart + totalSpan) down to trimStart:
+    // Left half covers [srcAtCut .. trimStart + totalSpan], Right half covers [trimStart .. srcAtCut]
+    const origTrim = clip.trimStart || 0;
+    clip.trimStart = Math.max(0, srcAtCut);
+    rightClip.trimStart = Math.max(0, origTrim);
+  } else {
+    rightClip.trimStart = Math.max(0, srcAtCut);
+  }
+  // If clip had a speed ramp, bake constant equivalent speed on split halves so curve doesn't replay from 0!
+  if (clip.speedCurve && clip.speedCurve !== 'none') {
+    const totalSpan = getClipSourceSpan(clip);
+    const leftSpan = Math.max(0.05, srcAtCut - (clip.trimStart || 0));
+    const rightSpan = Math.max(0.05, totalSpan - leftSpan);
+    clip.speed = Math.round((leftSpan / Math.max(0.05, leftDur)) * 100) / 100;
+    rightClip.speed = Math.round((rightSpan / Math.max(0.05, rightDur)) * 100) / 100;
+    clip.speedCurve = 'none';
+    rightClip.speedCurve = 'none';
+  }
+
   clip.duration = leftDur;
-  clip.transitionOut = 'none';
-  state.clips.push(rightClip);
+  clip.keyframes = leftKf;
+  clip.transOut = 'none';
+  track.clips.push(rightClip);
+
+  // Split linked partner clip if present and unlocked
+  if (clip.linkGroupId && state.linkedSelection) {
+    for (const tr of state.tracks) {
+      if (tr.id === track.id || tr.locked) continue;
+      const partner = tr.clips.find(p => p.linkGroupId === clip.linkGroupId && t > p.start + 0.06 && t < p.start + p.duration - 0.06);
+      if (partner) {
+        const pRight = structuredClone(partner);
+        pRight.id = uid('clip');
+        const pLeftDur = quantize(t - partner.start);
+        pRight.start = t;
+        pRight.duration = quantize(partner.duration - pLeftDur);
+        pRight.trimStart = getSourceTime(partner, pLeftDur, partner.sourceDuration);
+        const newLink = uid('lnk');
+        rightClip.linkGroupId = newLink;
+        pRight.linkGroupId = newLink;
+        partner.duration = pLeftDur;
+        tr.clips.push(pRight);
+      }
+    }
+  }
+
+  selectSingleClip(rightClip.id);
   snapshotHistory();
-  selectClip(rightClip.id);
-  toast('Split clip');
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast('Split clip (keyframes & source preserved)');
+}
+
+function splitSelectedClip() {
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f) return showToast('Select a clip to split');
+  splitClipAt(f.clip, f.track, state.currentTime);
 }
 
 function duplicateSelectedClip() {
-  const clip = getSelectedClip();
-  if (!clip) return toast('Select a clip to duplicate');
-  const copy = JSON.parse(JSON.stringify(clip));
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f) return showToast('Select a clip to duplicate');
+  if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+  const copy = structuredClone(f.clip);
   copy.id = uid('clip');
-  copy.start = clip.start + clip.duration;
-  state.clips.push(copy);
+  copy.linkGroupId = null;
+  copy.start = resolveNonOverlappingStart(f.track, f.clip.start + f.clip.duration, copy.duration);
+  f.track.clips.push(copy);
+  compactMainTrackIfMagnetic();
+  selectSingleClip(copy.id);
   snapshotHistory();
-  selectClip(copy.id);
-  toast('Duplicated clip');
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast('Duplicated clip');
 }
 
-function deleteSelectedClip(ripple = false) {
-  const clip = getSelectedClip();
-  if (!clip) return;
-  const { trackId, start, duration } = clip;
-  state.clips = state.clips.filter(c => c.id !== clip.id);
+function copySelectedClips() {
+  const sel = getSelectedClips();
+  if (!sel.length) return showToast('Select clip(s) to copy');
+  const minStart = Math.min(...sel.map(x => x.clip.start));
+  state.copiedClips = sel.map(x => ({
+    trackType: x.track.type,
+    relStart: x.clip.start - minStart,
+    clip: structuredClone(x.clip),
+  }));
+  showToast(`Copied ${sel.length} clip(s)`);
+}
+
+function pasteCopiedClips() {
+  if (!state.copiedClips?.length) return showToast('Clipboard empty');
+  state.selectedClipIds.clear();
+  for (const item of state.copiedClips) {
+    const c = structuredClone(item.clip);
+    c.id = uid('clip');
+    c.linkGroupId = null;
+    const desiredStart = quantize(state.currentTime + item.relStart);
+    const tr = findOrCreateFreeTrack(item.trackType, desiredStart, c.duration);
+    c.start = resolveNonOverlappingStart(tr, desiredStart, c.duration);
+    tr.clips.push(c);
+    state.selectedClipIds.add(c.id);
+    state.selectedClipId = c.id;
+  }
+  compactMainTrackIfMagnetic();
+  snapshotHistory();
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast(`Pasted ${state.copiedClips.length} clip(s) at playhead`);
+}
+
+function copyClipAttrs() {
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f) return;
+  const c = f.clip;
+  state.copiedAttrs = structuredClone({
+    x: c.x, y: c.y, scale: c.scale, rotation: c.rotation, opacity: c.opacity,
+    fitMode: c.fitMode, blendMode: c.blendMode, filter: c.filter,
+    brightness: c.brightness, contrast: c.contrast, saturation: c.saturation,
+    temperature: c.temperature, blur: c.blur, effects: c.effects, effectIntensity: c.effectIntensity,
+    mask: c.mask,
+  });
+  showToast('Copied clip style, color & FX');
+}
+
+function pasteClipAttrs() {
+  if (!state.copiedAttrs) return showToast('No copied attributes');
+  const sel = getSelectedClips().filter(x => !x.track.locked);
+  if (!sel.length) return showToast('Select an unlocked clip first');
+  for (const { clip } of sel) Object.assign(clip, structuredClone(state.copiedAttrs));
+  snapshotHistory();
+  renderTimeline();
+  renderInspector();
+  renderNow();
+  showToast(`Pasted attributes to ${sel.length} clip(s)`);
+}
+
+function unlinkSelectedClips() {
+  const sel = getSelectedClips().filter(x => !x.track.locked);
+  for (const { clip } of sel) clip.linkGroupId = null;
+  snapshotHistory();
+  renderTimeline();
+  showToast('Unlinked selected clips');
+}
+
+function deleteSelectedClips(ripple = false) {
+  if (state.selectedCaptionId) {
+    state.captions = state.captions.filter(c => c.id !== state.selectedCaptionId);
+    state.selectedCaptionId = null;
+    snapshotHistory();
+    renderTimeline();
+    renderCaptionsUI();
+    renderNow();
+    return showToast('Deleted caption');
+  }
+  const sel = getSelectedClips();
+  if (!sel.length) return;
+  const unlocked = sel.filter(x => !x.track.locked);
+  if (!unlocked.length) return showToast('Selected track(s) are locked');
+
+  // If ripple delete on a single clip or main track, shift subsequent clips, captions & markers cleanly
+  let ripplePivot = null;
+  let rippleGap = 0;
   if (ripple) {
-    for (const c of state.clips) {
-      if (c.trackId === trackId && c.start >= start + duration - 0.02) c.start = Math.max(0, c.start - duration);
+    const mainTarget = unlocked.find(x => x.track.type === 'video') || unlocked[0];
+    ripplePivot = mainTarget.clip.start + mainTarget.clip.duration;
+    rippleGap = mainTarget.clip.duration;
+  }
+
+  for (const { clip, track } of unlocked) {
+    track.clips = track.clips.filter(c => c.id !== clip.id);
+    if (ripple && track.type !== 'video') {
+      for (const c of track.clips) {
+        if (c.start >= clip.start + clip.duration - 0.01) {
+          c.start = quantize(Math.max(0, c.start - clip.duration));
+        }
+      }
     }
   }
+
+  if (ripple && ripplePivot !== null) {
+    for (const tr of state.tracks) {
+      if (tr.locked) continue;
+      if (tr.type === 'video' || state.linkedSelection) {
+        for (const c of tr.clips) {
+          if (c.start >= ripplePivot - 0.01) c.start = quantize(Math.max(0, c.start - rippleGap));
+        }
+      }
+    }
+    for (const cap of state.captions) {
+      if (cap.start >= ripplePivot - 0.01) {
+        cap.start = quantize(Math.max(0, cap.start - rippleGap));
+        cap.end = quantize(Math.max(cap.start + 0.1, cap.end - rippleGap));
+      }
+    }
+    state.markers = state.markers.map(m => m >= ripplePivot - 0.01 ? quantize(Math.max(0, m - rippleGap)) : m);
+  }
+
+  compactMainTrackIfMagnetic();
   state.selectedClipId = null;
-  snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-  toast(ripple ? 'Ripple deleted clip' : 'Deleted clip');
+  state.selectedClipIds.clear();
+  engine.pruneUnusedElements();
+  snapshotHistory();
+  renderTimeline();
+  renderCaptionsUI();
+  renderInspector();
+  renderNow();
+  showToast(ripple ? 'Ripple deleted (timeline & captions shifted)' : `Deleted ${unlocked.length} clip(s)`);
 }
 
-function freezeFrameAtPlayhead() {
-  const clip = getSelectedClip();
-  if (!clip || clip.type !== 'video') return toast('Select a video clip at playhead');
-  const dataUrl = $('#previewCanvas').toDataURL('image/png');
-  const media = { id: uid('frz'), name: `Freeze ${fmtTC(state.playhead)}`, type: 'image', url: dataUrl, thumbUrl: dataUrl, duration: 2.5, width: state.canvasWidth, height: state.canvasHeight, hasAudio: false };
-  state.library.unshift(media);
-  renderMediaLibrary();
-  const track = state.tracks.find(t => t.id === 't_vid2') || state.tracks.find(t => t.type === 'video');
-  const frzClip = makeDefaultClip(media, track.id, state.playhead);
-  state.clips.push(frzClip);
-  snapshotHistory(); selectClip(frzClip.id);
-  toast('Created 2.5s Freeze Frame');
+async function freezeFrameAtPlayhead() {
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f || (f.clip.type !== 'video' && f.clip.type !== 'image')) {
+    return showToast('Select a video clip to freeze frame');
+  }
+  if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+  if (state.currentTime < f.clip.start || state.currentTime >= f.clip.start + f.clip.duration) {
+    return showToast('Move playhead inside the selected clip first');
+  }
+  showToast('Capturing isolated freeze frame...');
+  try {
+    const blob = await engine.captureIsolatedClipBlob(f.clip, state.currentTime);
+    if (!blob) throw new Error('Could not capture frame');
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: apiHeaders({
+        'X-Filename': encodeURIComponent(`Freeze_${f.clip.name.replace(/\.[^.]+$/, '')}_${Date.now()}.png`),
+        'X-Source-Tag': 'freeze',
+      }),
+      body: blob,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Freeze upload failed');
+    state.library.push(data.item);
+    renderMediaLibrary();
+
+    const freezeDur = 2.0;
+    const freezeClip = createDefaultClip({
+      mediaId: data.item.id,
+      name: `Freeze · ${f.clip.name}`,
+      type: 'image',
+      start: quantize(state.currentTime),
+      duration: freezeDur,
+      sourceDuration: freezeDur,
+      fitMode: 'contain',
+    });
+
+    // Insert cleanly on an unlocked overlay track or split main track
+    const ov = findOrCreateFreeTrack('overlay', freezeClip.start, freezeClip.duration);
+    ov.clips.push(freezeClip);
+    selectSingleClip(freezeClip.id);
+    snapshotHistory();
+    renderTimeline();
+    renderInspector();
+    renderNow();
+    showToast('Added isolated 2s Freeze Frame (persisted & export-ready)');
+  } catch (err) {
+    showToast(`Freeze failed: ${err.message}`);
+  }
 }
 
 function detachAudioFromSelected() {
-  const clip = getSelectedClip();
-  if (!clip || clip.type !== 'video') return toast('Select a video clip with audio');
-  const media = state.library.find(m => m.id === clip.mediaId);
-  if (!media?.hasAudio) return toast('Selected video has no audio');
-  const aTrack = state.tracks.find(t => t.type === 'audio');
-  clip.audioDetached = true;
-  const aClip = makeDefaultClip({ ...media, type: 'audio', name: `${clip.name} (Audio)` }, aTrack.id, clip.start);
-  aClip.duration = clip.duration; aClip.trimStart = clip.trimStart; aClip.speed = clip.speed;
-  state.clips.push(aClip);
-  snapshotHistory(); selectClip(aClip.id);
-  toast('Detached audio to Audio track');
-}
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f || f.clip.type !== 'video') return showToast('Select a video clip with audio');
+  if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+  if (f.clip.audioDetached) return showToast('Audio is already detached from this clip');
+  const m = state.library.find(x => x.id === f.clip.mediaId);
+  if (!m || !m.hasAudio) return showToast('Selected video has no audio track');
 
-// ── RIGHT-CLICK CONTEXT MENU ────────────────────────────────────────────────
-function openContextMenu(x, y) {
-  const m = $('#clipContextMenu');
-  m.classList.remove('hidden');
-  m.style.left = `${Math.min(window.innerWidth - 210, x)}px`;
-  m.style.top  = `${Math.min(window.innerHeight - 280, y)}px`;
-}
-function closeContextMenu() { $('#clipContextMenu').classList.add('hidden'); }
+  const audTr = findOrCreateFreeTrack('audio', f.clip.start, f.clip.duration);
+  const linkId = f.clip.linkGroupId || uid('lnk');
+  f.clip.linkGroupId = linkId;
+  f.clip.audioDetached = true;
 
-// ── RIGHT INSPECTOR ─────────────────────────────────────────────────────────
-function syncInspectorTabUI() {
-  $$('.insp-tab').forEach(b => b.classList.toggle('active', b.dataset.itab === state.activeInspectorTab));
-}
-
-function toggleKeyframe(clip, prop) {
-  const localT = Math.max(0, Math.min(clip.duration, state.playhead - clip.start));
-  clip.keyframes = clip.keyframes || {};
-  const arr = clip.keyframes[prop] || [];
-  const idx = arr.findIndex(k => Math.abs(k.t - localT) < 0.08);
-  if (idx >= 0) { arr.splice(idx, 1); toast(`Removed ${prop} keyframe`); }
-  else { arr.push({ t: Math.round(localT * 100) / 100, v: evalClipProp(clip, prop, localT) }); arr.sort((a, b) => a.t - b.t); toast(`Added ${prop} keyframe`); }
-  clip.keyframes[prop] = arr;
-  snapshotHistory(); renderTimeline(); renderInspector();
-}
-
-function jumpKeyframe(clip, dir) {
-  const all = [...new Set(Object.values(clip.keyframes || {}).flat().map(k => k.t))].sort((a, b) => a - b);
-  if (!all.length) return toast('No keyframes on this clip');
-  const localT = state.playhead - clip.start;
-  const target = dir > 0 ? all.find(t => t > localT + 0.05) : [...all].reverse().find(t => t < localT - 0.05);
-  if (target !== undefined) { state.playhead = clip.start + target; renderNow(); renderInspector(); }
-}
-
-function setClipProp(clip, prop, val) {
-  const localT = Math.max(0, Math.min(clip.duration, state.playhead - clip.start));
-  const arr = clip.keyframes?.[prop];
-  if (arr && arr.length > 0) {
-    const hit = arr.find(k => Math.abs(k.t - localT) < 0.08);
-    if (hit) hit.v = val;
-    else { arr.push({ t: Math.round(localT * 100) / 100, v: val }); arr.sort((a, b) => a.t - b.t); }
-  } else {
-    clip[prop] = val;
-  }
+  const audClip = createDefaultClip({
+    mediaId: m.id,
+    name: `${m.name} (Audio)`,
+    type: 'audio',
+    start: f.clip.start,
+    duration: f.clip.duration,
+    trimStart: f.clip.trimStart,
+    sourceDuration: f.clip.sourceDuration,
+    speed: f.clip.speed,
+    speedCurve: f.clip.speedCurve,
+    reverse: f.clip.reverse,
+    volume: f.clip.volume,
+    fadeIn: f.clip.fadeIn,
+    fadeOut: f.clip.fadeOut,
+    eqBass: f.clip.eqBass,
+    eqTreble: f.clip.eqTreble,
+    voiceFx: f.clip.voiceFx,
+    linkGroupId: linkId,
+    keyframes: f.clip.keyframes?.volume ? { volume: structuredClone(f.clip.keyframes.volume) } : {},
+  });
+  f.clip.muted = true;
+  audTr.clips.push(audClip);
+  selectSingleClip(audClip.id);
+  snapshotHistory();
+  renderTimeline();
+  renderInspector();
   renderNow();
+  showToast('Audio detached & linked (mix settings preserved)');
 }
 
-function renderSliderRow(clip, label, prop, min, max, step, suffix = '', allowKf = true) {
-  const localT = Math.max(0, Math.min(clip.duration, state.playhead - clip.start));
-  const cur = allowKf ? evalClipProp(clip, prop, localT) : (clip[prop] ?? 0);
-  const kfs = clip.keyframes?.[prop] || [];
-  const onKf = kfs.some(k => Math.abs(k.t - localT) < 0.08);
-  const row = document.createElement('div');
-  row.className = `prop-row ${allowKf ? '' : 'no-kf'}`;
-  row.innerHTML = `
-    <span class="prop-label">${label}</span>
-    <input type="range" min="${min}" max="${max}" step="${step}" value="${cur}" />
-    <span class="prop-val">${Math.round(cur * 10) / 10}${suffix}</span>
-    ${allowKf ? `<button class="kf-btn ${onKf ? 'on-kf' : kfs.length ? 'has-kf' : ''}" title="Add/Remove Keyframe">◆</button>` : ''}
-  `;
-  const range = row.querySelector('input'), valEl = row.querySelector('.prop-val');
-  range.oninput = () => {
-    const v = parseFloat(range.value);
-    valEl.textContent = `${Math.round(v * 10) / 10}${suffix}`;
-    setClipProp(clip, prop, v);
+// ── CONTEXT-AWARE INSPECTOR WITH NUMERIC INPUTS + EASING + KEYFRAME STEPPER ──
+function getAllowedTabsForClip(clip) {
+  if (!clip) return ['basic', 'mask', 'audio', 'speed', 'color', 'text'];
+  if (clip.type === 'audio') return ['audio', 'speed'];
+  if (clip.type === 'text') return ['basic', 'text'];
+  if (clip.type === 'graphic') return ['basic'];
+  if (clip.type === 'image') return ['basic', 'mask', 'color'];
+  return ['basic', 'mask', 'audio', 'speed', 'color'];
+}
+
+function propSliderRow(label, id, val, min, max, step, unit = '', kfProp = null, clip = null, disabled = false) {
+  const localT = clip ? quantize(Math.max(0, state.currentTime - clip.start)) : 0;
+  const kfs = kfProp && clip ? (clip.keyframes?.[kfProp] || []) : [];
+  const tol = 1 / Math.max(15, state.fps);
+  const hasKfHere = kfs.some(k => Math.abs(k.t - localT) <= tol);
+  const disAttr = disabled ? 'disabled' : '';
+  const kfControls = kfProp ? `
+    <button class="kf-nav-btn" data-kf-prev="${kfProp}" title="Prev Keyframe" ${disAttr}>◂</button>
+    <button class="kf-btn ${hasKfHere ? 'has-kf' : ''}" data-kf="${kfProp}" title="Toggle Keyframe at Playhead" ${disAttr}>◆</button>
+    <button class="kf-nav-btn" data-kf-next="${kfProp}" title="Next Keyframe" ${disAttr}>▸</button>` : '';
+  const dispVal = Number.isInteger(step) ? Math.round(val) : Number(val).toFixed(step < 0.1 ? 2 : 1);
+  return `
+    <div class="prop-row">
+      <div class="prop-head">
+        <span>${escHtml(label)}</span>
+        <div class="prop-val-group">
+          ${kfControls}
+          <input class="prop-num-in" id="${id}_num" type="number" min="${min}" max="${max}" step="${step}" value="${dispVal}" ${disAttr} />
+          ${unit ? `<span class="prop-unit">${escHtml(unit)}</span>` : ''}
+        </div>
+      </div>
+      <input class="prop-slider" id="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${val}" ${disAttr} />
+    </div>`;
+}
+
+function bindSliderAndNumber(id, onVal, onCommit = () => snapshotHistory()) {
+  const sl = $(`#${id}`);
+  const num = $(`#${id}_num`);
+  if (!sl) return;
+  sl.oninput = () => {
+    const v = Number(sl.value);
+    if (num) num.value = sl.step.includes('.') ? v.toFixed(sl.step.split('.')[1].length) : Math.round(v);
+    onVal(v);
   };
-  range.onchange = () => { snapshotHistory(); renderTimeline(); };
-  row.querySelector('.kf-btn')?.addEventListener('click', () => toggleKeyframe(clip, prop));
-  return row;
+  sl.onchange = () => { sl.blur(); onCommit(); };
+  sl.addEventListener('pointerup', () => sl.blur());
+  if (num) {
+    num.onchange = () => {
+      const clamped = Math.max(Number(sl.min), Math.min(Number(sl.max), Number(num.value) || 0));
+      sl.value = clamped;
+      num.value = sl.step.includes('.') ? clamped.toFixed(sl.step.split('.')[1].length) : Math.round(clamped);
+      onVal(clamped);
+      onCommit();
+      num.blur();
+    };
+  }
+}
+
+/** Lightweight in-place update of transform numeric fields during canvas drag (zero DOM rebuild!) */
+function syncTransformInputsInPlace(clip) {
+  const localT = Math.max(0, state.currentTime - clip.start);
+  const map = {
+    slScale: Math.round(evalKeyframe(clip, 'scale', localT, clip.scale) * 100),
+    slX: Math.round(evalKeyframe(clip, 'x', localT, clip.x)),
+    slY: Math.round(evalKeyframe(clip, 'y', localT, clip.y)),
+    slRot: Math.round(evalKeyframe(clip, 'rotation', localT, clip.rotation)),
+  };
+  for (const [id, v] of Object.entries(map)) {
+    const sl = $(`#${id}`);
+    const num = $(`#${id}_num`);
+    if (sl) sl.value = v;
+    if (num) num.value = v;
+  }
 }
 
 function renderInspector() {
   const body = $('#inspectorBody');
-  const clip = getSelectedClip();
-  if (!clip) {
-    body.innerHTML = `<div class="empty-inspector"><div class="empty-icon">◆</div><p>Select a clip on the timeline or click directly on the player to edit transform, masks, chroma key, keyframes, speed, color, audio, or text.</p></div>`;
+  const f = findClipAndTrack(state.selectedClipId);
+  const allowed = getAllowedTabsForClip(f?.clip);
+  $$('#inspectorTabs .insp-tab').forEach(btn => {
+    const ok = allowed.includes(btn.dataset.itab);
+    btn.classList.toggle('disabled-tab', !ok);
+  });
+  if (f && !allowed.includes(state.activeInspectorTab)) {
+    state.activeInspectorTab = allowed[0];
+  }
+  $$('#inspectorTabs .insp-tab').forEach(btn => btn.classList.toggle('active', btn.dataset.itab === state.activeInspectorTab));
+
+  if (!f) {
+    body.innerHTML = `<div class="empty-inspector"><div class="empty-icon">◆</div><p>Select a clip on the timeline or click directly on the player to inspect properties, masks, chroma key, keyframes, speed, color, audio, or text.</p></div>`;
     return;
   }
-  body.innerHTML = '';
+
+  const { clip, track } = f;
+  const locked = Boolean(track.locked);
   const tab = state.activeInspectorTab;
+  const localT = quantize(Math.max(0, state.currentTime - clip.start));
+  const dis = locked ? 'disabled' : '';
+  const lockBanner = locked ? `<div class="locked-banner">🔒 Track "${escHtml(track.name)}" is locked. Unlock to edit.</div>` : '';
 
   if (tab === 'basic') {
-    const s1 = document.createElement('div');
-    s1.className = 'insp-section';
-    s1.innerHTML = `
-      <div class="insp-section-head">
-        <span>Transform &amp; Keyframes</span>
-        <div class="kf-nav-group">
-          <button class="btn-micro" id="btnKfPrev" title="Prev Keyframe">◂◆</button>
-          <button class="btn-micro" id="btnKfNext" title="Next Keyframe">◆▸</button>
-          <button class="btn-micro" id="btnResetTrans">Reset</button>
+    const curScale = Math.round(evalKeyframe(clip, 'scale', localT, clip.scale) * 100);
+    const curX = Math.round(evalKeyframe(clip, 'x', localT, clip.x));
+    const curY = Math.round(evalKeyframe(clip, 'y', localT, clip.y));
+    const curRot = Math.round(evalKeyframe(clip, 'rotation', localT, clip.rotation));
+    const curOp = Math.round(evalKeyframe(clip, 'opacity', localT, clip.opacity) * 100);
+    const curEase = clip.defaultEase || 'easeInOut';
+
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Transform &amp; Keyframes</span><button id="btnResetTransform" class="btn-micro" ${dis}>Reset</button></div>
+        ${clip.type === 'video' || clip.type === 'image' ? `
+        <div class="prop-row">
+          <div class="prop-head"><span>Aspect Fit</span></div>
+          <select id="selFitMode" class="prop-select" ${dis}>
+            <option value="cover" ${clip.fitMode === 'cover' ? 'selected' : ''}>Cover (Fill Frame)</option>
+            <option value="contain" ${clip.fitMode === 'contain' ? 'selected' : ''}>Contain (Fit Full)</option>
+            <option value="stretch" ${clip.fitMode === 'stretch' ? 'selected' : ''}>Stretch</option>
+          </select>
+        </div>` : ''}
+        <div class="prop-row">
+          <div class="prop-head"><span>Blend Mode</span></div>
+          <select id="selBlendMode" class="prop-select" ${dis}>
+            ${['source-over', 'screen', 'multiply', 'overlay', 'lighten', 'darken', 'difference'].map(m =>
+              `<option value="${m}" ${clip.blendMode === m ? 'selected' : ''}>${m === 'source-over' ? 'Normal' : m}</option>`
+            ).join('')}
+          </select>
         </div>
+        <div class="prop-row">
+          <div class="prop-head"><span>Keyframe Easing</span></div>
+          <select id="selKfEase" class="prop-select" ${dis}>
+            ${EASING_TYPES.map(e => `<option value="${e.id}" ${curEase === e.id ? 'selected' : ''}>${e.label}</option>`).join('')}
+          </select>
+        </div>
+        ${propSliderRow('Scale', 'slScale', curScale, 10, 350, 1, '%', 'scale', clip, locked)}
+        ${propSliderRow('Position X', 'slX', curX, -1920, 1920, 1, 'px', 'x', clip, locked)}
+        ${propSliderRow('Position Y', 'slY', curY, -1920, 1920, 1, 'px', 'y', clip, locked)}
+        ${propSliderRow('Rotation', 'slRot', curRot, -180, 180, 1, '°', 'rotation', clip, locked)}
+        ${propSliderRow('Opacity', 'slOp', curOp, 0, 100, 1, '%', 'opacity', clip, locked)}
+        <div class="row-2">
+          <button id="btnFlipH" class="btn-mini ${clip.flipH ? 'active' : ''}" ${dis}>⇄ Flip H</button>
+          <button id="btnFlipV" class="btn-mini ${clip.flipV ? 'active' : ''}" ${dis}>⇅ Flip V</button>
+        </div>
+      </div>
+      ${clip.type === 'graphic' && clip.graphicKind === 'lower-third' ? `
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Lower Third Labels</span></div>
+        <input id="gTitle" class="prop-input" value="${escHtml(clip.text)}" placeholder="Speaker Name" ${dis} />
+        <input id="gSub" class="prop-input" value="${escHtml(clip.subText)}" placeholder="Subtitle" ${dis} />
+      </div>` : ''}
+      ${clip.type === 'video' || clip.type === 'image' ? `
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Chroma Key (Green Screen)</span></div>
+        <div class="row-2">
+          <button id="btnToggleChroma" class="btn-mini ${clip.chromaKey?.enabled ? 'active' : ''}" ${dis}>${clip.chromaKey?.enabled ? '✓ Key Enabled' : 'Enable Chroma Key'}</button>
+          <input id="colChroma" type="color" value="${escHtml(clip.chromaKey?.color || '#00ff00')}" ${dis} />
+        </div>
+        ${propSliderRow('Tolerance', 'slChromaStr', Math.round((clip.chromaKey?.strength ?? 0.36) * 100), 5, 85, 1, '%', null, null, locked)}
+        ${propSliderRow('Edge Feather', 'slChromaFea', Math.round((clip.chromaKey?.feather ?? 0.14) * 100), 0, 60, 1, '%', null, null, locked)}
+      </div>` : ''}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Transition Durations</span></div>
+        ${propSliderRow(`Intro (${clip.transIn})`, 'slTransInDur', clip.transInDur || 0.5, 0.1, 2.0, 0.05, 's', null, null, locked)}
+        ${propSliderRow(`Outro (${clip.transOut})`, 'slTransOutDur', clip.transOutDur || 0.5, 0.1, 2.0, 0.05, 's', null, null, locked)}
       </div>`;
-    s1.appendChild(renderSliderRow(clip, 'Scale',   'scale',    10, 350, 1, '%', true));
-    s1.appendChild(renderSliderRow(clip, 'Pos X',   'x',      -1200, 1200, 2, 'px', true));
-    s1.appendChild(renderSliderRow(clip, 'Pos Y',   'y',      -1200, 1200, 2, 'px', true));
-    s1.appendChild(renderSliderRow(clip, 'Rotate',  'rotation', -180, 180, 1, '°', true));
-    s1.appendChild(renderSliderRow(clip, 'Opacity', 'opacity',   0, 100, 1, '%', true));
 
-    const blendWrap = document.createElement('div');
-    blendWrap.className = 'prop-grid-2';
-    blendWrap.innerHTML = `
-      <select class="prop-select" id="selBlend">
-        <option value="source-over">Blend: Normal</option>
-        <option value="screen">Blend: Screen</option>
-        <option value="multiply">Blend: Multiply</option>
-        <option value="overlay">Blend: Overlay</option>
-        <option value="lighten">Blend: Lighten</option>
-        <option value="darken">Blend: Darken</option>
-        <option value="hard-light">Blend: Hard Light</option>
-        <option value="difference">Blend: Difference</option>
-      </select>
-      <div class="row-2">
-        <button class="btn-mini ${clip.flipH ? 'active' : ''}" id="btnFlipH">Flip H</button>
-        <button class="btn-mini ${clip.flipV ? 'active' : ''}" id="btnFlipV">Flip V</button>
-      </div>`;
-    blendWrap.querySelector('#selBlend').value = clip.blendMode || 'source-over';
-    blendWrap.querySelector('#selBlend').onchange = e => { clip.blendMode = e.target.value; snapshotHistory(); renderNow(); };
-    blendWrap.querySelector('#btnFlipH').onclick = () => { clip.flipH = !clip.flipH; snapshotHistory(); renderInspector(); renderNow(); };
-    blendWrap.querySelector('#btnFlipV').onclick = () => { clip.flipV = !clip.flipV; snapshotHistory(); renderInspector(); renderNow(); };
-    s1.appendChild(blendWrap);
+    if (locked) return;
 
-    const fitRow = document.createElement('div');
-    fitRow.className = 'row-2';
-    fitRow.innerHTML = `
-      <button class="btn-mini ${clip.fitMode === 'contain' ? 'active' : ''}" data-fit="contain">Fit</button>
-      <button class="btn-mini ${clip.fitMode === 'cover' ? 'active' : ''}" data-fit="cover">Fill Canvas</button>
-      <button class="btn-mini ${clip.fitMode === 'stretch' ? 'active' : ''}" data-fit="stretch">Stretch</button>`;
-    fitRow.querySelectorAll('[data-fit]').forEach(b => b.onclick = () => { clip.fitMode = b.dataset.fit; snapshotHistory(); renderInspector(); renderNow(); });
-    s1.appendChild(fitRow);
+    const setOrKey = (prop, value) => {
+      const kfs = clip.keyframes?.[prop];
+      if (kfs && kfs.length > 0) {
+        const tol = 1 / Math.max(15, state.fps);
+        const ex = kfs.find(k => Math.abs(k.t - localT) <= tol);
+        if (ex) ex.v = value;
+        else kfs.push({ t: localT, v: value, ease: clip.defaultEase || 'easeInOut' });
+      } else {
+        clip[prop] = value;
+      }
+      renderNow();
+    };
 
-    s1.querySelector('#btnKfPrev').onclick = () => jumpKeyframe(clip, -1);
-    s1.querySelector('#btnKfNext').onclick = () => jumpKeyframe(clip,  1);
-    s1.querySelector('#btnResetTrans').onclick = () => {
-      Object.assign(clip, { x: 0, y: 0, scale: 100, rotation: 0, opacity: 100, flipH: false, flipV: false, blendMode: 'source-over', keyframes: {} });
+    if ($('#selFitMode')) $('#selFitMode').onchange = (e) => { clip.fitMode = e.target.value; snapshotHistory(); renderNow(); };
+    $('#selBlendMode').onchange = (e) => { clip.blendMode = e.target.value; snapshotHistory(); renderNow(); };
+    $('#selKfEase').onchange = (e) => {
+      clip.defaultEase = e.target.value;
+      for (const list of Object.values(clip.keyframes || {})) {
+        for (const k of list) {
+          if (Math.abs(k.t - localT) <= 1 / Math.max(15, state.fps)) k.ease = e.target.value;
+        }
+      }
+      snapshotHistory();
+      renderNow();
+    };
+    bindSliderAndNumber('slScale', v => setOrKey('scale', v / 100));
+    bindSliderAndNumber('slX', v => setOrKey('x', v));
+    bindSliderAndNumber('slY', v => setOrKey('y', v));
+    bindSliderAndNumber('slRot', v => setOrKey('rotation', v));
+    bindSliderAndNumber('slOp', v => setOrKey('opacity', v / 100));
+    bindSliderAndNumber('slTransInDur', v => { clip.transInDur = v; renderNow(); });
+    bindSliderAndNumber('slTransOutDur', v => { clip.transOutDur = v; renderNow(); });
+    $('#btnFlipH').onclick = () => { clip.flipH = !clip.flipH; snapshotHistory(); renderInspector(); renderNow(); };
+    $('#btnFlipV').onclick = () => { clip.flipV = !clip.flipV; snapshotHistory(); renderInspector(); renderNow(); };
+    $('#btnResetTransform').onclick = () => {
+      Object.assign(clip, { x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, flipH: false, flipV: false, cropRect: null, blendMode: 'source-over', keyframes: {} });
       snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
     };
-    body.appendChild(s1);
-
-    if (clip.type === 'video' || clip.type === 'image') {
-      const s2 = document.createElement('div');
-      s2.className = 'insp-section';
-      s2.innerHTML = `<div class="insp-section-head"><span>Crop (%)</span><button class="btn-micro" id="btnResetCrop">Reset</button></div>`;
-      s2.appendChild(renderSliderRow(clip, 'Top',    'cropTop',    0, 45, 0.5, '%', false));
-      s2.appendChild(renderSliderRow(clip, 'Bottom', 'cropBottom', 0, 45, 0.5, '%', false));
-      s2.appendChild(renderSliderRow(clip, 'Left',   'cropLeft',   0, 45, 0.5, '%', false));
-      s2.appendChild(renderSliderRow(clip, 'Right',  'cropRight',  0, 45, 0.5, '%', false));
-      s2.querySelector('#btnResetCrop').onclick = () => { Object.assign(clip, { cropTop: 0, cropBottom: 0, cropLeft: 0, cropRight: 0 }); snapshotHistory(); renderInspector(); renderNow(); };
-      body.appendChild(s2);
+    if ($('#btnToggleChroma')) {
+      $('#btnToggleChroma').onclick = () => { clip.chromaKey.enabled = !clip.chromaKey.enabled; snapshotHistory(); renderInspector(); renderNow(); };
+      $('#colChroma').oninput = (e) => { clip.chromaKey.color = e.target.value; renderNow(); };
+      $('#colChroma').onchange = () => snapshotHistory();
+      bindSliderAndNumber('slChromaStr', v => { clip.chromaKey.strength = v / 100; renderNow(); });
+      bindSliderAndNumber('slChromaFea', v => { clip.chromaKey.feather = v / 100; renderNow(); });
     }
-
-    const s3 = document.createElement('div');
-    s3.className = 'insp-section';
-    s3.innerHTML = `<div class="insp-section-head"><span>Transition Timing</span></div>`;
-    s3.appendChild(renderSliderRow(clip, 'Duration', 'transitionDur', 0.1, 1.5, 0.05, 's', false));
-    body.appendChild(s3);
-  }
-
-  else if (tab === 'mask') {
-    const s1 = document.createElement('div');
-    s1.className = 'insp-section';
-    s1.innerHTML = `
-      <div class="insp-section-head"><span>CapCut Mask</span></div>
-      <div class="row-2">
-        ${['none','split','circle','rect','mirror'].map(m => `<button class="btn-mini ${(clip.maskType||'none')===m?'active':''}" data-mask="${m}">${m.toUpperCase()}</button>`).join('')}
+    if ($('#gTitle')) {
+      $('#gTitle').oninput = (e) => { clip.text = e.target.value; renderNow(); };
+      $('#gTitle').onchange = () => snapshotHistory();
+      $('#gSub').oninput = (e) => { clip.subText = e.target.value; renderNow(); };
+      $('#gSub').onchange = () => snapshotHistory();
+    }
+    wireKeyframeButtons(body, clip, localT);
+  } else if (tab === 'mask') {
+    const m = clip.mask || (clip.mask = { type: 'none', x: 0.5, y: 0.5, scale: 0.48, rotation: 0, feather: 0, invert: false });
+    const mx = Math.round(evalKeyframe(clip, 'maskX', localT, m.x) * 100);
+    const my = Math.round(evalKeyframe(clip, 'maskY', localT, m.y) * 100);
+    const ms = Math.round(evalKeyframe(clip, 'maskScale', localT, m.scale) * 100);
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Feathered Shape Mask</span></div>
+        <div class="preset-grid" id="maskTypeGrid">
+          ${[['none', 'None'], ['split', 'Split Screen'], ['circle', 'Circle'], ['rect', 'Rectangle'], ['mirror', 'Horizontal Strip']].map(([id, nm]) =>
+            `<button class="preset-card ${m.type === id ? 'active' : ''}" data-mtype="${id}" ${dis}><div class="preset-label">${nm}</div></button>`
+          ).join('')}
+        </div>
+        ${propSliderRow('Mask Center X', 'slMX', mx, 0, 100, 1, '%', 'maskX', clip, locked)}
+        ${propSliderRow('Mask Center Y', 'slMY', my, 0, 100, 1, '%', 'maskY', clip, locked)}
+        ${propSliderRow('Mask Size', 'slMS', ms, 5, 130, 1, '%', 'maskScale', clip, locked)}
+        ${propSliderRow('Mask Feather', 'slMFea', m.feather || 0, 0, 80, 1, 'px', null, null, locked)}
+        ${propSliderRow('Mask Rotation', 'slMR', m.rotation || 0, -180, 180, 1, '°', null, null, locked)}
+        <button id="btnMaskInvert" class="btn-mini ${m.invert ? 'active' : ''}" ${dis}>${m.invert ? '✓ Inverted Mask' : 'Invert Mask'}</button>
       </div>`;
-    s1.querySelectorAll('[data-mask]').forEach(b => b.onclick = () => { clip.maskType = b.dataset.mask; snapshotHistory(); renderTimeline(); renderInspector(); renderNow(); });
-    s1.appendChild(renderSliderRow(clip, 'Size',   'maskSize', 5, 100, 1, '%', false));
-    s1.appendChild(renderSliderRow(clip, 'Mask X', 'maskX',  -50, 50,  1, '%', false));
-    s1.appendChild(renderSliderRow(clip, 'Mask Y', 'maskY',  -50, 50,  1, '%', false));
-    s1.appendChild(renderSliderRow(clip, 'Rotate', 'maskRot', -180, 180, 1, '°', false));
-    const inv = document.createElement('label');
-    inv.className = 'prop-check';
-    inv.innerHTML = `<input type="checkbox" ${clip.maskInvert ? 'checked' : ''} /> Invert Mask`;
-    inv.querySelector('input').onchange = e => { clip.maskInvert = e.target.checked; snapshotHistory(); renderNow(); };
-    s1.appendChild(inv);
-    body.appendChild(s1);
-
-    const s2 = document.createElement('div');
-    s2.className = 'insp-section';
-    s2.innerHTML = `
-      <div class="insp-section-head"><span>Chroma Key (Green/Blue Screen)</span></div>
-      <div class="prop-grid-2">
-        <label class="prop-check"><input type="checkbox" id="chkChroma" ${clip.chromaEnabled ? 'checked' : ''} /> Enable Key</label>
-        <label class="prop-label">Key Color <input type="color" id="colChroma" value="${clip.chromaColor || '#00ff00'}" /></label>
-      </div>`;
-    s2.querySelector('#chkChroma').onchange = e => { clip.chromaEnabled = e.target.checked; snapshotHistory(); renderTimeline(); renderNow(); };
-    s2.querySelector('#colChroma').oninput = e => { clip.chromaColor = e.target.value; renderNow(); };
-    s2.appendChild(renderSliderRow(clip, 'Strength', 'chromaSimilarity', 5, 95, 1, '%', false));
-    s2.appendChild(renderSliderRow(clip, 'Smooth',   'chromaSmoothness', 1, 50, 1, '%', false));
-    body.appendChild(s2);
-  }
-
-  else if (tab === 'audio') {
-    const s = document.createElement('div');
-    s.className = 'insp-section';
-    s.innerHTML = `<div class="insp-section-head"><span>Audio Mix &amp; EQ</span></div>`;
-    s.appendChild(renderSliderRow(clip, 'Volume',   'volume',   0, 2, 0.05, 'x', false));
-    s.appendChild(renderSliderRow(clip, 'Fade In',  'fadeIn',   0, 3, 0.1,  's', false));
-    s.appendChild(renderSliderRow(clip, 'Fade Out', 'fadeOut',  0, 3, 0.1,  's', false));
-    s.appendChild(renderSliderRow(clip, 'Bass EQ',  'eqBass', -12, 12, 1,  'dB', false));
-    s.appendChild(renderSliderRow(clip, 'Treble',   'eqTreble',-12,12, 1,  'dB', false));
-    const vfx = document.createElement('select');
-    vfx.className = 'prop-select';
-    vfx.innerHTML = `
-      <option value="normal">Voice FX: Normal</option>
-      <option value="radio">Voice FX: Vintage Radio</option>
-      <option value="deep">Voice FX: Deep Cinema</option>
-      <option value="chipmunk">Voice FX: High Pitch</option>`;
-    vfx.value = clip.voiceFx || 'normal';
-    vfx.onchange = e => { clip.voiceFx = e.target.value; snapshotHistory(); renderNow(); };
-    s.appendChild(vfx);
-    const chk = document.createElement('label');
-    chk.className = 'prop-check';
-    chk.innerHTML = `<input type="checkbox" ${clip.muted ? 'checked' : ''} /> Mute this clip`;
-    chk.querySelector('input').onchange = e => { clip.muted = e.target.checked; snapshotHistory(); renderNow(); };
-    s.appendChild(chk);
-    body.appendChild(s);
-  }
-
-  else if (tab === 'speed') {
-    const s = document.createElement('div');
-    s.className = 'insp-section';
-    s.innerHTML = `<div class="insp-section-head"><span>Speed &amp; Curve Ramps</span></div>`;
-    const row = renderSliderRow(clip, 'Speed', 'speed', 0.25, 4.0, 0.05, 'x', false);
-    row.querySelector('input').onchange = () => {
-      const sp = parseFloat(row.querySelector('input').value);
-      const srcSpan = (clip.maxDuration || clip.duration) - (clip.trimStart || 0);
-      clip.speed = sp;
-      if (clip.type === 'video' || clip.type === 'audio') clip.duration = Math.max(0.2, Math.min(clip.duration, srcSpan / sp));
-      snapshotHistory(); renderTimeline(); renderNow();
+    if (locked) return;
+    $$('#maskTypeGrid button').forEach(b => { b.onclick = () => { m.type = b.dataset.mtype; snapshotHistory(); renderTimeline(); renderInspector(); renderNow(); }; });
+    const setMaskKey = (kfProp, field, val) => {
+      const kfs = clip.keyframes?.[kfProp];
+      if (kfs && kfs.length > 0) {
+        const ex = kfs.find(k => Math.abs(k.t - localT) <= 1 / Math.max(15, state.fps));
+        if (ex) ex.v = val; else kfs.push({ t: localT, v: val, ease: clip.defaultEase || 'easeInOut' });
+      } else m[field] = val;
+      renderNow();
     };
-    s.appendChild(row);
-    const curveBox = document.createElement('div');
-    curveBox.className = 'row-2';
-    curveBox.innerHTML = Object.entries(SPEED_CURVES).map(([k, v]) => `<button class="btn-mini ${(clip.speedCurve||'normal')===k?'active':''}" data-curve="${k}">${v.name}</button>`).join('');
-    curveBox.querySelectorAll('[data-curve]').forEach(b => b.onclick = () => {
-      clip.speedCurve = b.dataset.curve; snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
-      toast(`Speed curve: ${SPEED_CURVES[clip.speedCurve].name}`);
+    bindSliderAndNumber('slMX', v => setMaskKey('maskX', 'x', v / 100));
+    bindSliderAndNumber('slMY', v => setMaskKey('maskY', 'y', v / 100));
+    bindSliderAndNumber('slMS', v => setMaskKey('maskScale', 'scale', v / 100));
+    bindSliderAndNumber('slMFea', v => { m.feather = v; renderNow(); });
+    bindSliderAndNumber('slMR', v => { m.rotation = v; renderNow(); });
+    $('#btnMaskInvert').onclick = () => { m.invert = !m.invert; snapshotHistory(); renderInspector(); renderNow(); };
+    wireKeyframeButtons(body, clip, localT);
+  } else if (tab === 'audio') {
+    const curVol = Math.round(evalKeyframe(clip, 'volume', localT, clip.volume ?? 1) * 100);
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Audio Mixer &amp; Keyframes</span><button id="btnClipMute" class="btn-micro ${clip.muted ? 'active' : ''}" ${dis}>${clip.muted ? 'Muted' : 'Mute'}</button></div>
+        ${propSliderRow('Volume', 'slVol', curVol, 0, 200, 1, '%', 'volume', clip, locked)}
+        ${propSliderRow('Fade In', 'slFadeIn', clip.fadeIn || 0, 0, 5, 0.1, 's', null, null, locked)}
+        ${propSliderRow('Fade Out', 'slFadeOut', clip.fadeOut || 0, 0, 5, 0.1, 's', null, null, locked)}
+      </div>
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>EQ &amp; Voice FX (Export-Synced)</span></div>
+        ${propSliderRow('Bass EQ', 'slBass', clip.eqBass || 0, -15, 15, 1, 'dB', null, null, locked)}
+        ${propSliderRow('Treble EQ', 'slTreble', clip.eqTreble || 0, -15, 15, 1, 'dB', null, null, locked)}
+        <div class="prop-row">
+          <div class="prop-head"><span>Voice Effect</span></div>
+          <select id="selVoiceFx" class="prop-select" ${dis}>
+            <option value="none" ${clip.voiceFx === 'none' ? 'selected' : ''}>Natural</option>
+            <option value="radio" ${clip.voiceFx === 'radio' ? 'selected' : ''}>Lo-Fi Radio Bandpass</option>
+            <option value="deep" ${clip.voiceFx === 'deep' ? 'selected' : ''}>Deep Voice</option>
+            <option value="chipmunk" ${clip.voiceFx === 'chipmunk' ? 'selected' : ''}>High Pitch</option>
+            <option value="echo" ${clip.voiceFx === 'echo' ? 'selected' : ''}>Studio Echo</option>
+          </select>
+        </div>
+      </div>`;
+    if (locked) return;
+    $('#btnClipMute').onclick = () => { clip.muted = !clip.muted; snapshotHistory(); renderInspector(); renderNow(); };
+    bindSliderAndNumber('slVol', v => {
+      const kfs = clip.keyframes?.volume;
+      if (kfs && kfs.length > 0) {
+        const ex = kfs.find(k => Math.abs(k.t - localT) <= 1 / Math.max(15, state.fps));
+        if (ex) ex.v = v / 100; else kfs.push({ t: localT, v: v / 100, ease: clip.defaultEase || 'easeInOut' });
+      } else clip.volume = v / 100;
+      renderNow();
     });
-    s.appendChild(curveBox);
-    const rev = document.createElement('label');
-    rev.className = 'prop-check';
-    rev.innerHTML = `<input type="checkbox" ${clip.reverse ? 'checked' : ''} /> Reverse Clip Playback`;
-    rev.querySelector('input').onchange = e => { clip.reverse = e.target.checked; snapshotHistory(); renderNow(); };
-    s.appendChild(rev);
-    body.appendChild(s);
-  }
-
-  else if (tab === 'color') {
-    const s = document.createElement('div');
-    s.className = 'insp-section';
-    s.innerHTML = `<div class="insp-section-head"><span>Color Grading</span><button class="btn-micro" id="btnResetColor">Reset</button></div>`;
-    s.appendChild(renderSliderRow(clip, 'Brightness', 'brightness', 20, 200, 1, '%', false));
-    s.appendChild(renderSliderRow(clip, 'Contrast',   'contrast',   20, 220, 1, '%', false));
-    s.appendChild(renderSliderRow(clip, 'Saturation', 'saturate',   0,  250, 1, '%', false));
-    s.appendChild(renderSliderRow(clip, 'Hue',        'hue',       -180, 180, 1, '°', false));
-    s.appendChild(renderSliderRow(clip, 'Blur',       'blur',       0,  24,  0.5, 'px', false));
-    s.appendChild(renderSliderRow(clip, 'Vignette',   'vignette',   0,  100, 1, '%', false));
-    s.querySelector('#btnResetColor').onclick = () => {
-      Object.assign(clip, { brightness: 100, contrast: 100, saturate: 100, hue: 0, blur: 0, vignette: 0 });
+    bindSliderAndNumber('slFadeIn', v => { clip.fadeIn = v; });
+    bindSliderAndNumber('slFadeOut', v => { clip.fadeOut = v; });
+    bindSliderAndNumber('slBass', v => { clip.eqBass = v; renderNow(); });
+    bindSliderAndNumber('slTreble', v => { clip.eqTreble = v; renderNow(); });
+    $('#selVoiceFx').onchange = (e) => { clip.voiceFx = e.target.value; snapshotHistory(); renderNow(); };
+    wireKeyframeButtons(body, clip, localT);
+  } else if (tab === 'speed') {
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Speed &amp; Ramping Curves</span></div>
+        ${propSliderRow('Base Speed', 'slSpeed', clip.speed || 1, 0.25, 4, 0.05, '×', null, null, locked)}
+        <div class="speed-pills">
+          ${[0.25, 0.5, 1, 1.5, 2].map(v => `<button class="speed-pill ${Math.abs((clip.speed || 1) - v) < 0.02 ? 'active' : ''}" data-sp="${v}" ${dis}>${v}×</button>`).join('')}
+        </div>
+        <div class="prop-row">
+          <div class="prop-head"><span>CapCut Speed Ramp Curve (Audio-Synced Export)</span></div>
+          <select id="selSpeedCurve" class="prop-select" ${dis}>
+            ${Object.entries(SPEED_CURVES).map(([k, v]) => `<option value="${k}" ${(clip.speedCurve || 'none') === k ? 'selected' : ''}>${v.label}</option>`).join('')}
+          </select>
+        </div>
+        <button id="btnReverseClip" class="btn-mini ${clip.reverse ? 'active' : ''}" ${dis}>${clip.reverse ? '✓ Reverse Active (Video + Audio)' : '◀ Reverse Clip'}</button>
+      </div>`;
+    if (locked) return;
+    const applySpeed = (sp) => {
+      const oldSpan = getClipSourceSpan(clip);
+      clip.speed = Math.max(0.25, Math.min(4, sp));
+      // Preserve source range: expand when slowing down (up to available media), shrink when speeding up!
+      const availSrc = Math.max(0.2, (clip.sourceDuration || oldSpan) - (clip.trimStart || 0));
+      const desiredSrc = Math.min(availSrc, oldSpan);
+      clip.duration = quantize(Math.max(0.15, desiredSrc / clip.speed));
+      compactMainTrackIfMagnetic();
+      renderTimeline();
+      renderNow();
+    };
+    bindSliderAndNumber('slSpeed', v => applySpeed(v), () => { snapshotHistory(); renderInspector(); });
+    $$('.speed-pill').forEach(p => { p.onclick = () => { applySpeed(Number(p.dataset.sp)); snapshotHistory(); renderInspector(); }; });
+    $('#selSpeedCurve').onchange = (e) => { clip.speedCurve = e.target.value; snapshotHistory(); renderTimeline(); renderNow(); };
+    $('#btnReverseClip').onclick = () => { clip.reverse = !clip.reverse; snapshotHistory(); renderTimeline(); renderInspector(); renderNow(); };
+  } else if (tab === 'color') {
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Color Grading</span><button id="btnResetColor" class="btn-micro" ${dis}>Reset</button></div>
+        ${propSliderRow('Brightness', 'slBright', clip.brightness || 0, -60, 60, 1, '', null, null, locked)}
+        ${propSliderRow('Contrast', 'slCont', clip.contrast || 0, -60, 80, 1, '', null, null, locked)}
+        ${propSliderRow('Saturation', 'slSat', clip.saturation || 0, -100, 100, 1, '', null, null, locked)}
+        ${propSliderRow('Temperature', 'slTemp', clip.temperature || 0, -60, 60, 1, '', null, null, locked)}
+        ${propSliderRow('Blur', 'slBlur', clip.blur || 0, 0, 24, 0.5, 'px', null, null, locked)}
+      </div>`;
+    if (locked) return;
+    bindSliderAndNumber('slBright', v => { clip.brightness = v; renderNow(); });
+    bindSliderAndNumber('slCont', v => { clip.contrast = v; renderNow(); });
+    bindSliderAndNumber('slSat', v => { clip.saturation = v; renderNow(); });
+    bindSliderAndNumber('slTemp', v => { clip.temperature = v; renderNow(); });
+    bindSliderAndNumber('slBlur', v => { clip.blur = v; renderNow(); });
+    $('#btnResetColor').onclick = () => {
+      Object.assign(clip, { filter: 'none', brightness: 0, contrast: 0, saturation: 0, temperature: 0, blur: 0 });
       snapshotHistory(); renderInspector(); renderNow();
     };
-    body.appendChild(s);
-  }
-
-  else if (tab === 'text') {
-    if (clip.type === 'graphic' && clip.graphicType === 'lowerThird') {
-      const s = document.createElement('div');
-      s.className = 'insp-section';
-      s.innerHTML = `
-        <div class="insp-section-head"><span>Lower Third Copy</span></div>
-        <input class="prop-input" id="gTitle" value="${clip.graphicTitle || ''}" />
-        <input class="prop-input" id="gSub" value="${clip.graphicSub || ''}" />`;
-      s.querySelector('#gTitle').oninput = e => { clip.graphicTitle = e.target.value; renderNow(); };
-      s.querySelector('#gSub').oninput   = e => { clip.graphicSub   = e.target.value; renderNow(); };
-      body.appendChild(s);
-      return;
-    }
+  } else if (tab === 'text') {
     if (clip.type !== 'text') {
-      body.innerHTML = `<div class="empty-inspector"><p>Select a Text clip (or add one from the Text tab) to edit typography.</p></div>`;
+      body.innerHTML = `<div class="empty-inspector"><p>Select a Text clip to style typography, spacing, alignment, shadow, and animations.</p><button id="btnQuickText" class="btn-accent">+ Add Text at Playhead</button></div>`;
+      $('#btnQuickText').onclick = () => addTextClip();
       return;
     }
-    const s = document.createElement('div');
-    s.className = 'insp-section';
-    s.innerHTML = `
-      <div class="insp-section-head"><span>Typography &amp; Animation</span></div>
-      <textarea class="prop-textarea" id="txtContent">${clip.text || ''}</textarea>
-      <div class="prop-grid-2">
-        <select class="prop-select" id="txtFont">
-          <option value="DIN Condensed, Impact, sans-serif">DIN Condensed</option>
-          <option value="-apple-system, Inter, sans-serif">SF / Inter Bold</option>
-          <option value="Impact, Arial Black, sans-serif">Impact Heavy</option>
-          <option value="SF Mono, Menlo, monospace">Monospace HUD</option>
-          <option value="Avenir Next, Helvetica Neue, sans-serif">Avenir Next</option>
-          <option value="Georgia, serif">Editorial Serif</option>
-        </select>
-        <select class="prop-select" id="txtAnim">
-          <option value="none">No Animation</option>
-          <option value="fade">Fade In</option>
-          <option value="pop">Pop Bounce</option>
-          <option value="slideUp">Slide Up</option>
-          <option value="typewriter">Typewriter</option>
-          <option value="glitch">Glitch In</option>
-        </select>
-      </div>
-      <div class="prop-grid-2">
-        <label class="prop-label">Color <input type="color" id="txtColor" value="${clip.textColor || '#ffffff'}" /></label>
-        <label class="prop-label">Stroke <input type="color" id="txtStroke" value="${clip.strokeColor && clip.strokeColor !== 'transparent' ? clip.strokeColor : '#000000'}" /></label>
-      </div>
-      <div class="prop-grid-2">
-        <label class="prop-label">BG Box <input type="color" id="txtBg" value="${clip.textBg && clip.textBg !== 'transparent' ? clip.textBg : '#000000'}" /></label>
-        <label class="prop-label">BG Alpha <input type="range" id="txtBgA" min="0" max="1" step="0.05" value="${clip.textBgAlpha || 0}" /></label>
-      </div>`;
-    s.querySelector('#txtFont').value = clip.fontFamily || 'DIN Condensed, Impact, sans-serif';
-    s.querySelector('#txtAnim').value = clip.textAnim || 'none';
-    s.querySelector('#txtContent').oninput = e => { clip.text = e.target.value; renderTimeline(); renderNow(); };
-    s.querySelector('#txtContent').onchange = snapshotHistory;
-    s.querySelector('#txtFont').onchange = e => { clip.fontFamily = e.target.value; snapshotHistory(); renderNow(); };
-    s.querySelector('#txtAnim').onchange = e => { clip.textAnim = e.target.value; snapshotHistory(); renderNow(); };
-    s.querySelector('#txtColor').oninput = e => { clip.textColor = e.target.value; renderNow(); };
-    s.querySelector('#txtStroke').oninput = e => { clip.strokeColor = e.target.value; renderNow(); };
-    s.querySelector('#txtBg').oninput = e => { clip.textBg = e.target.value; if (!clip.textBgAlpha) clip.textBgAlpha = 0.85; renderNow(); };
-    s.querySelector('#txtBgA').oninput = e => { clip.textBgAlpha = parseFloat(e.target.value); if (clip.textBg === 'transparent') clip.textBg = '#000000'; renderNow(); };
-    s.appendChild(renderSliderRow(clip, 'Font Size', 'fontSize', 18, 220, 2, 'px', false));
-    s.appendChild(renderSliderRow(clip, 'Stroke W',  'strokeWidth', 0, 24, 1, 'px', false));
-    body.appendChild(s);
-  }
-}
-
-// ── STACKABLE VFX INTENSITY PANEL & CAPTIONS LIST ───────────────────────────
-function renderEffectIntensityPanel() {
-  const wrap = $('#effectIntensityWrap');
-  const clip = getSelectedClip();
-  $$('#effectsGrid .preset-card').forEach(c => {
-    c.classList.toggle('active', Boolean(clip?.effects?.[c.dataset.fxId]));
-  });
-  if (!clip || !Object.keys(clip.effects || {}).length) { wrap.innerHTML = ''; return; }
-  wrap.innerHTML = '';
-  for (const [fxId, val] of Object.entries(clip.effects)) {
-    const meta = EFFECT_PRESETS.find(e => e.id === fxId);
-    const row = document.createElement('div');
-    row.className = 'fx-chip-row';
-    row.innerHTML = `
-      <div class="fx-chip-head"><span>${meta?.name || fxId}</span><span>${val}%</span></div>
-      <input type="range" min="10" max="100" step="2" value="${val}" />`;
-    const inp = row.querySelector('input');
-    const lbl = row.querySelector('.fx-chip-head span:last-child');
-    inp.oninput = () => { clip.effects[fxId] = Number(inp.value); lbl.textContent = `${clip.effects[fxId]}%`; renderNow(); };
-    inp.onchange = snapshotHistory;
-    wrap.appendChild(row);
-  }
-}
-
-function renderCaptionsList() {
-  const list = $('#captionList');
-  list.innerHTML = '';
-  state.captions.sort((a, b) => a.start - b.start).forEach(cap => {
-    const row = document.createElement('div');
-    row.className = 'caption-row';
-    row.innerHTML = `
-      <div class="caption-row-head">
-        <span>${fmtTC(cap.start)} → ${fmtTC(cap.end)}</span>
-        <div>
-          <button class="btn-micro" data-act="go">Jump</button>
-          <button class="btn-micro" data-act="del">✕</button>
+    body.innerHTML = `${lockBanner}
+      <div class="insp-section">
+        <div class="insp-sec-head"><span>Typography &amp; Layout</span></div>
+        <textarea id="txtContent" class="prop-textarea" ${dis}>${escHtml(clip.text)}</textarea>
+        ${propSliderRow('Font Size', 'slFontSize', clip.fontSize || 72, 20, 200, 1, 'px', null, null, locked)}
+        ${propSliderRow('Letter Spacing', 'slSpacing', clip.spacing || 0, -4, 30, 1, 'px', null, null, locked)}
+        <div class="row-2">
+          <select id="selFontWeight" class="prop-select" ${dis}>
+            ${[['400', 'Regular'], ['700', 'Bold'], ['800', 'ExtraBold'], ['900', 'Black']].map(([w, l]) =>
+              `<option value="${w}" ${(clip.fontWeight || '900') === w ? 'selected' : ''}>${l}</option>`
+            ).join('')}
+          </select>
+          <select id="selTextAlign" class="prop-select" ${dis}>
+            ${[['left', 'Left'], ['center', 'Center'], ['right', 'Right']].map(([a, l]) =>
+              `<option value="${a}" ${(clip.align || 'center') === a ? 'selected' : ''}>${l}</option>`
+            ).join('')}
+          </select>
         </div>
-      </div>
-      <input type="text" value="${(cap.text || '').replace(/"/g, '&quot;')}" />`;
-    row.querySelector('input').oninput = e => { cap.text = e.target.value; renderNow(); };
-    row.querySelector('input').onchange = snapshotHistory;
-    row.querySelector('[data-act="go"]').onclick = () => { state.playhead = cap.start; renderNow(); };
-    row.querySelector('[data-act="del"]').onclick = () => {
-      state.captions = state.captions.filter(c => c.id !== cap.id);
-      snapshotHistory(); renderCaptionsList(); renderNow();
+        ${propSliderRow('Stroke Width', 'slStroke', clip.strokeWidth || 0, 0, 24, 1, 'px', null, null, locked)}
+        ${propSliderRow('Shadow Blur', 'slShadow', clip.shadowBlur || 0, 0, 40, 1, 'px', null, null, locked)}
+        <div class="color-row">
+          <label>Text</label><input id="txtColor" type="color" value="${escHtml(clip.color || '#ffffff')}" ${dis} />
+          <label>Stroke</label><input id="txtStroke" type="color" value="${escHtml(clip.strokeColor || '#000000')}" ${dis} />
+          <label>Box</label><input id="txtBg" type="color" value="${escHtml(clip.bgColor || '#000000')}" ${dis} />
+        </div>
+        ${propSliderRow('Box Opacity', 'slBgA', Math.round((clip.bgAlpha || 0) * 100), 0, 100, 1, '%', null, null, locked)}
+        <div class="row-2">
+          <div class="prop-row">
+            <div class="prop-head"><span>Intro Anim</span></div>
+            <select id="txtAnimIn" class="prop-select" ${dis}>
+              ${['none', 'pop', 'slide-up', 'fade', 'typewriter'].map(a => `<option value="${a}" ${clip.animIn === a ? 'selected' : ''}>${a}</option>`).join('')}
+            </select>
+          </div>
+          <div class="prop-row">
+            <div class="prop-head"><span>Outro Anim</span></div>
+            <select id="txtAnimOut" class="prop-select" ${dis}>
+              ${['none', 'fade', 'pop', 'slide-down', 'zoom-out'].map(a => `<option value="${a}" ${(clip.animOut || 'none') === a ? 'selected' : ''}>${a}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+      </div>`;
+    if (locked) return;
+    $('#txtContent').oninput = (e) => { clip.text = e.target.value; renderNow(); };
+    $('#txtContent').onchange = () => { snapshotHistory(); renderTimeline(); };
+    bindSliderAndNumber('slFontSize', v => { clip.fontSize = v; renderNow(); });
+    bindSliderAndNumber('slSpacing', v => { clip.spacing = v; renderNow(); });
+    bindSliderAndNumber('slStroke', v => { clip.strokeWidth = v; renderNow(); });
+    bindSliderAndNumber('slShadow', v => { clip.shadowBlur = v; renderNow(); });
+    bindSliderAndNumber('slBgA', v => { clip.bgAlpha = v / 100; renderNow(); });
+    $('#selFontWeight').onchange = (e) => { clip.fontWeight = e.target.value; snapshotHistory(); renderNow(); };
+    $('#selTextAlign').onchange = (e) => { clip.align = e.target.value; snapshotHistory(); renderNow(); };
+    $('#txtColor').oninput = (e) => { clip.color = e.target.value; renderNow(); };
+    $('#txtColor').onchange = () => snapshotHistory();
+    $('#txtStroke').oninput = (e) => { clip.strokeColor = e.target.value; renderNow(); };
+    $('#txtStroke').onchange = () => snapshotHistory();
+    $('#txtBg').oninput = (e) => { clip.bgColor = e.target.value; renderNow(); };
+    $('#txtBg').onchange = () => snapshotHistory();
+    $('#txtAnimIn').onchange = (e) => { clip.animIn = e.target.value; snapshotHistory(); renderNow(); };
+    $('#txtAnimOut').onchange = (e) => { clip.animOut = e.target.value; snapshotHistory(); renderNow(); };
+  }
+}
+
+function wireKeyframeButtons(container, clip, localT) {
+  const tol = 1 / Math.max(15, state.fps);
+  container.querySelectorAll('.kf-btn').forEach(btn => {
+    btn.onclick = () => {
+      const prop = btn.dataset.kf;
+      if (!clip.keyframes[prop]) clip.keyframes[prop] = [];
+      const idx = clip.keyframes[prop].findIndex(k => Math.abs(k.t - localT) <= tol);
+      if (idx >= 0) clip.keyframes[prop].splice(idx, 1);
+      else {
+        const fallback = prop.startsWith('mask') ? (clip.mask?.[prop.slice(4).toLowerCase()] ?? 0.5) : (clip[prop] ?? 1);
+        clip.keyframes[prop].push({ t: localT, v: evalKeyframe(clip, prop, localT, fallback), ease: clip.defaultEase || 'easeInOut' });
+      }
+      snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
     };
-    list.appendChild(row);
+  });
+  container.querySelectorAll('[data-kf-prev]').forEach(btn => {
+    btn.onclick = () => {
+      const list = (clip.keyframes?.[btn.dataset.kfPrev] || []).map(k => k.t).sort((a, b) => a - b);
+      const prev = [...list].reverse().find(kt => kt < localT - tol);
+      if (prev !== undefined) { state.currentTime = quantize(clip.start + prev); renderInspector(); renderNow(); }
+    };
+  });
+  container.querySelectorAll('[data-kf-next]').forEach(btn => {
+    btn.onclick = () => {
+      const list = (clip.keyframes?.[btn.dataset.kfNext] || []).map(k => k.t).sort((a, b) => a - b);
+      const next = list.find(kt => kt > localT + tol);
+      if (next !== undefined) { state.currentTime = quantize(clip.start + next); renderInspector(); renderNow(); }
+    };
   });
 }
 
-function parseSrt(srtText) {
-  const blocks = srtText.trim().replace(/\r/g, '').split(/\n\n+/);
-  const toSec = s => {
-    const m = s.match(/(\d+):(\d+):(\d+)[,.](\d+)/);
+// ── CAPTIONS (CC / SRT + EDITABLE START/END TIMESTAMPS) ─────────────────────
+function parseSRT(text) {
+  const blocks = text.replace(/\r/g, '').trim().split(/\n\n+/);
+  const toSec = (ts) => {
+    const m = ts.match(/(\d+):(\d+):(\d+)[,.](\d+)/);
     return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4]) / 1000 : 0;
   };
   const out = [];
   for (const b of blocks) {
-    const lines = b.split('\n');
-    const timeLine = lines.find(l => l.includes('-->'));
-    if (!timeLine) continue;
-    const [a, c] = timeLine.split('-->');
-    const txt = lines.slice(lines.indexOf(timeLine) + 1).join(' ').trim();
-    if (txt) out.push({ id: uid('cc'), start: toSec(a), end: toSec(c), text: txt });
+    const lines = b.split('\n').map(l => l.trim()).filter(Boolean);
+    const tsLine = lines.find(l => l.includes('-->'));
+    if (!tsLine) continue;
+    const [a, c] = tsLine.split('-->').map(s => s.trim());
+    const idx = lines.indexOf(tsLine);
+    out.push({ id: uid('cap'), start: quantize(toSec(a)), end: quantize(toSec(c)), text: lines.slice(idx + 1).join(' ') });
   }
   return out;
 }
 
-function exportSrtText() {
-  const fmtSrt = s => {
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sc = Math.floor(s % 60), ms = Math.round((s - Math.floor(s)) * 1000);
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+function toSRT(captions) {
+  const fmt = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    const ms = Math.round((sec - Math.floor(sec)) * 1000);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
   };
-  return state.captions.map((c, i) => `${i + 1}\n${fmtSrt(c.start)} --> ${fmtSrt(c.end)}\n${c.text}\n`).join('\n');
+  return captions.map((c, i) => `${i + 1}\n${fmt(c.start)} --> ${fmt(c.end)}\n${c.text}\n`).join('\n');
 }
 
-// ── MEDIA LIBRARY & PRESETS ─────────────────────────────────────────────────
+function addCaptionAtPlayhead() {
+  const st = quantize(state.currentTime);
+  const cap = { id: uid('cap'), start: st, end: quantize(st + 2.2), text: 'New caption line here' };
+  state.captions.push(cap);
+  state.captions.sort((a, b) => a.start - b.start);
+  state.selectedCaptionId = cap.id;
+  snapshotHistory();
+  renderTimeline();
+  renderCaptionsUI();
+  renderNow();
+}
+
+function renderCaptionsUI() {
+  const box = $('#captionList');
+  if (!state.captions.length) {
+    box.innerHTML = `<div class="drawer-tip">No captions yet. Click "+ Line" or import an .SRT file. Captions also appear on the purple CC lane in the timeline!</div>`;
+    return;
+  }
+  box.innerHTML = '';
+  state.captions.forEach((cap) => {
+    const row = document.createElement('div');
+    row.className = `caption-item ${state.selectedCaptionId === cap.id ? 'active' : ''}`;
+    row.innerHTML = `
+      <div class="caption-top">
+        <input class="cap-time-in" data-field="start" value="${cap.start.toFixed(2)}" title="Start time (seconds)" />
+        <span>→</span>
+        <input class="cap-time-in" data-field="end" value="${cap.end.toFixed(2)}" title="End time (seconds)" />
+        <button class="btn-micro" data-act="jump">Go</button>
+        <button class="btn-micro" data-act="del">✕</button>
+      </div>
+      <input class="cap-text-in" value="${escHtml(cap.text)}" />`;
+    const sIn = row.querySelector('[data-field="start"]');
+    const eIn = row.querySelector('[data-field="end"]');
+    sIn.onchange = () => {
+      const v = Number(sIn.value);
+      if (Number.isFinite(v) && v >= 0 && v < cap.end - 0.1) {
+        cap.start = quantize(v);
+        state.captions.sort((a, b) => a.start - b.start);
+        snapshotHistory(); renderTimeline(); renderCaptionsUI(); renderNow();
+      } else sIn.value = cap.start.toFixed(2);
+    };
+    eIn.onchange = () => {
+      const v = Number(eIn.value);
+      if (Number.isFinite(v) && v > cap.start + 0.1) {
+        cap.end = quantize(v);
+        snapshotHistory(); renderTimeline(); renderCaptionsUI(); renderNow();
+      } else eIn.value = cap.end.toFixed(2);
+    };
+    row.querySelector('[data-act="jump"]').onclick = () => { state.currentTime = quantize(cap.start); state.selectedCaptionId = cap.id; renderCaptionsUI(); renderNow(); };
+    row.querySelector('[data-act="del"]').onclick = () => {
+      state.captions = state.captions.filter(x => x.id !== cap.id);
+      snapshotHistory(); renderTimeline(); renderCaptionsUI(); renderNow();
+    };
+    const tIn = row.querySelector('.cap-text-in');
+    tIn.oninput = (e) => { cap.text = e.target.value; renderNow(); };
+    tIn.onchange = () => { snapshotHistory(); renderTimeline(); };
+    box.appendChild(row);
+  });
+}
+
+// ── LEFT DRAWERS (Safe Escaping, Click Select + Explicit Insert/Delete) ────
 function renderMediaLibrary() {
-  const grid = $('#mediaGrid'), aList = $('#audioList');
-  grid.innerHTML = ''; aList.innerHTML = '';
-  for (const item of state.library) {
-    if (item.type === 'audio') {
-      const row = document.createElement('div');
-      row.className = 'audio-row';
-      row.innerHTML = `<div class="audio-row-info"><div class="audio-row-name">${item.name}</div><div class="audio-row-dur">${fmtTC(item.duration)}</div></div><button class="btn-mini">+ Add</button>`;
-      row.querySelector('button').onclick = () => addMediaToTimeline(item, state.playhead);
-      aList.appendChild(row);
-    }
-    if (state.mediaFilter !== 'all' && item.type !== state.mediaFilter) continue;
+  const grid = $('#mediaGrid');
+  const audioList = $('#audioList');
+  grid.innerHTML = '';
+  audioList.innerHTML = '';
+  const filtered = state.library.filter(m => state.mediaFilter === 'all' || m.type === state.mediaFilter);
+
+  filtered.forEach(m => {
     const card = document.createElement('div');
-    card.className = 'media-card';
+    card.className = `media-card ${state.selectedMediaId === m.id ? 'selected' : ''}`;
     card.draggable = true;
-    card.ondragstart = e => e.dataTransfer.setData('application/x-motioncut-media', item.id);
     card.innerHTML = `
       <div class="media-thumb">
-        ${item.thumbUrl ? `<img src="${item.thumbUrl}" loading="lazy" />` : `<span class="audio-glyph">♫</span>`}
-        ${item.type === 'video' ? `<span class="media-res">${item.width}×${item.height}</span>` : ''}
-        <span class="media-badge">${fmtTC(item.duration)}</span>
+        ${m.thumbUrl ? `<img src="${escHtml(m.thumbUrl)}" alt="" />` : `<span style="font-size:22px;color:#00e5c3">♫</span>`}
+        <span class="media-kind">${escHtml(m.type)}</span>
+        <span class="media-dur">${formatTC(m.duration, state.fps)}</span>
         <button class="media-add-btn" title="Add to Timeline">+</button>
+        ${m.userAdded ? `<button class="media-del-btn" title="Remove from Library">✕</button>` : ''}
       </div>
-      <div class="media-meta"><div class="media-name" title="${item.name}">${item.name}</div></div>`;
-    card.onclick = () => addMediaToTimeline(item);
+      <div class="media-meta">
+        <div class="media-title" title="${escHtml(m.name)}">${escHtml(m.name)}</div>
+        <div class="media-sub">${m.type === 'audio' ? 'Audio' : `${m.width}×${m.height}`}</div>
+      </div>`;
+    card.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/motioncut-media-id', m.id);
+    });
+    card.onclick = () => { state.selectedMediaId = m.id; renderMediaLibrary(); };
+    card.ondblclick = () => addMediaToTimeline(m);
+    card.querySelector('.media-add-btn').onclick = (e) => { e.stopPropagation(); addMediaToTimeline(m); };
+    const delBtn = card.querySelector('.media-del-btn');
+    if (delBtn) {
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
+        await fetch(`/api/media/${encodeURIComponent(m.id)}`, { method: 'DELETE', headers: apiHeaders() });
+        state.library = state.library.filter(x => x.id !== m.id);
+        renderMediaLibrary();
+        showToast(`Removed "${m.name}" from library`);
+      };
+    }
     grid.appendChild(card);
-  }
-}
-
-function populatePresets() {
-  for (const sfx of SFX_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card';
-    c.innerHTML = `<div class="preset-swatch" style="background:#0d2825;color:#00e5c3">♫ ${sfx.dur}s</div><div class="preset-name">${sfx.name}</div>`;
-    c.onclick = () => {
-      const item = { id: uid('sfx'), name: sfx.name, type: 'audio', url: synthSfxWavUrl(sfx.id), duration: sfx.dur, hasAudio: true };
-      state.library.push(item); addMediaToTimeline(item, state.playhead);
-    };
-    $('#sfxGrid').appendChild(c);
-  }
-  for (const p of TEXT_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card';
-    c.innerHTML = `<div class="preset-swatch" style="background:#111319;color:${p.color};font-family:${p.font}">${p.text.split('\n')[0].slice(0, 12)}</div><div class="preset-name">${p.name}</div>`;
-    c.onclick = () => addTextClip(p);
-    $('#textPresetGrid').appendChild(c);
-  }
-  for (const g of GRAPHIC_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card';
-    c.innerHTML = `<div class="preset-swatch" style="background:${g.swatch};color:#00e5c3">${g.label}</div><div class="preset-name">${g.name}</div>`;
-    c.onclick = () => addGraphicClip(g);
-    $('#graphicsGrid').appendChild(c);
-  }
-  for (const ef of EFFECT_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card'; c.dataset.fxId = ef.id;
-    c.innerHTML = `<div class="preset-swatch" style="background:${ef.swatch};color:#fff">${ef.label}</div><div class="preset-name">${ef.name}</div>`;
-    c.onclick = () => {
-      const clip = getSelectedClip();
-      if (!clip || clip.type === 'audio' || clip.type === 'text') return toast('Select a video or image clip first');
-      clip.effects = clip.effects || {};
-      if (clip.effects[ef.id]) delete clip.effects[ef.id];
-      else clip.effects[ef.id] = 72;
-      snapshotHistory(); renderTimeline(); renderEffectIntensityPanel(); renderNow();
-    };
-    $('#effectsGrid').appendChild(c);
-  }
-  for (const tr of TRANSITION_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card';
-    c.innerHTML = `<div class="preset-swatch" style="background:#181d29;color:#00e5c3;font-size:18px">${tr.label}</div><div class="preset-name">${tr.name}</div>`;
-    c.onclick = () => {
-      const clip = getSelectedClip();
-      if (!clip) return toast('Select a clip first');
-      if (state.transSide === 'in') clip.transitionIn = tr.id; else clip.transitionOut = tr.id;
-      snapshotHistory(); renderTimeline(); renderNow();
-      toast(`Set ${state.transSide.toUpperCase()}: ${tr.name}`);
-    };
-    $('#transitionsGrid').appendChild(c);
-  }
-  for (const fl of FILTER_PRESETS) {
-    const c = document.createElement('div'); c.className = 'preset-card';
-    const cssF = `brightness(${fl.vals.brightness}%) contrast(${fl.vals.contrast}%) saturate(${fl.vals.saturate}%) hue-rotate(${fl.vals.hue}deg)`;
-    c.innerHTML = `<div class="preset-swatch" style="background:linear-gradient(135deg,#ff4d6d,#4c8dff,#00e5c3);filter:${cssF}"></div><div class="preset-name">${fl.name}</div>`;
-    c.onclick = () => {
-      const clip = getSelectedClip();
-      if (!clip || clip.type === 'audio' || clip.type === 'text') return toast('Select a video or image clip first');
-      Object.assign(clip, fl.vals);
-      snapshotHistory(); renderInspector(); renderNow();
-      toast(`Filter: ${fl.name}`);
-    };
-    $('#filtersGrid').appendChild(c);
-  }
-}
-
-// ── FULL ON-CANVAS INTERACTION (Select, Move, 4-Corner Scale, Rotate, Double-Click Text!) ──
-function setupCanvasInteraction() {
-  const ov = $('#overlayCanvas');
-  const toCanvasCoords = e => {
-    const rect = ov.getBoundingClientRect();
-    return [(e.clientX - rect.left) * (state.canvasWidth / rect.width), (e.clientY - rect.top) * (state.canvasHeight / rect.height), rect];
-  };
-
-  ov.addEventListener('mousemove', e => {
-    const [px, py] = toCanvasCoords(e);
-    const hit = engine.hitTestCanvas(px, py, state.selectedClipId);
-    ov.style.cursor = !hit ? 'default' : hit.mode === 'rotate' ? 'grab' : hit.mode === 'scale' ? 'nwse-resize' : 'move';
   });
 
-  ov.addEventListener('dblclick', e => {
-    const [px, py, rect] = toCanvasCoords(e);
-    const hit = engine.hitTestCanvas(px, py, state.selectedClipId);
-    if (!hit) return;
-    const clip = state.clips.find(c => c.id === hit.clipId);
-    if (!clip || clip.type !== 'text') return;
-    selectClip(clip.id);
-    const ed = $('#inlineTextEditor');
-    ed.value = clip.text || '';
-    ed.style.left = `${(hit.bounds.cx / state.canvasWidth) * rect.width}px`;
-    ed.style.top  = `${(hit.bounds.cy / state.canvasHeight) * rect.height}px`;
-    ed.classList.remove('hidden');
-    ed.focus(); ed.select();
-    const finish = () => {
-      clip.text = ed.value;
-      ed.classList.add('hidden');
+  state.library.filter(m => m.type === 'audio').forEach(m => {
+    const row = document.createElement('div');
+    row.className = 'audio-row';
+    row.innerHTML = `<div style="min-width:0"><div class="audio-row-name">${escHtml(m.name)}</div><div class="audio-row-dur">${formatTC(m.duration, state.fps)}</div></div><button class="btn-mini">+ Add</button>`;
+    row.querySelector('button').onclick = () => addMediaToTimeline(m, null, state.currentTime);
+    audioList.appendChild(row);
+  });
+}
+
+function renderEffectIntensityControls() {
+  const wrap = $('#effectIntensityWrap');
+  wrap.innerHTML = '';
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f || !f.clip.effects?.length) return;
+  f.clip.effects.forEach(fxId => {
+    const def = EFFECT_PRESETS.find(x => x.id === fxId);
+    const val = Math.round((f.clip.effectIntensity?.[fxId] ?? 0.65) * 100);
+    const row = document.createElement('div');
+    row.className = 'fx-active-row';
+    row.innerHTML = `
+      <div class="fx-active-top"><span>${escHtml(def?.name || fxId)}</span><span>${val}%</span></div>
+      <input type="range" class="prop-slider" min="10" max="100" value="${val}" ${f.track.locked ? 'disabled' : ''} />`;
+    const sl = row.querySelector('input');
+    sl.oninput = (e) => {
+      if (!f.clip.effectIntensity) f.clip.effectIntensity = {};
+      f.clip.effectIntensity[fxId] = Number(e.target.value) / 100;
+      row.querySelector('.fx-active-top span:last-child').textContent = `${e.target.value}%`;
+      renderNow();
+    };
+    sl.onchange = () => { sl.blur(); snapshotHistory(); };
+    wrap.appendChild(row);
+  });
+}
+
+function renderPresets() {
+  const sg = $('#sfxGrid'); sg.innerHTML = '';
+  SFX_PRESETS.forEach(p => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.innerHTML = `<div class="preset-preview" style="color:#00e5c3">♫</div><div class="preset-label">${escHtml(p.name)}</div>`;
+    b.onclick = () => addProceduralSfx(p);
+    sg.appendChild(b);
+  });
+
+  const tg = $('#textPresetGrid'); tg.innerHTML = '';
+  TEXT_PRESETS.forEach(p => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.innerHTML = `<div class="preset-preview" style="color:${p.color};font-size:13px">Aa</div><div class="preset-label">${escHtml(p.name)}</div>`;
+    b.onclick = () => addTextClip(p);
+    tg.appendChild(b);
+  });
+
+  const gg = $('#graphicsGrid'); gg.innerHTML = '';
+  GRAPHICS_PRESETS.forEach(p => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.innerHTML = `<div class="preset-preview" style="color:#ec5698;font-size:11px;font-family:var(--mono)">${escHtml(p.label)}</div><div class="preset-label">${escHtml(p.name)}</div>`;
+    b.onclick = () => addGraphicClip(p);
+    gg.appendChild(b);
+  });
+
+  const eg = $('#effectsGrid'); eg.innerHTML = '';
+  EFFECT_PRESETS.forEach(fx => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.dataset.fx = fx.id;
+    b.innerHTML = `<div class="preset-preview" style="font-size:10px;color:#00e5c3">${escHtml(fx.badge)}</div><div class="preset-label">${escHtml(fx.name)}</div>`;
+    b.onclick = () => {
+      const f = findClipAndTrack(state.selectedClipId);
+      if (!f || (f.clip.type !== 'video' && f.clip.type !== 'image')) return showToast('Select a video or image clip first');
+      if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+      if (!Array.isArray(f.clip.effects)) f.clip.effects = [];
+      const i = f.clip.effects.indexOf(fx.id);
+      if (i >= 0) f.clip.effects.splice(i, 1);
+      else { f.clip.effects.push(fx.id); f.clip.effectIntensity[fx.id] = 0.65; }
+      b.classList.toggle('active', f.clip.effects.includes(fx.id));
+      snapshotHistory(); renderTimeline(); renderEffectIntensityControls(); renderNow();
+    };
+    eg.appendChild(b);
+  });
+
+  const trg = $('#transitionsGrid'); trg.innerHTML = '';
+  TRANSITION_PRESETS.forEach(tr => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.innerHTML = `<div class="preset-preview" style="color:#00b8ff">⇄</div><div class="preset-label">${escHtml(tr.name)}</div>`;
+    b.onclick = () => {
+      const f = findClipAndTrack(state.selectedClipId);
+      if (!f || (f.clip.type !== 'video' && f.clip.type !== 'image')) return showToast('Select a video or image clip first');
+      if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+      if (state.transSide === 'in') {
+        f.clip.transIn = tr.id; f.clip.transInDur = tr.dur || 0.5;
+        // Warn user if preceding clip has tight source handle
+        const prev = f.track.clips.find(p => p.id !== f.clip.id && Math.abs((p.start + p.duration) - f.clip.start) <= 0.06);
+        if (prev && tr.id !== 'none') {
+          const remainingHandle = (prev.sourceDuration || prev.duration) - ((prev.trimStart || 0) + getClipSourceSpan(prev));
+          if (remainingHandle < f.clip.transInDur) {
+            showToast(`Applied ${tr.name} (note: outgoing clip handle is short; tail frame will hold smoothly)`);
+          } else {
+            showToast(`Applied A→B ${tr.name} (${f.clip.transInDur}s)`);
+          }
+        } else {
+          showToast(`Applied ${tr.name} (In)`);
+        }
+      } else {
+        f.clip.transOut = tr.id; f.clip.transOutDur = tr.dur || 0.5;
+        showToast(`Applied ${tr.name} (Out)`);
+      }
       snapshotHistory(); renderTimeline(); renderInspector(); renderNow();
     };
-    ed.onblur = finish;
-    ed.onkeydown = ev => { if (ev.key === 'Escape' || (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey))) ed.blur(); };
+    trg.appendChild(b);
   });
 
-  ov.addEventListener('mousedown', e => {
-    const [px, py] = toCanvasCoords(e);
-    const hit = engine.hitTestCanvas(px, py, state.selectedClipId);
-    if (!hit) { selectClip(null); return; }
-    selectClip(hit.clipId);
-    const clip = getSelectedClip();
-    if (!clip) return;
+  const fg = $('#filtersGrid'); fg.innerHTML = '';
+  LUT_FILTERS.forEach(lut => {
+    const b = document.createElement('button');
+    b.className = 'preset-card';
+    b.innerHTML = `<div class="preset-preview" style="width:36px;height:20px;border-radius:4px;background:linear-gradient(135deg,#00e5c3,#ff4f6d);filter:${lut.css}"></div><div class="preset-label">${escHtml(lut.name)}</div>`;
+    b.onclick = () => {
+      const f = findClipAndTrack(state.selectedClipId);
+      if (!f || (f.clip.type !== 'video' && f.clip.type !== 'image')) return showToast('Select a video or image clip first');
+      if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+      f.clip.filter = lut.id;
+      snapshotHistory(); renderInspector(); renderNow();
+      showToast(`Applied LUT: ${lut.name}`);
+    };
+    fg.appendChild(b);
+  });
+}
 
-    const localT = Math.max(0, Math.min(clip.duration, state.playhead - clip.start));
-    const origX = evalClipProp(clip, 'x', localT) || 0;
-    const origY = evalClipProp(clip, 'y', localT) || 0;
-    const origScale = evalClipProp(clip, 'scale', localT) ?? 100;
-    const origRot = evalClipProp(clip, 'rotation', localT) || 0;
-    const startDist = Math.max(20, Math.hypot(px - hit.bounds.cx, py - hit.bounds.cy));
-    const startAng = Math.atan2(py - hit.bounds.cy, px - hit.bounds.cx);
+// ── CANVAS INTERACTION (LOCK-SAFE, IN-PLACE INSPECTOR UPDATES, ESC CANCELS INLINE TEXT) ──
+let inlineEditorClip = null;
+let inlineEditorOrigText = '';
+let inlineCancelFlag = false;
 
-    const onMove = ev => {
-      const [cx, cy] = toCanvasCoords(ev);
-      if (hit.mode === 'move') {
-        let nx = origX + (cx - px), ny = origY + (cy - py);
-        engine.snapLines.x = Math.abs(nx) < 18;
-        engine.snapLines.y = Math.abs(ny) < 18;
-        if (engine.snapLines.x) nx = 0;
-        if (engine.snapLines.y) ny = 0;
-        setClipProp(clip, 'x', Math.round(nx));
-        setClipProp(clip, 'y', Math.round(ny));
-      } else if (hit.mode === 'scale') {
-        const dist = Math.max(10, Math.hypot(cx - hit.bounds.cx, cy - hit.bounds.cy));
-        const ns = Math.max(10, Math.min(350, Math.round(origScale * (dist / startDist))));
-        setClipProp(clip, 'scale', ns);
-      } else if (hit.mode === 'rotate') {
-        const ang = Math.atan2(cy - hit.bounds.cy, cx - hit.bounds.cx);
-        let deg = origRot + ((ang - startAng) * 180) / Math.PI;
-        if (Math.abs(deg % 90) < 4) deg = Math.round(deg / 90) * 90;
-        setClipProp(clip, 'rotation', Math.round(deg));
+function openInlineTextEditor(clip) {
+  const f = findClipAndTrack(clip.id);
+  if (f?.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+  const ed = $('#inlineTextEditor');
+  const shell = $('#canvasShell');
+  const scaleX = shell.clientWidth / state.canvasWidth;
+  const scaleY = shell.clientHeight / state.canvasHeight;
+  const box = engine.getClipBoundingBox(clip, state.currentTime);
+  inlineEditorClip = clip;
+  inlineEditorOrigText = clip.text || '';
+  inlineCancelFlag = false;
+
+  ed.value = clip.text || '';
+  ed.style.fontSize = `${Math.max(13, Math.round((clip.fontSize || 72) * scaleY))}px`;
+  ed.style.color = clip.color || '#ffffff';
+  ed.style.left = `${Math.max(8, (box.cx - box.w / 2) * scaleX)}px`;
+  ed.style.top = `${Math.max(8, (box.cy - box.h / 2) * scaleY)}px`;
+  ed.style.width = `${Math.max(140, Math.min(shell.clientWidth - 16, box.w * scaleX + 24))}px`;
+  ed.style.height = `${Math.max(44, box.h * scaleY + 18)}px`;
+  ed.classList.remove('hidden');
+  ed.focus();
+  ed.select();
+}
+
+function closeInlineTextEditor(commit = true) {
+  const ed = $('#inlineTextEditor');
+  if (!inlineEditorClip) return;
+  if (commit && !inlineCancelFlag) {
+    inlineEditorClip.text = ed.value;
+    snapshotHistory();
+    renderTimeline();
+    renderInspector();
+    renderNow();
+  } else {
+    inlineEditorClip.text = inlineEditorOrigText;
+    renderNow();
+  }
+  inlineEditorClip = null;
+  ed.classList.add('hidden');
+}
+
+$('#inlineTextEditor').addEventListener('input', (e) => {
+  if (inlineEditorClip) { inlineEditorClip.text = e.target.value; renderNow(); }
+});
+$('#inlineTextEditor').addEventListener('blur', () => closeInlineTextEditor(!inlineCancelFlag));
+$('#inlineTextEditor').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    inlineCancelFlag = true;
+    closeInlineTextEditor(false);
+    showToast('Cancelled text edit');
+  } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    closeInlineTextEditor(true);
+  }
+});
+
+function setupCanvasInteractions() {
+  const ov = $('#overlayCanvas');
+  const toCanvasXY = (e) => {
+    const r = ov.getBoundingClientRect();
+    return [(e.clientX - r.left) * (state.canvasWidth / r.width), (e.clientY - r.top) * (state.canvasHeight / r.height)];
+  };
+
+  ov.addEventListener('dblclick', (e) => {
+    const [px, py] = toCanvasXY(e);
+    const hit = engine.hitTestAnyClip(px, py, state.currentTime);
+    if (hit && hit.type === 'text') {
+      selectSingleClip(hit.id);
+      renderTimeline();
+      openInlineTextEditor(hit);
+    }
+  });
+
+  ov.addEventListener('mousedown', (e) => {
+    const [px, py] = toCanvasXY(e);
+    let hit = engine.hitTestGizmo(px, py, state.currentTime);
+    if (!hit) {
+      const any = engine.hitTestAnyClip(px, py, state.currentTime);
+      if (any) {
+        selectSingleClip(any.id);
+        renderTimeline();
+        renderInspector();
+        renderNow();
+        hit = { mode: 'move', clip: any, box: engine.getClipBoundingBox(any, state.currentTime) };
+      } else {
+        selectSingleClip(null);
+        renderTimeline();
+        renderInspector();
+        renderNow();
+        return;
       }
-      renderInspector();
+    }
+
+    const found = findClipAndTrack(hit.clip.id);
+    if (found?.track.locked) return showToast(`Track "${found.track.name}" is locked`);
+
+    const clip = hit.clip;
+    const localT = quantize(Math.max(0, state.currentTime - clip.start));
+    const origX = evalKeyframe(clip, 'x', localT, clip.x || 0);
+    const origY = evalKeyframe(clip, 'y', localT, clip.y || 0);
+    const origScale = evalKeyframe(clip, 'scale', localT, clip.scale ?? 1);
+    const origRot = evalKeyframe(clip, 'rotation', localT, clip.rotation || 0);
+    const startDist = Math.max(10, Math.hypot(px - hit.box.cx, py - hit.box.cy));
+    const startAngle = Math.atan2(py - hit.box.cy, px - hit.box.cx);
+    const W = state.canvasWidth, H = state.canvasHeight;
+    let changed = false;
+
+    const setVal = (prop, val) => {
+      const kfs = clip.keyframes?.[prop];
+      if (kfs && kfs.length > 0) {
+        const tol = 1 / Math.max(15, state.fps);
+        const ex = kfs.find(k => Math.abs(k.t - localT) <= tol);
+        if (ex) ex.v = val; else kfs.push({ t: localT, v: val, ease: clip.defaultEase || 'easeInOut' });
+      } else clip[prop] = val;
+    };
+
+    const onMove = (ev) => {
+      changed = true;
+      const [nx, ny] = toCanvasXY(ev);
+      engine.snapXGuide = null;
+      engine.snapYGuide = null;
+      if (hit.mode === 'move') {
+        let tx = origX + (nx - px);
+        let ty = origY + (ny - py);
+        // Snap to Center + Rule-of-Thirds guides
+        const snapXs = [0, -W / 6, W / 6];
+        const snapYs = [0, -H / 6, H / 6];
+        for (const sx of snapXs) {
+          if (Math.abs(tx - sx) < 16) { tx = sx; engine.snapXGuide = W / 2 + sx; break; }
+        }
+        for (const sy of snapYs) {
+          if (Math.abs(ty - sy) < 16) { ty = sy; engine.snapYGuide = H / 2 + sy; break; }
+        }
+        setVal('x', Math.round(tx));
+        setVal('y', Math.round(ty));
+      } else if (hit.mode === 'scale') {
+        const dist = Math.max(10, Math.hypot(nx - hit.box.cx, ny - hit.box.cy));
+        setVal('scale', Math.max(0.1, Math.min(4.0, origScale * (dist / startDist))));
+      } else if (hit.mode === 'rotate') {
+        const ang = Math.atan2(ny - hit.box.cy, nx - hit.box.cx);
+        let deg = origRot + ((ang - startAngle) * 180) / Math.PI;
+        for (const snapDeg of [0, 90, -90, 180, -180]) {
+          if (Math.abs(deg - snapDeg) < 4) deg = snapDeg;
+        }
+        setVal('rotation', Math.round(deg));
+      }
+      // Update inspector numeric fields in-place without rebuilding DOM!
+      syncTransformInputsInPlace(clip);
+      renderNow();
     };
     const onUp = () => {
-      engine.snapLines = { x: false, y: false };
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
-      snapshotHistory(); renderNow();
+      engine.snapXGuide = null;
+      engine.snapYGuide = null;
+      if (changed) { snapshotHistory(); renderInspector(); renderNow(); }
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   });
 }
 
-// ── SMART TOOLS & EXPORT ────────────────────────────────────────────────────
-async function uploadFiles(fileList) {
-  for (const file of fileList) {
-    toast(`Importing ${file.name}...`);
-    const resp = await fetch('/api/upload', { method: 'POST', headers: { 'X-Filename': encodeURIComponent(file.name) }, body: file });
-    const data = await resp.json();
-    if (data.item) { state.library.unshift(data.item); renderMediaLibrary(); toast(`Imported "${data.item.name}"`); }
-    else toast(`Import failed: ${data.error || 'Error'}`);
-  }
-}
-
+// ── SMART TOOLS ─────────────────────────────────────────────────────────────
 async function runAutoCrop() {
-  const clip = getSelectedClip();
-  if (!clip || clip.type !== 'video') return toast('Select a video clip on the timeline first');
-  toast('Running FFmpeg cropdetect...');
-  const resp = await fetch(`/api/cropdetect/${clip.mediaId}`);
-  const data = await resp.json();
-  if (!data.crop) return toast('No black bars detected');
-  const { w, h, x, y } = data.crop;
-  clip.cropLeft = Math.round((x / data.width) * 1000) / 10;
-  clip.cropRight = Math.round(((data.width - x - w) / data.width) * 1000) / 10;
-  clip.cropTop = Math.round((y / data.height) * 1000) / 10;
-  clip.cropBottom = Math.round(((data.height - y - h) / data.height) * 1000) / 10;
-  clip.fitMode = 'cover';
-  snapshotHistory(); renderInspector(); renderNow();
-  toast(`Auto-cropped to ${w}×${h} active content!`);
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f || f.clip.type !== 'video') return showToast('Select a video clip to auto-crop');
+  if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+  showToast('Running FFmpeg cropdetect...');
+  try {
+    const r = await fetch(`/api/cropdetect/${f.clip.mediaId}`);
+    const d = await r.json();
+    if (!r.ok || !d.crop) return showToast('Could not detect crop bounds');
+    if (!d.hasBars) {
+      return showToast(`No black bars detected — frame is already full ${d.width}×${d.height}`);
+    }
+    f.clip.cropRect = d.crop;
+    f.clip.fitMode = 'cover';
+    snapshotHistory(); renderInspector(); renderNow();
+    showToast(`Stripped letterbox bars -> ${d.crop.w}×${d.crop.h}`);
+  } catch (e) { showToast(`Auto-crop error: ${e.message}`); }
 }
 
 async function runVisionCutout() {
-  const clip = getSelectedClip();
-  if (!clip || (clip.type !== 'video' && clip.type !== 'image')) return toast('Select a video or image clip first');
-  const srcT = (clip.trimStart || 0) + Math.max(0, state.playhead - clip.start) * (clip.speed || 1);
-  toast('Running Apple Vision foreground cutout...');
-  const resp = await fetch(`/api/cutout/${clip.mediaId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ time: srcT }) });
-  const data = await resp.json();
-  if (!resp.ok || !data.item) return toast(`Cutout error: ${data.error || 'failed'}`);
-  state.library.unshift(data.item); renderMediaLibrary();
-  const ovTrack = state.tracks.find(t => t.id === 't_vid2') || state.tracks.find(t => t.type === 'video');
-  const c = makeDefaultClip(data.item, ovTrack.id, state.playhead);
-  state.clips.push(c); snapshotHistory(); selectClip(c.id);
-  toast('Added Apple Vision transparent cutout layer!');
+  const f = findClipAndTrack(state.selectedClipId);
+  if (!f || (f.clip.type !== 'video' && f.clip.type !== 'image')) return showToast('Select a video or image clip first');
+  showToast('Running macOS Apple Vision cutout...');
+  try {
+    const localT = Math.max(0, state.currentTime - f.clip.start);
+    const srcT = (f.clip.trimStart || 0) + localT * (f.clip.speed || 1);
+    const r = await fetch(`/api/cutout/${f.clip.mediaId}`, {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ time: srcT }),
+    });
+    const d = await r.json();
+    if (!r.ok) return showToast(d.error || 'Cutout failed');
+    state.library.push(d.item);
+    renderMediaLibrary();
+    addMediaToTimeline(d.item, null, state.currentTime);
+    showToast('Added transparent Vision Cutout PNG on overlay!');
+  } catch (e) { showToast(`Cutout error: ${e.message}`); }
 }
 
 async function runAutoBeats() {
-  const clip = getSelectedClip();
-  if (!clip) return toast('Select an audio or video clip');
-  toast('Detecting audio beats...');
-  const resp = await fetch(`/api/waveform/${clip.mediaId}?bins=120`);
-  const data = await resp.json();
-  if (!data.beats?.length) return toast('No beats detected');
-  const speed = clip.speed || 1;
-  const fresh = data.beats.map(b => clip.start + (b - (clip.trimStart || 0)) / speed).filter(t => t >= clip.start && t <= clip.start + clip.duration);
-  state.markers = [...new Set([...state.markers, ...fresh.map(v => Math.round(v * 100) / 100)])].sort((a, b) => a - b);
-  snapshotHistory(); renderTimeline();
-  toast(`Dropped ${fresh.length} beat markers onto timeline!`);
-}
-
-function computeExportSize() {
-  const ratioChoice = $('#expAspect').value, res = Number($('#expRes').value);
-  const ratio = ratioChoice === 'current' ? state.aspect : ratioChoice;
-  const map = { '16:9': [Math.round((res * 16) / 9), res], '9:16': [res, Math.round((res * 16) / 9)], '1:1': [res, res], '4:5': [res, Math.round((res * 5) / 4)], '21:9': [Math.round((res * 21) / 9), res] };
-  let [w, h] = map[ratio] || [1920, 1080];
-  return { width: Math.round(w / 2) * 2, height: Math.round(h / 2) * 2 };
-}
-
-async function startExport() {
-  if (!state.clips.length) return toast('Add at least one clip first');
-  togglePlay(false);
-  const btn = $('#btnExportStart'), progWrap = $('#exportProgressWrap'), progBar = $('#exportProgressBar'), progText = $('#exportStatusText'), resBox = $('#exportResultBox');
-  btn.disabled = true; progWrap.classList.remove('hidden'); resBox.classList.add('hidden');
-
-  const { width, height } = computeExportSize();
-  const fps = Number($('#expFps').value), crf = Number($('#expCrf').value);
-  const name = $('#expName').value.trim() || `motioncut_${Date.now()}`;
-  const mode = $('#expEngine').value;
-
+  const f = findClipAndTrack(state.selectedClipId);
+  const clip = f?.clip || state.tracks.flatMap(t => t.clips).find(c => c.mediaId && state.library.find(m => m.id === c.mediaId)?.hasAudio);
+  if (!clip) return showToast('Add an audio/video clip first');
+  showToast('Analyzing audio transients...');
   try {
-    let result;
-    if (mode === 'quick') {
-      const clip = getSelectedClip() || state.clips.find(c => c.type === 'video');
-      if (!clip || clip.type !== 'video') throw new Error('Select a video clip for Instant FFmpeg Reframe');
-      progBar.style.width = '45%'; progText.textContent = 'Running native FFmpeg hardware reframe...';
-      const media = state.library.find(m => m.id === clip.mediaId);
-      const cropRect = (clip.cropTop || clip.cropBottom || clip.cropLeft || clip.cropRight) ? {
-        x: Math.round((clip.cropLeft / 100) * media.width), y: Math.round((clip.cropTop / 100) * media.height),
-        w: Math.round(((100 - clip.cropLeft - clip.cropRight) / 100) * media.width), h: Math.round(((100 - clip.cropTop - clip.cropBottom) / 100) * media.height),
-      } : null;
-      const resp = await fetch('/api/quick-export', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaId: clip.mediaId, width, height, fps, crf, name, trimStart: clip.trimStart || 0, duration: clip.duration, fitMode: state.bgMode === 'blur' ? 'blur' : (clip.fitMode === 'cover' ? 'cover' : 'contain'), cropRect }),
-      });
-      result = await resp.json();
-      if (!resp.ok || !result.ok) throw new Error(result.error || 'Quick export failed');
-      progBar.style.width = '100%'; progText.textContent = 'Export complete!';
-    } else {
-      result = await engine.exportDeterministicMP4(state, { width, height, fps, crf, name }, (pct, msg) => {
-        progBar.style.width = `${pct}%`; progText.textContent = msg;
-      });
+    const r = await fetch(`/api/waveform/${clip.mediaId}?bins=200`);
+    const d = await r.json();
+    state.waveforms.set(clip.mediaId, d);
+    const newMarkers = (d.beats || [])
+      .filter(b => b >= (clip.trimStart || 0) && b <= (clip.trimStart || 0) + getClipSourceSpan(clip))
+      .map(b => quantize(clip.start + (b - (clip.trimStart || 0)) / (clip.speed || 1)));
+    state.markers = [...new Set([...state.markers, ...newMarkers])].sort((a, b) => a - b);
+    snapshotHistory(); renderTimeline();
+    showToast(`Dropped ${newMarkers.length} magnetic beat markers`);
+  } catch (e) { showToast(`Beat sync error: ${e.message}`); }
+}
+
+// ── RELINK MISSING MEDIA MODAL ──────────────────────────────────────────────
+function checkMissingMediaAndPrompt(manifest) {
+  const libIds = new Set(state.library.map(m => m.id));
+  const missingIds = new Set();
+  for (const tr of state.tracks) {
+    for (const c of tr.clips) {
+      if (c.mediaId && !libIds.has(c.mediaId)) missingIds.add(c.mediaId);
     }
-    const mb = (result.size / (1024 * 1024)).toFixed(2);
-    resBox.innerHTML = `
-      <div><strong>Exported ${result.fileName}</strong> (${result.width}×${result.height} · ${result.fps}fps · ${result.duration.toFixed(2)}s · ${mb} MB)</div>
-      <code>${result.filePath}</code>
-      <div><a href="${result.downloadUrl}?download=1" download="${result.fileName}">⬇ Download MP4</a> &nbsp;·&nbsp; <a href="${result.downloadUrl}" target="_blank">▶ Open in New Tab</a></div>`;
-    resBox.classList.remove('hidden');
-    toast('Studio MP4 Export Complete!');
-    await refreshLibrary();
-  } catch (err) {
-    progText.textContent = `Error: ${err.message}`;
-    toast(`Export failed: ${err.message}`, 4000);
-  } finally {
-    btn.disabled = false; fitPreviewCanvas(); renderNow();
+  }
+  if (!missingIds.size) return;
+
+  const list = $('#relinkList');
+  list.innerHTML = '';
+  for (const mid of missingIds) {
+    const info = manifest[mid] || { name: mid, type: 'media' };
+    const row = document.createElement('div');
+    row.className = 'relink-row';
+    row.innerHTML = `
+      <div><strong>${escHtml(info.name)}</strong><div class="media-sub">ID: ${escHtml(mid)}</div></div>
+      <div class="row-2" style="flex:0 0 auto">
+        <button class="btn-mini" data-pick="${escHtml(mid)}">Relink File...</button>
+      </div>`;
+    row.querySelector('[data-pick]').onclick = () => {
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.accept = 'video/*,audio/*,image/*';
+      inp.onchange = async () => {
+        const file = inp.files?.[0];
+        if (!file) return;
+        const r = await fetch('/api/upload', {
+          method: 'POST',
+          headers: apiHeaders({ 'X-Filename': encodeURIComponent(file.name) }),
+          body: file,
+        });
+        const d = await r.json();
+        if (!r.ok) return showToast(d.error || 'Relink upload failed');
+        state.library.push(d.item);
+        for (const tr of state.tracks) {
+          for (const c of tr.clips) {
+            if (c.mediaId === mid) { c.mediaId = d.item.id; c.sourceDuration = d.item.duration; }
+          }
+        }
+        row.innerHTML = `<span style="color:#00e5c3">✓ Relinked → ${escHtml(d.item.name)}</span>`;
+        snapshotHistory(); renderMediaLibrary(); renderTimeline(); renderNow();
+      };
+      inp.click();
+    };
+    list.appendChild(row);
+  }
+  $('#relinkModal').classList.remove('hidden');
+}
+
+// ── EXPORT MODAL (SEPARATE MODES, PROJECT FPS DEFAULT, LIVE ETA & CANCEL) ───
+function getExportDims() {
+  const aspectVal = $('#expAspect').value;
+  const res = Number($('#expRes').value);
+  const ratioStr = aspectVal === 'current' ? state.aspect : aspectVal;
+  const [rw, rh] = ratioStr.split(':').map(Number);
+  let w, h;
+  if (rw >= rh) { h = res; w = Math.round((res * rw) / rh / 2) * 2; }
+  else { w = res; h = Math.round((res * rh) / rw / 2) * 2; }
+  return { width: w, height: h, ratioStr };
+}
+
+function updateExportSummary() {
+  const { width, height, ratioStr } = getExportDims();
+  const fps = Number($('#expFps').value);
+  const dur = getProjectDuration();
+  const sum = $('#exportSummaryLine');
+  if (state.exportMode === 'deterministic') {
+    const frames = Math.max(1, Math.round(Math.max(1 / fps, dur) * fps));
+    sum.textContent = `Timeline Render: ${width}×${height} (${ratioStr}) · ${fps}fps · ${dur.toFixed(2)}s (${frames} frames) · Multi-track H.264/AAC`;
+  } else {
+    const f = findClipAndTrack(state.selectedClipId);
+    sum.textContent = f && f.clip.type === 'video'
+      ? `Quick Reframe: "${f.clip.name}" → ${width}×${height} (${ratioStr}) · ${fps}fps direct FFmpeg (~2s)`
+      : `Quick Reframe requires selecting a video clip on the timeline.`;
   }
 }
 
-function setTool(mode) {
-  state.tool = mode;
-  $('#btnToolSelect').classList.toggle('active', mode === 'select');
-  $('#btnToolRazor').classList.toggle('active', mode === 'razor');
-  $('#timelineScroll').classList.toggle('razor-mode', mode === 'razor');
+async function runExport() {
+  const { width, height } = getExportDims();
+  const fps = Number($('#expFps').value);
+  const crf = Number($('#expCrf').value);
+  const name = $('#expName').value.trim() || `motioncut_${Date.now()}`;
+  const progWrap = $('#exportProgressWrap');
+  const progBar = $('#exportProgressBar');
+  const progText = $('#exportStatusText');
+  const resBox = $('#exportResultBox');
+  const startBtn = $('#btnExportStart');
+  const cancelBtn = $('#btnExportCancel');
+
+  progWrap.classList.remove('hidden');
+  resBox.classList.add('hidden');
+  startBtn.disabled = true;
+  cancelBtn.textContent = 'Cancel Export';
+  progBar.style.width = '3%';
+  progText.textContent = 'Starting studio FFmpeg render...';
+
+  try {
+    let data;
+    if (state.exportMode === 'quick') {
+      const f = findClipAndTrack(state.selectedClipId);
+      const vidClip = (f && f.clip.type === 'video') ? f.clip : state.tracks.flatMap(t => t.clips).find(c => c.type === 'video');
+      if (!vidClip) throw new Error('Select a video clip for Quick Reframe');
+      progBar.style.width = '45%';
+      const r = await fetch('/api/quick-export', {
+        method: 'POST',
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          mediaId: vidClip.mediaId, width, height, fps, crf, name,
+          fitMode: vidClip.fitMode || 'cover',
+          trimStart: vidClip.trimStart || 0,
+          duration: vidClip.duration,
+          cropRect: vidClip.cropRect,
+        }),
+      });
+      data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Quick export failed');
+      progBar.style.width = '100%';
+    } else {
+      data = await engine.exportDeterministicMP4({
+        width, height, fps, crf, name,
+        onProgress: (pct, msg) => {
+          progBar.style.width = `${pct}%`;
+          progText.textContent = msg;
+        },
+      });
+    }
+
+    resBox.innerHTML = `
+      <div><strong>✓ Exported:</strong> ${escHtml(data.fileName)}</div>
+      <div>${data.width}×${data.height} · ${data.fps} fps · ${Number(data.duration).toFixed(2)}s · ${(data.size / 1024 / 1024).toFixed(2)} MB</div>
+      <div><a href="${escHtml(data.downloadUrl)}?download=1" download="${escHtml(data.fileName)}">Download MP4</a></div>`;
+    resBox.classList.remove('hidden');
+    showToast(`Exported ${data.fileName}`);
+    await refreshLibrary();
+  } catch (err) {
+    if (String(err.message).toLowerCase().includes('cancel') || err.name === 'AbortError') {
+      progText.textContent = 'Export cancelled and cleaned up.';
+      showToast('Export cancelled');
+    } else {
+      progText.textContent = `Error: ${err.message}`;
+      showToast(`Export error: ${err.message}`);
+    }
+  } finally {
+    startBtn.disabled = false;
+    cancelBtn.textContent = 'Close';
+  }
 }
 
-// ── UI WIRING & SHORTCUTS ───────────────────────────────────────────────────
-function setupUI() {
-  $$('.rail-btn').forEach(btn => {
+async function closeOrCancelExportModal() {
+  if (engine.isExporting) {
+    await engine.cancelExport();
+    return;
+  }
+  $('#exportModal').classList.add('hidden');
+}
+
+// ── SPLITTER + SIDEBAR COLLAPSE + PLAYHEAD-ANCHORED ZOOM ────────────────────
+function setupSplitter() {
+  const sp = $('#timelineSplitter');
+  const dock = $('#timelineDock');
+  sp.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    sp.classList.add('dragging');
+    const startY = e.clientY;
+    const startH = dock.getBoundingClientRect().height;
+    const onMove = (ev) => {
+      const nextH = Math.max(170, Math.min(window.innerHeight - 230, startH - (ev.clientY - startY)));
+      dock.style.height = `${nextH}px`;
+      dock.style.flexBasis = `${nextH}px`;
+    };
+    const onUp = () => {
+      sp.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+}
+
+function setZoomAnchored(nextZoom) {
+  const clamped = Math.max(20, Math.min(260, Math.round(nextZoom)));
+  const scroll = $('#timelineScroll');
+  const oldPlayheadPx = state.currentTime * state.zoom;
+  const playheadViewportOffset = oldPlayheadPx - scroll.scrollLeft;
+  state.zoom = clamped;
+  $('#zoomSlider').value = String(clamped);
+  renderTimeline();
+  // Keep playhead visually anchored in viewport when zooming!
+  const newPlayheadPx = state.currentTime * state.zoom;
+  if (playheadViewportOffset >= 0 && playheadViewportOffset <= scroll.clientWidth) {
+    scroll.scrollLeft = Math.max(0, newPlayheadPx - playheadViewportOffset);
+  }
+}
+
+function setActiveTool(tool) {
+  state.activeTool = tool;
+  $('#btnToolSelect').classList.toggle('active', tool === 'select');
+  $('#btnToolRazor').classList.toggle('active', tool === 'razor');
+  $('#timelineScroll').classList.toggle('razor-mode', tool === 'razor');
+}
+
+function updateCanvasResBadge() {
+  const shell = $('#canvasShell');
+  shell.style.aspectRatio = `${state.canvasWidth} / ${state.canvasHeight}`;
+  $('#previewCanvas').width = state.canvasWidth;
+  $('#previewCanvas').height = state.canvasHeight;
+  $('#overlayCanvas').width = state.canvasWidth;
+  $('#overlayCanvas').height = state.canvasHeight;
+  $('#canvasResBadge').textContent = `${state.canvasWidth} × ${state.canvasHeight} · ${state.aspect}`;
+}
+
+function saveProjectJSON() {
+  const payload = buildProjectPayload();
+  const jsonStr = JSON.stringify(payload, null, 2);
+  try { localStorage.setItem(AUTOSAVE_KEY, jsonStr); setSaveStatus('Saved'); } catch {}
+  // Also backup on server quietly
+  fetch('/api/projects', {
+    method: 'POST',
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+    body: jsonStr,
+  }).catch(() => {});
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${state.title || 'motioncut'}.mcut.json`;
+  a.click();
+  showToast('Project saved (.mcut.json + autosave)');
+}
+
+function startNewProject() {
+  if (state.playing) togglePlay(false);
+  state.title = 'Untitled_Project';
+  state.aspect = '16:9';
+  state.canvasWidth = 1920;
+  state.canvasHeight = 1080;
+  state.fps = 30;
+  state.bgMode = 'black';
+  state.currentTime = 0;
+  state.tracks = makeEmptyTracks();
+  state.captions = [];
+  state.markers = [];
+  state.selectedClipId = null;
+  state.selectedClipIds.clear();
+  state.selectedCaptionId = null;
+  $('#projectTitle').value = state.title;
+  $('#fpsSelect').value = '30';
+  $$('#aspectGroup .aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.ratio === '16:9'));
+  updateCanvasResBadge();
+  engine.pruneUnusedElements();
+  snapshotHistory();
+  renderTimeline();
+  renderCaptionsUI();
+  renderInspector();
+  renderNow();
+  showToast('Started new clean project');
+}
+
+function loadStarterDemo() {
+  if (state.playing) togglePlay(false);
+  state.tracks = makeEmptyTracks();
+  state.captions = [];
+  state.markers = [];
+  state.currentTime = 0;
+  state.title = 'Scanner_16x9_Edit';
+  $('#projectTitle').value = state.title;
+  const starter = state.library.find(m => m.name.includes('16:9')) || state.library.find(m => m.type === 'video');
+  if (starter) {
+    addMediaToTimeline(starter, 't_vid1', 0);
+    state.currentTime = 0;
+    renderNow();
+    showToast(`Loaded demo: ${starter.name}`);
+  } else {
+    snapshotHistory();
+    renderTimeline();
+    showToast('No sample videos found — import media to begin');
+  }
+}
+
+// ── WIRE UI EVENTS & KEYBOARD SHORTCUTS ─────────────────────────────────────
+function setupUIEvents() {
+  setupSplitter();
+  setupCanvasInteractions();
+
+  // Collapsible side panels
+  $('#btnToggleLeft').onclick = () => {
+    const collapsed = $('#leftPanel').classList.toggle('collapsed');
+    $('#btnToggleLeft').classList.toggle('active', collapsed);
+  };
+  $('#btnToggleRight').onclick = () => {
+    const collapsed = $('#rightPanel').classList.toggle('collapsed');
+    $('#btnToggleRight').classList.toggle('active', collapsed);
+  };
+
+  $('#projectTitle').oninput = (e) => { state.title = e.target.value; setSaveStatus('Unsaved', 'dirty'); };
+  $('#projectTitle').onchange = () => snapshotHistory();
+  $('#btnNewProject').onclick = startNewProject;
+  $('#btnLoadDemo').onclick = loadStarterDemo;
+
+  $$('#toolRail .rail-btn').forEach(btn => {
     btn.onclick = () => {
-      $$('.rail-btn').forEach(b => b.classList.remove('active'));
+      $('#leftPanel').classList.remove('collapsed');
+      $$('#toolRail .rail-btn').forEach(b => b.classList.remove('active'));
       $$('.drawer-pane').forEach(p => p.classList.remove('active'));
-      btn.classList.add('active'); $(`#pane-${btn.dataset.tab}`).classList.add('active');
+      btn.classList.add('active');
+      $(`#pane-${btn.dataset.tab}`).classList.add('active');
+      if (btn.dataset.tab === 'effects') renderEffectIntensityControls();
+      if (btn.dataset.tab === 'captions') renderCaptionsUI();
     };
-  });
-  $$('.insp-tab').forEach(btn => {
-    btn.onclick = () => { state.activeInspectorTab = btn.dataset.itab; syncInspectorTabUI(); renderInspector(); };
-  });
-  $$('#mediaFilterChips .chip').forEach(btn => {
-    btn.onclick = () => {
-      $$('#mediaFilterChips .chip').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active'); state.mediaFilter = btn.dataset.filter; renderMediaLibrary();
-    };
-  });
-  $$('.aspect-btn').forEach(btn => {
-    btn.onclick = () => {
-      state.aspect = btn.dataset.ratio; state.canvasWidth = Number(btn.dataset.w); state.canvasHeight = Number(btn.dataset.h);
-      updateAspectUI(); snapshotHistory(); renderNow();
-      toast(`Canvas ${state.aspect} (${state.canvasWidth}×${state.canvasHeight})`);
-    };
-  });
-  $('#fpsSelect').onchange = e => { state.fps = Number(e.target.value); };
-  $$('.bg-mode-btn').forEach(btn => {
-    btn.onclick = () => {
-      $$('.bg-mode-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active'); state.bgMode = btn.dataset.bg; snapshotHistory(); renderNow();
-    };
-  });
-  $$('[data-trans-side]').forEach(btn => {
-    btn.onclick = () => { $$('[data-trans-side]').forEach(b => b.classList.remove('active')); btn.classList.add('active'); state.transSide = btn.dataset.transSide; };
   });
 
-  // Captions tab wiring
-  $('#btnAddCaptionAtPlayhead').onclick = () => {
-    state.captions.push({ id: uid('cc'), start: Math.round(state.playhead * 100) / 100, end: Math.round((state.playhead + 2.2) * 100) / 100, text: 'Type your caption here' });
-    snapshotHistory(); renderCaptionsList(); renderNow();
-  };
-  $$('#captionStyleRow .btn-mini').forEach(b => b.onclick = () => {
-    $$('#captionStyleRow .btn-mini').forEach(x => x.classList.remove('active'));
-    b.classList.add('active'); state.captionStyle = b.dataset.cstyle; snapshotHistory(); renderNow();
+  $$('#mediaFilterChips .chip').forEach(ch => {
+    ch.onclick = () => {
+      state.mediaFilter = ch.dataset.filter;
+      $$('#mediaFilterChips .chip').forEach(x => x.classList.toggle('active', x === ch));
+      renderMediaLibrary();
+    };
   });
-  $('#btnImportSrt').onclick = () => $('#srtFileInput').click();
-  $('#srtFileInput').onchange = async e => {
-    const f = e.target.files?.[0]; if (!f) return;
-    const parsed = parseSrt(await f.text());
-    state.captions.push(...parsed);
-    snapshotHistory(); renderCaptionsList(); renderNow();
-    toast(`Imported ${parsed.length} captions from ${f.name}`);
-    e.target.value = '';
+
+  $$('#inspectorTabs .insp-tab').forEach(btn => {
+    btn.onclick = () => { state.activeInspectorTab = btn.dataset.itab; renderInspector(); };
+  });
+
+  $$('#aspectGroup .aspect-btn').forEach(btn => {
+    btn.onclick = () => {
+      state.aspect = btn.dataset.ratio;
+      state.canvasWidth = Number(btn.dataset.w);
+      state.canvasHeight = Number(btn.dataset.h);
+      $$('#aspectGroup .aspect-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      updateCanvasResBadge();
+      snapshotHistory();
+      renderNow();
+    };
+  });
+
+  $('#fpsSelect').onchange = (e) => { state.fps = Number(e.target.value); snapshotHistory(); renderTimeline(); renderNow(); };
+  $$('.trans-target-row .seg-btn').forEach(b => {
+    b.onclick = () => {
+      state.transSide = b.dataset.transSide;
+      $$('.trans-target-row .seg-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+    };
+  });
+
+  $$('.bg-mode-btn').forEach(b => {
+    b.onclick = () => {
+      state.bgMode = b.dataset.bg;
+      $$('.bg-mode-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      snapshotHistory(); renderNow();
+    };
+  });
+
+  // Editable timecode input
+  $('#timecodeInput').onchange = () => {
+    const parsed = parseTC($('#timecodeInput').value, state.fps);
+    if (parsed !== null) {
+      state.currentTime = quantize(Math.max(0, Math.min(getTimelineViewDuration(), parsed)));
+      renderNow();
+    } else {
+      $('#timecodeInput').value = formatTC(state.currentTime, state.fps);
+    }
+    $('#timecodeInput').blur();
   };
-  $('#btnExportSrt').onclick = () => {
-    if (!state.captions.length) return toast('No captions to export');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([exportSrtText()], { type: 'text/plain' }));
-    a.download = `${$('#projectTitle').value || 'captions'}.srt`; a.click();
-    toast('Exported .SRT file');
+
+  // Upload & Import
+  $('#btnUploadTrigger').onclick = () => $('#mediaUploadInput').click();
+  const handleFiles = async (files) => {
+    for (const file of files) {
+      showToast(`Uploading ${file.name}...`);
+      const r = await fetch('/api/upload', {
+        method: 'POST',
+        headers: apiHeaders({ 'X-Filename': encodeURIComponent(file.name) }),
+        body: file,
+      });
+      const d = await r.json();
+      if (r.ok && d.item) {
+        if (!state.library.find(m => m.id === d.item.id)) state.library.push(d.item);
+        renderMediaLibrary();
+        showToast(`Imported ${d.item.name}`);
+      } else showToast(d.error || 'Upload failed');
+    }
   };
-  $('#btnClearEffects').onclick = () => {
-    const clip = getSelectedClip(); if (!clip) return;
-    clip.effects = {}; snapshotHistory(); renderTimeline(); renderEffectIntensityPanel(); renderNow();
+  $('#mediaUploadInput').onchange = (e) => { handleFiles(e.target.files); e.target.value = ''; };
+  const dz = $('#dropZone');
+  dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('dragover'); };
+  dz.ondragleave = () => dz.classList.remove('dragover');
+  dz.ondrop = (e) => { e.preventDefault(); dz.classList.remove('dragover'); if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files); };
+
+  $('#btnImportPath').onclick = async () => {
+    const p = $('#localPathInput').value.trim();
+    if (!p) return;
+    const r = await fetch('/api/import-path', {
+      method: 'POST',
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ path: p }),
+    });
+    const d = await r.json();
+    if (!r.ok) return showToast(d.error || 'Path import failed');
+    if (!state.library.find(m => m.id === d.item.id)) state.library.push(d.item);
+    $('#localPathInput').value = '';
+    renderMediaLibrary();
+    addMediaToTimeline(d.item);
+    showToast(`Imported ${d.item.name}`);
   };
 
   // Transport
   $('#btnPlayPause').onclick = () => togglePlay();
-  $('#btnJumpStart').onclick = () => { state.playhead = 0; renderNow(); };
-  $('#btnJumpEnd').onclick = () => { state.playhead = state.getProjectDuration(); renderNow(); };
-  $('#btnStepBack').onclick = () => { togglePlay(false); state.playhead = Math.max(0, state.playhead - 1 / state.fps); renderNow(); };
-  $('#btnStepFwd').onclick = () => { togglePlay(false); state.playhead = Math.min(state.getProjectDuration(), state.playhead + 1 / state.fps); renderNow(); };
-  $('#btnLoop').onclick = e => { state.loop = !state.loop; e.currentTarget.classList.toggle('active', state.loop); };
-  $('#btnMasterMute').onclick = e => { state.masterMute = !state.masterMute; e.currentTarget.textContent = state.masterMute ? '🔇' : '🔊'; renderNow(); };
-  $('#btnFullscreen').onclick = () => { const el = $('#canvasShell'); if (document.fullscreenElement) document.exitFullscreen(); else el.requestFullscreen?.(); };
-  $('#btnFitPreview').onclick = e => { engine.showGuides = !engine.showGuides; e.currentTarget.classList.toggle('active', engine.showGuides); renderNow(); };
-  $('#btnSnapshot').onclick = () => { const a = document.createElement('a'); a.href = $('#previewCanvas').toDataURL('image/png'); a.download = `frame_${fmtTC(state.playhead).replace(/[:.]/g, '-')}.png`; a.click(); toast('Saved frame PNG'); };
+  $('#btnJumpStart').onclick = () => { state.currentTime = 0; renderNow(); };
+  $('#btnJumpEnd').onclick = () => { state.currentTime = quantize(getProjectDuration()); renderNow(); };
+  $('#btnStepBack').onclick = () => { state.currentTime = quantize(Math.max(0, state.currentTime - 1 / state.fps)); renderNow(); };
+  $('#btnStepFwd').onclick = () => { state.currentTime = quantize(state.currentTime + 1 / state.fps); renderNow(); };
+  $('#btnLoop').onclick = (e) => { state.loop = !state.loop; e.currentTarget.classList.toggle('active', state.loop); };
+  $('#btnMasterMute').onclick = (e) => { state.masterMuted = !state.masterMuted; e.currentTarget.textContent = state.masterMuted ? '🔇' : '🔊'; renderNow(); };
+  $('#btnFitPreview').onclick = (e) => { state.showGuides = !state.showGuides; e.currentTarget.classList.toggle('active', state.showGuides); renderNow(); };
+  $('#btnFullscreen').onclick = () => { if (!document.fullscreenElement) $('#viewportStage').requestFullscreen?.(); else document.exitFullscreen?.(); };
+  $('#btnSnapshot').onclick = () => {
+    const a = document.createElement('a');
+    a.href = $('#previewCanvas').toDataURL('image/png');
+    a.download = `${state.title || 'frame'}_${Math.round(state.currentTime * 100)}.png`;
+    a.click();
+    showToast('Saved frame snapshot PNG');
+  };
 
-  // Timeline toolbar & Splitter
-  $('#btnToolSelect').onclick = () => setTool('select');
-  $('#btnToolRazor').onclick = () => setTool('razor');
+  // Timeline Toolbar
+  $('#btnToolSelect').onclick = () => setActiveTool('select');
+  $('#btnToolRazor').onclick = () => setActiveTool('razor');
   $('#btnUndo').onclick = undo;
   $('#btnRedo').onclick = redo;
   $('#btnSplit').onclick = splitSelectedClip;
   $('#btnDuplicate').onclick = duplicateSelectedClip;
   $('#btnFreeze').onclick = freezeFrameAtPlayhead;
   $('#btnDetachAudio').onclick = detachAudioFromSelected;
-  $('#btnRippleDelete').onclick = () => deleteSelectedClip(true);
-  $('#btnDelete').onclick = () => deleteSelectedClip(false);
-  $('#btnAddMarker').onclick = () => { state.markers.push(Math.round(state.playhead * 100) / 100); snapshotHistory(); renderTimeline(); toast(`Marker @ ${fmtTC(state.playhead)}`); };
-  $('#btnToggleSnap').onclick = e => { state.snap = !state.snap; e.currentTarget.classList.toggle('active', state.snap); };
-  $('#btnAddTrackV').onclick = () => { const n = state.tracks.filter(t => t.type === 'video').length + 1; state.tracks.splice(1, 0, { id: uid('tv'), name: `Overlay ${n - 1}`, type: 'video', muted: false, hidden: false, locked: false }); snapshotHistory(); renderTimeline(); };
-  $('#btnAddTrackA').onclick = () => { const n = state.tracks.filter(t => t.type === 'audio').length + 1; state.tracks.push({ id: uid('ta'), name: `Audio ${n}`, type: 'audio', muted: false, hidden: false, locked: false }); snapshotHistory(); renderTimeline(); };
-  $('#zoomSlider').oninput = e => { state.pxPerSec = Number(e.target.value); renderTimeline(); };
-  $('#btnZoomOut').onclick = () => { state.pxPerSec = Math.max(20, state.pxPerSec - 16); $('#zoomSlider').value = state.pxPerSec; renderTimeline(); };
-  $('#btnZoomIn').onclick = () => { state.pxPerSec = Math.min(240, state.pxPerSec + 16); $('#zoomSlider').value = state.pxPerSec; renderTimeline(); };
-  $('#btnZoomFit').onclick = () => { state.pxPerSec = Math.max(20, Math.min(240, Math.floor(Math.max(300, $('#timelineScroll').clientWidth - 40) / Math.max(5, state.getProjectDuration())))); $('#zoomSlider').value = state.pxPerSec; renderTimeline(); };
+  $('#btnRippleDelete').onclick = () => deleteSelectedClips(true);
+  $('#btnDelete').onclick = () => deleteSelectedClips(false);
+  $('#btnAddMarker').onclick = () => {
+    const t = quantize(state.currentTime);
+    if (!state.markers.includes(t)) state.markers.push(t);
+    state.markers.sort((a, b) => a - b);
+    snapshotHistory(); drawRuler();
+    showToast(`Marker at ${formatTC(t, state.fps)}`);
+  };
+  $('#btnClearMarkers').onclick = () => { state.markers = []; snapshotHistory(); drawRuler(); showToast('Cleared all markers'); };
+  $('#btnToggleSnap').onclick = (e) => { state.snap = !state.snap; e.currentTarget.classList.toggle('active', state.snap); };
+  $('#btnToggleMagnet').onclick = (e) => {
+    state.magnetMain = !state.magnetMain;
+    e.currentTarget.classList.toggle('active', state.magnetMain);
+    if (state.magnetMain) { compactMainTrackIfMagnetic(); snapshotHistory(); renderTimeline(); renderNow(); }
+  };
+  $('#btnToggleLinked').onclick = (e) => { state.linkedSelection = !state.linkedSelection; e.currentTarget.classList.toggle('active', state.linkedSelection); };
 
-  // Draggable vertical timeline splitter
-  const sp = $('#timelineSplitter'), dock = $('#timelineDock');
-  sp.onmousedown = e => {
-    sp.classList.add('dragging');
-    const startY = e.clientY, startH = dock.offsetHeight;
-    const onMove = ev => { dock.style.height = `${Math.max(170, Math.min(window.innerHeight * 0.6, startH - (ev.clientY - startY)))}px`; fitPreviewCanvas(); };
-    const onUp = () => { sp.classList.remove('dragging'); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  $('#btnAddTrackV').onclick = () => {
+    const n = state.tracks.filter(t => t.type === 'overlay' || t.type === 'video').length + 1;
+    state.tracks.unshift({ id: uid('tr'), name: `Overlay V${n}`, type: 'overlay', color: '#7c5dfa', muted: false, hidden: false, locked: false, clips: [] });
+    snapshotHistory(); renderTimeline();
+  };
+  $('#btnAddTrackT').onclick = () => {
+    const n = state.tracks.filter(t => t.type === 'text').length + 1;
+    state.tracks.unshift({ id: uid('tr'), name: `Text T${n}`, type: 'text', color: '#f09b3a', muted: false, hidden: false, locked: false, clips: [] });
+    snapshotHistory(); renderTimeline();
+  };
+  $('#btnAddTrackA').onclick = () => {
+    const n = state.tracks.filter(t => t.type === 'audio').length + 1;
+    state.tracks.push({ id: uid('tr'), name: `Audio A${n}`, type: 'audio', color: '#1fc496', muted: false, hidden: false, locked: false, clips: [] });
+    snapshotHistory(); renderTimeline();
   };
 
-  // Context menu actions
-  $('#clipContextMenu').querySelectorAll('button').forEach(btn => {
-    btn.onclick = () => {
-      const act = btn.dataset.act, clip = getSelectedClip();
-      closeContextMenu();
-      if (!clip) return;
-      if (act === 'split') splitSelectedClip();
-      else if (act === 'duplicate') duplicateSelectedClip();
-      else if (act === 'copyAttrs') {
-        state.copiedAttrs = { brightness: clip.brightness, contrast: clip.contrast, saturate: clip.saturate, hue: clip.hue, blur: clip.blur, vignette: clip.vignette, effects: JSON.parse(JSON.stringify(clip.effects || {})), blendMode: clip.blendMode };
-        toast('Copied clip style & color');
-      } else if (act === 'pasteAttrs') {
-        if (!state.copiedAttrs) return toast('Copy attributes from a clip first');
-        Object.assign(clip, JSON.parse(JSON.stringify(state.copiedAttrs)));
-        snapshotHistory(); renderTimeline(); renderInspector(); renderEffectIntensityPanel(); renderNow();
-        toast('Pasted style & color');
-      } else if (act === 'autoCrop') runAutoCrop();
-      else if (act === 'freeze') freezeFrameAtPlayhead();
-      else if (act === 'detach') detachAudioFromSelected();
-      else if (act === 'rippleDelete') deleteSelectedClip(true);
-      else if (act === 'delete') deleteSelectedClip(false);
-    };
+  $('#zoomSlider').oninput = (e) => setZoomAnchored(Number(e.target.value));
+  $('#zoomSlider').onchange = (e) => e.target.blur();
+  $('#btnZoomIn').onclick = () => setZoomAnchored(state.zoom + 24);
+  $('#btnZoomOut').onclick = () => setZoomAnchored(state.zoom - 24);
+  $('#btnZoomFit').onclick = () => {
+    const avail = Math.max(300, $('#timelineScroll').clientWidth - 40);
+    setZoomAnchored(avail / Math.max(4, getProjectDuration() + 1));
+  };
+
+  // Cmd/Ctrl + Wheel Zoom (playhead-anchored) & Vertical scroll sync with track headers
+  $('#timelineScroll').addEventListener('wheel', (e) => {
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      const delta = e.deltaY < 0 ? 18 : -18;
+      setZoomAnchored(state.zoom + delta);
+    }
+  }, { passive: false });
+  $('#timelineScroll').addEventListener('scroll', (e) => {
+    $('#trackHeaderList').scrollTop = e.target.scrollTop;
   });
-  window.addEventListener('click', closeContextMenu);
 
-  // Ruler & playhead scrubbing
-  const scrub = e => {
+  // Ruler scrubbing (zero DOM thrashing — only updates playhead & timecode!)
+  const scrubAt = (e) => {
     const rect = $('#timelineWrap').getBoundingClientRect();
-    state.playhead = Math.max(0, (e.clientX - rect.left) / state.pxPerSec);
-    renderNow(); renderInspector();
+    state.currentTime = quantize(Math.max(0, (e.clientX - rect.left) / state.zoom));
+    renderNow();
   };
-  const startScrub = e => {
-    togglePlay(false); scrub(e);
-    const onMove = ev => scrub(ev);
-    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  const startScrub = (e) => {
+    e.preventDefault();
+    if (state.playing) togglePlay(false);
+    scrubAt(e);
+    const onMove = (ev) => scrubAt(ev);
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); renderInspector(); };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   };
   $('#timelineRuler').addEventListener('mousedown', startScrub);
   $('.playhead-cap').addEventListener('mousedown', startScrub);
-  $('#timelineScroll').addEventListener('scroll', () => { $('#trackHeaderList').scrollTop = $('#timelineScroll').scrollTop; });
 
-  // Uploads & Local Path
-  $('#btnUploadTrigger').onclick = () => $('#mediaUploadInput').click();
-  $('#mediaUploadInput').onchange = e => { if (e.target.files?.length) uploadFiles(e.target.files); e.target.value = ''; };
-  const dz = $('#dropZone');
-  dz.ondragover = e => { e.preventDefault(); dz.classList.add('dragover'); };
-  dz.ondragleave = () => dz.classList.remove('dragover');
-  dz.ondrop = e => { e.preventDefault(); dz.classList.remove('dragover'); if (e.dataTransfer.files?.length) uploadFiles(e.dataTransfer.files); };
-  $('#btnImportPath').onclick = async () => {
-    const p = $('#localPathInput').value.trim(); if (!p) return;
-    const resp = await fetch('/api/import-path', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: p }) });
-    const data = await resp.json();
-    if (data.item) { if (!state.library.some(m => m.id === data.item.id)) state.library.unshift(data.item); renderMediaLibrary(); addMediaToTimeline(data.item); $('#localPathInput').value = ''; }
-    else toast(data.error || 'Import failed');
+  // Empty Timeline Lane Click (Move Playhead) + Drag Marquee Multi-Select!
+  $('#tracksContainer').addEventListener('mousedown', (e) => {
+    if (e.target.closest('.tl-clip')) return;
+    if (e.button !== 0) return;
+    const wrapRect = $('#timelineWrap').getBoundingClientRect();
+    const startX = e.clientX - wrapRect.left;
+    const startY = e.clientY - wrapRect.top;
+    const marquee = $('#marqueeBox');
+    let isDragging = false;
+
+    const onMove = (ev) => {
+      const curX = ev.clientX - wrapRect.left;
+      const curY = ev.clientY - wrapRect.top;
+      if (Math.hypot(curX - startX, curY - startY) > 6) {
+        isDragging = true;
+        const left = Math.min(startX, curX);
+        const top = Math.min(startY, curY);
+        const width = Math.abs(curX - startX);
+        const height = Math.abs(curY - startY);
+        marquee.style.left = `${left}px`;
+        marquee.style.top = `${top}px`;
+        marquee.style.width = `${width}px`;
+        marquee.style.height = `${height}px`;
+        marquee.classList.remove('hidden');
+
+        // Hit-test clips inside marquee box
+        const mRect = marquee.getBoundingClientRect();
+        state.selectedClipIds.clear();
+        let first = null;
+        $$('#tracksContainer .tl-clip[data-clip-id]').forEach(el => {
+          const r = el.getBoundingClientRect();
+          const hit = !(r.right < mRect.left || r.left > mRect.right || r.bottom < mRect.top || r.top > mRect.bottom);
+          el.classList.toggle('selected', hit);
+          if (hit) {
+            state.selectedClipIds.add(el.dataset.clipId);
+            if (!first) first = el.dataset.clipId;
+          }
+        });
+        state.selectedClipId = first;
+      }
+    };
+    const onUp = (ev) => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      marquee.classList.add('hidden');
+      if (!isDragging) {
+        // Plain click on empty lane moves playhead directly!
+        const sec = quantize(Math.max(0, (ev.clientX - wrapRect.left) / state.zoom));
+        state.currentTime = sec;
+        renderNow();
+      } else {
+        renderInspector();
+      }
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  // Captions
+  $('#btnAddCaptionAtPlayhead').onclick = addCaptionAtPlayhead;
+  $$('#captionStyleRow button').forEach(b => {
+    b.onclick = () => {
+      state.captionStyle = b.dataset.cstyle;
+      $$('#captionStyleRow button').forEach(x => x.classList.toggle('active', x === b));
+      snapshotHistory(); renderNow();
+    };
+  });
+  $('#capYPos').oninput = (e) => { state.captionYPos = Number(e.target.value); renderNow(); };
+  $('#capYPos').onchange = (e) => { e.target.blur(); snapshotHistory(); };
+  $('#capFontSize').oninput = (e) => { state.captionFontSize = Number(e.target.value); renderNow(); };
+  $('#capFontSize').onchange = (e) => { e.target.blur(); snapshotHistory(); };
+  $('#btnImportSrt').onclick = () => $('#srtFileInput').click();
+  $('#srtFileInput').onchange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    state.captions = parseSRT(await file.text());
+    snapshotHistory(); renderTimeline(); renderCaptionsUI(); renderNow();
+    showToast(`Imported ${state.captions.length} caption lines`);
+    e.target.value = '';
+  };
+  $('#btnExportSrt').onclick = () => {
+    if (!state.captions.length) return showToast('No captions to export');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([toSRT(state.captions)], { type: 'text/plain' }));
+    a.download = `${state.title || 'captions'}.srt`;
+    a.click();
   };
 
-  // Text, Smart Tools, Save/Load, Modals
+  // Text, FX & Smart Tools
   $('#btnAddDefaultText').onclick = () => addTextClip(TEXT_PRESETS[0]);
+  $('#btnClearEffects').onclick = () => {
+    const f = findClipAndTrack(state.selectedClipId);
+    if (!f) return;
+    if (f.track.locked) return showToast(`Track "${f.track.name}" is locked`);
+    f.clip.effects = [];
+    snapshotHistory(); renderTimeline(); renderEffectIntensityControls(); renderNow();
+  };
   $('#btnAutoCrop').onclick = runAutoCrop;
   $('#btnVisionCutout').onclick = runVisionCutout;
   $('#btnAutoBeats').onclick = runAutoBeats;
+
+  // Save / Load Project
+  $('#btnSaveProj').onclick = saveProjectJSON;
+  $('#btnLoadProj').onclick = () => $('#projFileInput').click();
+  $('#projFileInput').onchange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const txt = await file.text();
+      applySnapshot(txt, true);
+      snapshotHistory();
+      showToast('Project loaded');
+    } catch { showToast('Invalid project JSON'); }
+    e.target.value = '';
+  };
+
+  // Export Modal & Relink Modal & Shortcuts Modal
+  $$('#exportModeTabs .seg-btn').forEach(b => {
+    b.onclick = () => {
+      state.exportMode = b.dataset.expmode;
+      $$('#exportModeTabs .seg-btn').forEach(x => x.classList.toggle('active', x === b));
+      updateExportSummary();
+    };
+  });
+  ['#expAspect', '#expRes', '#expFps', '#expCrf'].forEach(sel => {
+    $(sel).onchange = updateExportSummary;
+  });
+
+  $('#btnExportOpen').onclick = () => {
+    $('#expName').value = state.title || 'motioncut_export';
+    $('#expFps').value = String(state.fps);
+    $('#exportProgressWrap').classList.add('hidden');
+    $('#exportResultBox').classList.add('hidden');
+    updateExportSummary();
+    $('#exportModal').classList.remove('hidden');
+    $('#expName').focus();
+  };
+  $('#btnExportClose').onclick = closeOrCancelExportModal;
+  $('#btnExportCancel').onclick = closeOrCancelExportModal;
+  $('#btnExportStart').onclick = runExport;
+
+  $('#btnRelinkClose').onclick = () => $('#relinkModal').classList.add('hidden');
+  $('#btnRelinkDone').onclick = () => $('#relinkModal').classList.add('hidden');
+
   $('#btnShortcutsOpen').onclick = () => $('#shortcutsModal').classList.remove('hidden');
   $('#btnShortcutsClose').onclick = () => $('#shortcutsModal').classList.add('hidden');
 
-  $('#btnSaveProj').onclick = () => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify({ title: $('#projectTitle').value, aspect: state.aspect, canvasWidth: state.canvasWidth, canvasHeight: state.canvasHeight, fps: state.fps, bgMode: state.bgMode, tracks: state.tracks, clips: state.clips, markers: state.markers, captions: state.captions, captionStyle: state.captionStyle }, null, 2)], { type: 'application/json' }));
-    a.download = `${$('#projectTitle').value || 'project'}.mcut.json`; a.click(); toast('Saved .mcut.json');
-  };
-  $('#btnLoadProj').onclick = () => $('#projFileInput').click();
-  $('#projFileInput').onchange = async e => { const f = e.target.files?.[0]; if (!f) return; applySnapshot(await f.text()); snapshotHistory(); toast(`Loaded ${f.name}`); e.target.value = ''; };
-
-  $('#btnExportOpen').onclick = () => { $('#expName').value = `${($('#projectTitle').value || 'motioncut').replace(/\s+/g, '_')}_${state.aspect.replace(':', 'x')}`; $('#exportModal').classList.remove('hidden'); };
-  $('#btnExportClose').onclick = () => $('#exportModal').classList.add('hidden');
-  $('#btnExportCancel').onclick = () => $('#exportModal').classList.add('hidden');
-  $('#btnExportStart').onclick = startExport;
-
-  window.addEventListener('keydown', e => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  // Keyboard Shortcuts (Guard Cmd+S, wire Home/End/- /=/B/V/Cmd+C/V/A, ignore text inputs cleanly)
+  window.addEventListener('keydown', (e) => {
+    const tag = document.activeElement?.tagName;
+    const isTextInput = tag === 'TEXTAREA' || (tag === 'INPUT' && document.activeElement.type !== 'range' && document.activeElement.type !== 'button');
     const cmd = e.metaKey || e.ctrlKey;
+
+    if (e.key === 'Escape') {
+      if (!$('#shortcutsModal').classList.contains('hidden')) { $('#shortcutsModal').classList.add('hidden'); return; }
+      if (!$('#relinkModal').classList.contains('hidden')) { $('#relinkModal').classList.add('hidden'); return; }
+      if (!$('#exportModal').classList.contains('hidden')) { closeOrCancelExportModal(); return; }
+      closeContextMenu();
+      return;
+    }
+
+    if (cmd && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveProjectJSON();
+      return;
+    }
+
+    if (isTextInput) return;
+
+    const k = e.key.toLowerCase();
     if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
-    else if (e.key === 'v' || e.key === 'V') setTool('select');
-    else if (e.key === 'b' && !cmd) setTool('razor');
-    else if (e.key === 's' || e.key === 'S' || (cmd && e.key.toLowerCase() === 'b')) { e.preventDefault(); splitSelectedClip(); }
-    else if (cmd && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
-    else if (cmd && ((e.key.toLowerCase() === 'z' && e.shiftKey) || e.key.toLowerCase() === 'y')) { e.preventDefault(); redo(); }
-    else if (cmd && e.key.toLowerCase() === 'd') { e.preventDefault(); duplicateSelectedClip(); }
-    else if ((e.key === 'Backspace' || e.key === 'Delete') && e.shiftKey) { e.preventDefault(); deleteSelectedClip(true); }
-    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); deleteSelectedClip(false); }
-    else if (e.key === 'ArrowLeft')  { e.preventDefault(); togglePlay(false); state.playhead = Math.max(0, state.playhead - 1 / state.fps); renderNow(); }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); togglePlay(false); state.playhead = Math.min(state.getProjectDuration(), state.playhead + 1 / state.fps); renderNow(); }
-    else if (e.key === 'm' || e.key === 'M') { state.markers.push(Math.round(state.playhead * 100) / 100); snapshotHistory(); renderTimeline(); }
+    else if (k === 'v' && !cmd) setActiveTool('select');
+    else if (k === 'b' && !cmd) setActiveTool('razor');
+    else if ((k === 's' && !cmd) || (cmd && k === 'b')) { e.preventDefault(); splitSelectedClip(); }
+    else if (cmd && k === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
+    else if (cmd && k === 'z' && e.shiftKey) { e.preventDefault(); redo(); }
+    else if (cmd && k === 'd') { e.preventDefault(); duplicateSelectedClip(); }
+    else if (cmd && k === 'c') { e.preventDefault(); copySelectedClips(); }
+    else if (cmd && k === 'v') { e.preventDefault(); pasteCopiedClips(); }
+    else if (cmd && k === 'a') {
+      e.preventDefault();
+      state.selectedClipIds.clear();
+      for (const tr of state.tracks) {
+        if (tr.locked) continue;
+        for (const c of tr.clips) { state.selectedClipIds.add(c.id); if (!state.selectedClipId) state.selectedClipId = c.id; }
+      }
+      renderTimeline();
+      showToast(`Selected ${state.selectedClipIds.size} clip(s)`);
+    }
+    else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelectedClips(e.shiftKey); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); state.currentTime = quantize(Math.max(0, state.currentTime - (e.shiftKey ? 10 : 1) / state.fps)); renderNow(); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); state.currentTime = quantize(state.currentTime + (e.shiftKey ? 10 : 1) / state.fps); renderNow(); }
+    else if (e.key === 'Home') { e.preventDefault(); state.currentTime = 0; renderNow(); }
+    else if (e.key === 'End') { e.preventDefault(); state.currentTime = quantize(getProjectDuration()); renderNow(); }
+    else if (e.key === '-' || e.key === '_') { e.preventDefault(); setZoomAnchored(state.zoom - 22); }
+    else if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoomAnchored(state.zoom + 22); }
+    else if (k === 'm' && !cmd) $('#btnAddMarker').click();
+    else if (e.key === '[') $('#btnToggleLeft').click();
+    else if (e.key === ']') $('#btnToggleRight').click();
     else if (e.key === '?') $('#shortcutsModal').classList.toggle('hidden');
   });
-
-  window.addEventListener('resize', () => { fitPreviewCanvas(); drawRuler(); });
 }
 
 async function refreshLibrary() {
-  const resp = await fetch('/api/library');
-  const data = await resp.json();
+  const r = await fetch('/api/library');
+  const data = await r.json();
   state.library = data.items || [];
   renderMediaLibrary();
 }
 
 async function boot() {
-  setupUI();
-  populatePresets();
-  setupCanvasInteraction();
+  setupUIEvents();
+  renderPresets();
+  updateCanvasResBadge();
   await refreshLibrary();
-  const starter = state.library.find(m => m.name.includes('16:9')) || state.library.find(m => m.type === 'video');
-  if (starter && state.clips.length === 0) {
-    addMediaToTimeline(starter, 0);
-    $('#projectTitle').value = 'Scanner_16x9_Edit';
+
+  // Restore autosave cleanly if present!
+  let restored = false;
+  try {
+    const saved = localStorage.getItem(AUTOSAVE_KEY);
+    if (saved) {
+      applySnapshot(saved, true);
+      state.history = [saved];
+      state.historyIdx = 0;
+      setSaveStatus('Restored');
+      restored = true;
+      // Fetch waveforms for restored audio/video clips
+      const mediaIds = new Set(state.tracks.flatMap(t => t.clips).map(c => c.mediaId).filter(Boolean));
+      for (const mid of mediaIds) {
+        const m = state.library.find(x => x.id === mid);
+        if (m && m.hasAudio && !state.waveforms.has(mid)) fetchWaveform(mid);
+      }
+    }
+  } catch {}
+
+  if (!restored) {
+    loadStarterDemo();
   }
-  updateAspectUI();
-  renderTimeline();
-  renderInspector();
-  renderCaptionsList();
-  renderNow();
 }
 
 boot();

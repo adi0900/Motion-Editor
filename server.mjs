@@ -1,19 +1,15 @@
 #!/usr/bin/env node
 /**
- * MotionCut Pro v2 — Local CapCut-Style Video Editor Backend (Node 24 + FFmpeg, zero npm deps)
- * Endpoints:
- *  - GET  /api/library                   : Media catalog (preloaded MotionViz assets + uploads)
- *  - POST /api/upload                    : Upload video/audio/image + ffprobe + thumb
- *  - POST /api/import-path               : Import existing local Mac file path
- *  - DELETE /api/media/:id               : Remove item from library
- *  - GET  /api/filmstrip/:id             : Real 10-frame FFmpeg filmstrip sprite for timeline clips
- *  - GET  /api/waveform/:id              : Real FFmpeg PCM peaks + onset beat detection
- *  - GET  /api/cropdetect/:id            : Real FFmpeg letterbox black-bar auto-detection
- *  - POST /api/cutout/:id                : Local macOS Apple Vision foreground cutout ($0)
- *  - POST /api/export-frames/start       : Start deterministic frame-accurate FFmpeg MP4 pipe
- *  - POST /api/export-frames/push/:jobId : Push frame JPEG bytes into FFmpeg stdin
- *  - POST /api/export-frames/finish/:id  : Close video pipe & mix multi-track audio via FFmpeg -> MP4
- *  - POST /api/quick-export              : Instant 2s FFmpeg direct reframe/trim export
+ * MotionCut Pro v3 — Hardened Local CapCut-Style Video Editor Backend (Node 24 + FFmpeg, zero npm deps)
+ *
+ * Security & Reliability:
+ *  - Localhost-only Host & CORS validation + per-boot session token (X-MC-Token) on mutating routes
+ *  - Strict HTTP 206 Range validation (416 on invalid/OOB ranges, HEAD support, never throws after headersSent)
+ *  - Streaming multipart/raw disk uploads (no RAM cap; supports multi-GB 4K clips)
+ *  - Persistent catalog.json with missing-file detection (survives restarts, no stale 404s)
+ *  - Export job stdin error guards, unhandled rejection guards, cancel endpoint, and TTL orphan reaper
+ *  - Full preview-to-export audio parity: reverse (areverse), piecewise speed-ramp audio, voice FX, EQ,
+ *    clamped fades, keyframed volume envelopes, and persisted procedural SFX / freeze frames.
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -29,14 +25,25 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const THUMBS_DIR = path.join(__dirname, 'thumbs');
 const EXPORTS_DIR = path.join(__dirname, 'exports');
+const PROJECTS_DIR = path.join(__dirname, 'projects');
+const CATALOG_PATH = path.join(__dirname, 'catalog.json');
 const PORT = Number(process.env.PORT || 4321);
+const SESSION_TOKEN = crypto.randomBytes(24).toString('hex');
 
-for (const d of [PUBLIC_DIR, UPLOADS_DIR, THUMBS_DIR, EXPORTS_DIR]) {
+for (const d of [PUBLIC_DIR, UPLOADS_DIR, THUMBS_DIR, EXPORTS_DIR, PROJECTS_DIR]) {
   fs.mkdirSync(d, { recursive: true });
 }
 
-const mediaMap = new Map();
-const exportJobs = new Map(); // jobId -> { proc, videoOnlyPath, finalPath, fileName, width, height, fps, crf, audioTracks, donePromise }
+process.on('uncaughtException', (err) => {
+  console.error('[MotionCut uncaughtException]', err?.stack || err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[MotionCut unhandledRejection]', err?.stack || err);
+});
+
+const mediaMap = new Map();       // id -> internal media item (includes filePath)
+const waveformCache = new Map();  // `${id}:${bins}` -> { peaks, beats }
+const exportJobs = new Map();     // jobId -> active export job state
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -51,9 +58,14 @@ const MIME = {
   '.mp4': 'video/mp4',
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska',
+  '.m4v': 'video/mp4',
   '.wav': 'audio/wav',
   '.mp3': 'audio/mpeg',
   '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
 };
 
 function detectKind(filePath) {
@@ -62,6 +74,42 @@ function detectKind(filePath) {
   if (['.wav', '.mp3', '.m4a', '.aac', '.ogg', '.flac'].includes(ext)) return 'audio';
   if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image';
   return 'unknown';
+}
+
+function toPublicMedia(item) {
+  const exists = fs.existsSync(item.filePath);
+  return {
+    id: item.id,
+    name: item.name,
+    type: item.type,
+    url: item.url,
+    thumbUrl: item.thumbUrl,
+    filmstripUrl: item.filmstripUrl,
+    duration: item.duration,
+    width: item.width,
+    height: item.height,
+    fps: item.fps,
+    hasAudio: item.hasAudio,
+    size: item.size,
+    sourceTag: item.sourceTag || 'local',
+    userAdded: Boolean(item.userAdded),
+    missing: !exists,
+  };
+}
+
+function saveCatalog() {
+  try {
+    const entries = [...mediaMap.values()].map(m => ({
+      id: m.id,
+      name: m.name,
+      filePath: m.filePath,
+      sourceTag: m.sourceTag || 'local',
+      userAdded: Boolean(m.userAdded),
+    }));
+    fs.writeFileSync(CATALOG_PATH, JSON.stringify({ version: 3, entries }, null, 2));
+  } catch (err) {
+    console.error('[Catalog save error]', err.message);
+  }
 }
 
 async function probeFile(filePath) {
@@ -75,7 +123,7 @@ async function probeFile(filePath) {
   let fps = 30;
   if (vStream?.r_frame_rate && vStream.r_frame_rate.includes('/')) {
     const [n, d] = vStream.r_frame_rate.split('/').map(Number);
-    if (d > 0 && n > 0) fps = Math.round((n / d) * 100) / 100;
+    if (d > 0 && n > 0 && n / d <= 240) fps = Math.round((n / d) * 100) / 100;
   }
   return {
     duration: Number.isFinite(dur) && dur > 0 ? dur : 5,
@@ -86,20 +134,20 @@ async function probeFile(filePath) {
   };
 }
 
-async function generateThumb(id, filePath, kind) {
+async function generateThumb(id, filePath, kind, force = false) {
   const thumbPath = path.join(THUMBS_DIR, `${id}.jpg`);
-  if (fs.existsSync(thumbPath)) return `/thumbs/${id}.jpg`;
+  if (!force && fs.existsSync(thumbPath)) return `/thumbs/${id}.jpg`;
   try {
     if (kind === 'video') {
-      await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-ss', '0.5', '-i', filePath, '-vframes', '1', '-vf', 'scale=320:-2', thumbPath]);
+      await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-ss', '0.3', '-i', filePath, '-vframes', '1', '-vf', 'scale=320:-2', thumbPath]);
       if (!fs.existsSync(thumbPath)) {
         await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-i', filePath, '-vframes', '1', '-vf', 'scale=320:-2', thumbPath]);
       }
-      return `/thumbs/${id}.jpg`;
+      return fs.existsSync(thumbPath) ? `/thumbs/${id}.jpg` : null;
     }
     if (kind === 'image') {
       await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-i', filePath, '-vf', 'scale=320:-2', thumbPath]);
-      return `/thumbs/${id}.jpg`;
+      return fs.existsSync(thumbPath) ? `/thumbs/${id}.jpg` : null;
     }
   } catch {}
   return null;
@@ -108,8 +156,9 @@ async function generateThumb(id, filePath, kind) {
 async function generateFilmstrip(item) {
   const stripPath = path.join(THUMBS_DIR, `${item.id}_strip.jpg`);
   if (fs.existsSync(stripPath)) return stripPath;
-  const count = 10;
-  const fpsVal = Math.max(0.1, count / Math.max(0.5, item.duration));
+  const count = 16;
+  const dur = Math.max(0.5, item.duration || 5);
+  const fpsVal = Math.max(0.05, count / dur);
   await execFileAsync('ffmpeg', [
     '-y', '-v', 'error', '-i', item.filePath,
     '-vf', `fps=${fpsVal.toFixed(4)},scale=120:68:force_original_aspect_ratio=increase,crop=120:68,tile=${count}x1`,
@@ -118,23 +167,29 @@ async function generateFilmstrip(item) {
   return stripPath;
 }
 
-async function registerMedia(filePath, customName = null) {
-  if (!fs.existsSync(filePath)) return null;
+async function registerMedia(filePath, customName = null, opts = {}) {
   const abs = path.resolve(filePath);
-  for (const m of mediaMap.values()) {
-    if (m.filePath === abs) return m;
-  }
+  if (!fs.existsSync(abs)) return null;
+  let stat;
+  try { stat = fs.statSync(abs); } catch { return null; }
+  if (!stat.isFile()) return null;
+
   const kind = detectKind(abs);
   if (kind === 'unknown') return null;
-  const id = 'm_' + crypto.createHash('md5').update(abs).digest('hex').slice(0, 10);
+
+  const id = opts.forceId || ('m_' + crypto.createHash('sha256').update(abs).digest('hex').slice(0, 12));
+  const existing = mediaMap.get(id);
+  if (existing && !opts.refresh && existing.size === stat.size) {
+    return existing;
+  }
+
   let meta = { duration: 5, width: 1920, height: 1080, fps: 30, hasAudio: false };
   try { meta = await probeFile(abs); } catch {}
   if (kind === 'image') meta.duration = 5.0;
-  const thumbUrl = await generateThumb(id, abs, kind);
-  const stat = fs.statSync(abs);
+  const thumbUrl = await generateThumb(id, abs, kind, Boolean(opts.refresh));
   const item = {
     id,
-    name: customName || path.basename(abs),
+    name: customName || existing?.name || path.basename(abs),
     type: kind,
     filePath: abs,
     url: `/media/${id}`,
@@ -146,12 +201,33 @@ async function registerMedia(filePath, customName = null) {
     fps: meta.fps,
     hasAudio: meta.hasAudio || kind === 'audio',
     size: stat.size,
+    sourceTag: opts.sourceTag || existing?.sourceTag || 'local',
+    userAdded: opts.userAdded !== undefined ? Boolean(opts.userAdded) : Boolean(existing?.userAdded),
   };
   mediaMap.set(id, item);
+  if (!opts.skipSave) saveCatalog();
   return item;
 }
 
 async function seedDefaultLibrary() {
+  // 1. Restore persisted catalog first
+  if (fs.existsSync(CATALOG_PATH)) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
+      for (const e of (saved.entries || [])) {
+        if (e.filePath && fs.existsSync(e.filePath)) {
+          await registerMedia(e.filePath, e.name, {
+            forceId: e.id,
+            sourceTag: e.sourceTag || 'local',
+            userAdded: e.userAdded,
+            skipSave: true,
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Seed MotionViz sample assets (only if present on disk)
   const candidates = [
     ['/Users/shadowslave/MotionViz/videos/2026-11-24-flora-ig-Df90f4rB60D/renders/flora_scanner_plate_14s_16x9.mp4', 'Scanner Plate 14.5s (16:9)'],
     ['/Users/shadowslave/MotionViz/videos/2026-11-24-flora-ig-Df90f4rB60D/renders/flora_scanner_plate_14s.mp4', 'Scanner Plate 14.5s (9:16)'],
@@ -162,15 +238,23 @@ async function seedDefaultLibrary() {
     ['/Users/shadowslave/MotionViz/videos/2026-11-24-flora-blender-meta/audio/soundtrack.wav', 'Meta Electronic Track (18s)'],
   ];
   for (const [p, label] of candidates) {
-    if (fs.existsSync(p)) await registerMedia(p, label);
+    if (fs.existsSync(p)) await registerMedia(p, label, { sourceTag: 'sample', userAdded: false, skipSave: true });
   }
+
+  // 3. Scan uploads directory
   for (const f of fs.readdirSync(UPLOADS_DIR)) {
     const full = path.join(UPLOADS_DIR, f);
-    if (fs.statSync(full).isFile()) await registerMedia(full);
+    try {
+      if (fs.statSync(full).isFile()) {
+        await registerMedia(full, null, { sourceTag: 'upload', userAdded: true, skipSave: true });
+      }
+    } catch {}
   }
+  saveCatalog();
 }
 
 function sendJSON(res, code, obj) {
+  if (res.headersSent || res.writableEnded) return;
   const body = JSON.stringify(obj);
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -180,16 +264,58 @@ function sendJSON(res, code, obj) {
   res.end(body);
 }
 
+function parseRangeHeader(rangeHeader, size) {
+  if (!rangeHeader || typeof rangeHeader !== 'string') return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!m) return { invalid: true };
+  const [, rawStart, rawEnd] = m;
+  if (rawStart === '' && rawEnd === '') return { invalid: true };
+  let start, end;
+  if (rawStart === '') {
+    // Suffix range: bytes=-N
+    const suffix = Number(rawEnd);
+    if (!Number.isInteger(suffix) || suffix <= 0) return { invalid: true };
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd === '' ? size - 1 : Number(rawEnd);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || start >= size) {
+      return { invalid: true };
+    }
+    end = Math.min(end, size - 1);
+  }
+  return { start, end };
+}
+
 function streamFileWithRange(req, res, filePath) {
-  if (!fs.existsSync(filePath)) { res.writeHead(404); res.end('Not found'); return; }
-  const stat = fs.statSync(filePath);
+  if (!fs.existsSync(filePath)) {
+    if (!res.headersSent) { res.writeHead(404); res.end('Not found'); }
+    return;
+  }
+  let stat;
+  try { stat = fs.statSync(filePath); } catch {
+    if (!res.headersSent) { res.writeHead(404); res.end('Not found'); }
+    return;
+  }
+  if (!stat.isFile()) {
+    if (!res.headersSent) { res.writeHead(404); res.end('Not found'); }
+    return;
+  }
+
   const ext = path.extname(filePath).toLowerCase();
   const mime = MIME[ext] || 'application/octet-stream';
+  const isHead = req.method === 'HEAD';
   const range = req.headers.range;
+
   if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+    const parsed = parseRangeHeader(range, stat.size);
+    if (!parsed || parsed.invalid || stat.size === 0) {
+      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}`, 'Accept-Ranges': 'bytes' });
+      res.end();
+      return;
+    }
+    const { start, end } = parsed;
     const chunk = end - start + 1;
     res.writeHead(206, {
       'Content-Range': `bytes ${start}-${end}/${stat.size}`,
@@ -197,35 +323,86 @@ function streamFileWithRange(req, res, filePath) {
       'Content-Length': chunk,
       'Content-Type': mime,
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    if (isHead) { res.end(); return; }
+    const s = fs.createReadStream(filePath, { start, end });
+    s.on('error', () => { try { res.destroy(); } catch {} });
+    s.pipe(res);
   } else {
-    res.writeHead(200, { 'Content-Length': stat.size, 'Content-Type': mime, 'Accept-Ranges': 'bytes' });
-    fs.createReadStream(filePath).pipe(res);
+    res.writeHead(200, {
+      'Content-Length': stat.size,
+      'Content-Type': mime,
+      'Accept-Ranges': 'bytes',
+    });
+    if (isHead) { res.end(); return; }
+    const s = fs.createReadStream(filePath);
+    s.on('error', () => { try { res.destroy(); } catch {} });
+    s.pipe(res);
   }
 }
 
-async function readBodyBuffer(req, maxBytes = 512 * 1024 * 1024) {
+async function readBodyBuffer(req, maxBytes = 64 * 1024 * 1024) {
   const chunks = [];
   let total = 0;
   for await (const ch of req) {
     total += ch.length;
-    if (total > maxBytes) throw new Error('Payload too large');
+    if (total > maxBytes) {
+      const err = new Error('Payload too large');
+      err.statusCode = 413;
+      throw err;
+    }
     chunks.push(ch);
   }
   return Buffer.concat(chunks);
 }
 
-async function computeWaveform(filePath, bins = 120) {
+async function streamRequestToFile(req, destPath, maxBytes = 8 * 1024 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(destPath);
+    let total = 0;
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      try { ws.destroy(); } catch {}
+      try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch {}
+      reject(err);
+    };
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        const err = new Error('Upload exceeds 8GB limit');
+        err.statusCode = 413;
+        req.destroy();
+        fail(err);
+      }
+    });
+    req.on('aborted', () => fail(new Error('Upload aborted by client')));
+    req.on('error', fail);
+    ws.on('error', fail);
+    ws.on('finish', () => {
+      if (settled) return;
+      settled = true;
+      resolve(total);
+    });
+    req.pipe(ws);
+  });
+}
+
+async function computeWaveform(id, filePath, bins = 180) {
+  const clampedBins = Math.max(16, Math.min(1000, Math.round(Number(bins) || 180)));
+  const cacheKey = `${id}:${clampedBins}`;
+  if (waveformCache.has(cacheKey)) return waveformCache.get(cacheKey);
+
   const { stdout } = await execFileAsync('ffmpeg', [
     '-v', 'error', '-i', filePath, '-vn', '-ac', '1', '-ar', '4000', '-f', 's16le', '-',
   ], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
 
   const samples = new Int16Array(stdout.buffer, stdout.byteOffset, Math.floor(stdout.byteLength / 2));
-  if (samples.length === 0) return { peaks: Array(bins).fill(0.1), beats: [] };
+  if (samples.length === 0) return { peaks: Array(clampedBins).fill(0.05), beats: [] };
 
-  const step = Math.max(1, Math.floor(samples.length / bins));
+  const step = Math.max(1, Math.floor(samples.length / clampedBins));
   const peaks = [];
-  for (let i = 0; i < bins; i++) {
+  for (let i = 0; i < clampedBins; i++) {
     let maxVal = 0;
     const s0 = i * step;
     const s1 = Math.min(samples.length, s0 + step);
@@ -236,7 +413,7 @@ async function computeWaveform(filePath, bins = 120) {
     peaks.push(Math.round((maxVal / 32768) * 1000) / 1000);
   }
 
-  const win = 400;
+  const win = 400; // 100ms @ 4kHz
   const energies = [];
   for (let i = 0; i + win <= samples.length; i += win) {
     let sum = 0;
@@ -253,7 +430,9 @@ async function computeWaveform(filePath, bins = 120) {
       lastBeat = t;
     }
   }
-  return { peaks, beats };
+  const res = { peaks, beats };
+  waveformCache.set(cacheKey, res);
+  return res;
 }
 
 async function detectCrop(filePath) {
@@ -264,19 +443,88 @@ async function detectCrop(filePath) {
   return { w: Number(last[1]), h: Number(last[2]), x: Number(last[3]), y: Number(last[4]) };
 }
 
+function uniqueExportPath(baseName) {
+  const clean = (baseName || `motioncut_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.mp4$/i, '');
+  let candidate = `${clean}.mp4`;
+  let n = 2;
+  while (fs.existsSync(path.join(EXPORTS_DIR, candidate))) {
+    candidate = `${clean}_${n++}.mp4`;
+  }
+  return { fileName: candidate, fullPath: path.join(EXPORTS_DIR, candidate) };
+}
+
+// Speed ramp curve definitions matching engine.js identically
+const SPEED_CURVES = {
+  none: null,
+  montage: [[0, 2.2], [0.22, 0.45], [0.55, 0.45], [0.78, 2.2], [1, 1.4]],
+  hero: [[0, 1.0], [0.3, 0.35], [0.65, 0.35], [0.85, 2.4], [1, 1.0]],
+  bullet: [[0, 3.0], [0.2, 0.3], [0.75, 0.3], [1, 2.5]],
+  flashin: [[0, 3.5], [0.25, 1.0], [1, 1.0]],
+  smooth: [[0, 0.5], [0.5, 1.8], [1, 0.5]],
+};
+
+function evalRampSpeed(curveKey, u) {
+  const pts = SPEED_CURVES[curveKey];
+  if (!pts) return 1;
+  const uc = Math.max(0, Math.min(1, u));
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [u0, s0] = pts[i];
+    const [u1, s1] = pts[i + 1];
+    if (uc >= u0 && uc <= u1) {
+      const f = (uc - u0) / Math.max(0.0001, u1 - u0);
+      return s0 + (s1 - s0) * f;
+    }
+  }
+  return pts[pts.length - 1][1];
+}
+
 function buildAtempoChain(speed) {
   const parts = [];
   let s = Math.max(0.25, Math.min(8.0, Number(speed) || 1));
   while (s > 2.0) { parts.push('atempo=2.0'); s /= 2.0; }
   while (s < 0.5) { parts.push('atempo=0.5'); s /= 0.5; }
-  if (Math.abs(s - 1.0) > 0.01) parts.push(`atempo=${s.toFixed(3)}`);
+  if (Math.abs(s - 1.0) > 0.008) parts.push(`atempo=${s.toFixed(4)}`);
   return parts;
+}
+
+function buildVoiceFxFilters(voiceFx) {
+  switch (voiceFx) {
+    case 'radio':
+      return ['highpass=f=420', 'lowpass=f=2800'];
+    case 'deep':
+      return ['aresample=48000', 'asetrate=48000*0.80', 'aresample=48000', 'atempo=1.25'];
+    case 'chipmunk':
+      return ['aresample=48000', 'asetrate=48000*1.35', 'aresample=48000', 'atempo=0.7407'];
+    case 'echo':
+      return ['aecho=0.8:0.88:120:0.42'];
+    default:
+      return [];
+  }
+}
+
+function buildVolumeExpr(baseVol, kfs) {
+  if (!Array.isArray(kfs) || kfs.length < 2) {
+    return `volume=${Math.max(0, Math.min(2, baseVol)).toFixed(3)}`;
+  }
+  const sorted = [...kfs].sort((a, b) => a.t - b.t);
+  let expr = `${Math.max(0, Math.min(2, sorted[sorted.length - 1].v)).toFixed(3)}`;
+  for (let i = sorted.length - 2; i >= 0; i--) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    const dt = Math.max(0.001, b.t - a.t);
+    const seg = `(${a.v.toFixed(3)}+(${(b.v - a.v).toFixed(3)})*min(1,max(0,(t-${a.t.toFixed(3)})/${dt.toFixed(3)})))`;
+    expr = `if(lt(t,${b.t.toFixed(3)}),${seg},${expr})`;
+  }
+  expr = `if(lt(t,${sorted[0].t.toFixed(3)}),${sorted[0].v.toFixed(3)},${expr})`;
+  return `volume='${expr}':eval=frame`;
 }
 
 async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioClips) {
   const valid = (audioClips || []).filter(c => {
     const m = mediaMap.get(c.mediaId);
-    return m && m.hasAudio && fs.existsSync(m.filePath) && (c.volume ?? 1) > 0.001;
+    if (!m || !m.hasAudio || !fs.existsSync(m.filePath)) return false;
+    const hasVolKf = Array.isArray(c.volumeKeyframes) && c.volumeKeyframes.length > 0;
+    return hasVolKf || (c.volume ?? 1) > 0.001;
   });
   if (!valid.length) {
     fs.renameSync(videoOnlyPath, finalPath);
@@ -291,31 +539,72 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     const m = mediaMap.get(c.mediaId);
     args.push('-i', m.filePath);
     const inIdx = idx + 1;
-    const speed = Math.max(0.25, Math.min(8, Number(c.speed) || 1));
+    const baseSpeed = Math.max(0.25, Math.min(8, Number(c.speed) || 1));
     const trimStart = Math.max(0, Number(c.trimStart) || 0);
-    const srcDur = Math.max(0.05, Number(c.duration) * speed);
+    const dur = Math.max(0.04, Number(c.duration) || 1);
     const delayMs = Math.max(0, Math.round((Number(c.start) || 0) * 1000));
     const vol = Math.max(0, Math.min(2, Number(c.volume ?? 1)));
-
-    const chain = [`atrim=start=${trimStart.toFixed(3)}:duration=${srcDur.toFixed(3)}`, 'asetpts=PTS-STARTPTS'];
-    chain.push(...buildAtempoChain(speed));
-    if ((c.fadeIn || 0) > 0.01) chain.push(`afade=t=in:st=0:d=${Number(c.fadeIn).toFixed(2)}`);
-    if ((c.fadeOut || 0) > 0.01 && c.duration > c.fadeOut) {
-      chain.push(`afade=t=out:st=${Math.max(0, c.duration - c.fadeOut).toFixed(2)}:d=${Number(c.fadeOut).toFixed(2)}`);
-    }
-    if ((c.eqBass || 0) !== 0) chain.push(`bass=g=${Number(c.eqBass).toFixed(1)}`);
-    if ((c.eqTreble || 0) !== 0) chain.push(`treble=g=${Number(c.eqTreble).toFixed(1)}`);
-    chain.push(`volume=${vol.toFixed(3)}`);
-    if (delayMs > 0) chain.push(`adelay=${delayMs}|${delayMs}`);
+    const curve = c.speedCurve && SPEED_CURVES[c.speedCurve] ? c.speedCurve : 'none';
     const lbl = `a${idx}`;
-    filterParts.push(`[${inIdx}:a]${chain.join(',')}[${lbl}]`);
+
+    const postChain = [];
+    if (c.reverse) {
+      postChain.push('areverse', 'asetpts=PTS-STARTPTS');
+    }
+    const fi = Math.min(dur, Math.max(0, Number(c.fadeIn) || 0));
+    const fo = Math.min(dur, Math.max(0, Number(c.fadeOut) || 0));
+    if (fi > 0.01) postChain.push(`afade=t=in:st=0:d=${fi.toFixed(3)}`);
+    if (fo > 0.01) postChain.push(`afade=t=out:st=${Math.max(0, dur - fo).toFixed(3)}:d=${fo.toFixed(3)}`);
+    if ((c.eqBass || 0) !== 0) postChain.push(`bass=g=${Math.max(-18, Math.min(18, Number(c.eqBass))).toFixed(1)}`);
+    if ((c.eqTreble || 0) !== 0) postChain.push(`treble=g=${Math.max(-18, Math.min(18, Number(c.eqTreble))).toFixed(1)}`);
+    postChain.push(...buildVoiceFxFilters(c.voiceFx));
+    postChain.push(buildVolumeExpr(vol, c.volumeKeyframes));
+    postChain.push(`atrim=start=0:duration=${dur.toFixed(3)}`, 'asetpts=PTS-STARTPTS', 'aresample=48000:first_pts=0', 'aformat=sample_rates=48000:channel_layouts=stereo');
+    if (delayMs > 0) postChain.push(`adelay=${delayMs}|${delayMs}`);
+
+    if (curve !== 'none') {
+      // 8-segment piecewise speed-ramp audio matching engine.js integral
+      const N = 8;
+      const segOutDur = dur / N;
+      const splitLabels = [];
+      for (let k = 0; k < N; k++) splitLabels.push(`[s${idx}_${k}]`);
+      filterParts.push(`[${inIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo,asplit=${N}${splitLabels.join('')}`);
+      let srcCursor = trimStart;
+      const concatInputs = [];
+      for (let k = 0; k < N; k++) {
+        const uMid = (k + 0.5) / N;
+        const segSpeed = Math.max(0.25, Math.min(8, baseSpeed * evalRampSpeed(curve, uMid)));
+        const segSrcDur = Math.max(0.02, segOutDur * segSpeed);
+        const segChain = [
+          `atrim=start=${srcCursor.toFixed(3)}:duration=${segSrcDur.toFixed(3)}`,
+          'asetpts=PTS-STARTPTS',
+          ...buildAtempoChain(segSpeed),
+          'asetpts=PTS-STARTPTS',
+        ];
+        filterParts.push(`[s${idx}_${k}]${segChain.join(',')}[r${idx}_${k}]`);
+        concatInputs.push(`[r${idx}_${k}]`);
+        srcCursor += segSrcDur;
+      }
+      filterParts.push(`${concatInputs.join('')}concat=n=${N}:v=0:a=1,asetpts=PTS-STARTPTS,${postChain.join(',')}[${lbl}]`);
+    } else {
+      const srcDur = Math.max(0.04, dur * baseSpeed);
+      const chain = [
+        'aformat=sample_rates=48000:channel_layouts=stereo',
+        `atrim=start=${trimStart.toFixed(3)}:duration=${srcDur.toFixed(3)}`,
+        'asetpts=PTS-STARTPTS',
+        ...buildAtempoChain(baseSpeed),
+        'asetpts=PTS-STARTPTS',
+        ...postChain,
+      ];
+      filterParts.push(`[${inIdx}:a]${chain.join(',')}[${lbl}]`);
+    }
     mixLabels.push(`[${lbl}]`);
   });
 
   if (mixLabels.length === 1) {
-    filterParts.push(`${mixLabels[0]}apad=whole_dur=${totalDuration.toFixed(3)},atrim=0:${totalDuration.toFixed(3)}[aout]`);
+    filterParts.push(`${mixLabels[0]}apad=whole_dur=${totalDuration.toFixed(3)},atrim=end=${totalDuration.toFixed(3)}[aout]`);
   } else {
-    filterParts.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:normalize=0,apad=whole_dur=${totalDuration.toFixed(3)},atrim=0:${totalDuration.toFixed(3)}[aout]`);
+    filterParts.push(`${mixLabels.join('')}amix=inputs=${mixLabels.length}:duration=longest:normalize=0,apad=whole_dur=${totalDuration.toFixed(3)},atrim=end=${totalDuration.toFixed(3)}[aout]`);
   }
 
   args.push(
@@ -324,57 +613,152 @@ async function muxAudioWithVideo(videoOnlyPath, finalPath, totalDuration, audioC
     '-c:v', 'copy',
     '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
     '-movflags', '+faststart',
-    '-shortest',
+    '-t', totalDuration.toFixed(3),
     finalPath,
   );
-  await execFileAsync('ffmpeg', args, { maxBuffer: 16 * 1024 * 1024 });
+  await execFileAsync('ffmpeg', args, { maxBuffer: 24 * 1024 * 1024 });
   try { fs.unlinkSync(videoOnlyPath); } catch {}
+}
+
+function cleanupExportJob(jobId, killProc = true) {
+  const job = exportJobs.get(jobId);
+  if (!job) return false;
+  job.cancelled = true;
+  exportJobs.delete(jobId);
+  if (killProc && job.proc && !job.proc.killed && job.proc.exitCode === null) {
+    try { job.proc.stdin.destroy(); } catch {}
+    try { job.proc.kill('SIGKILL'); } catch {}
+  }
+  setTimeout(() => {
+    try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
+  }, 400);
+  return true;
+}
+
+// Reap idle/abandoned export jobs every 2 minutes (10-minute idle TTL)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of exportJobs.entries()) {
+    if (now - job.lastActivity > 10 * 60 * 1000) {
+      console.warn(`[MotionCut] Reaping abandoned export job ${id}`);
+      cleanupExportJob(id, true);
+    }
+  }
+}, 120_000).unref();
+
+function isAllowedLocalHost(hostHeader) {
+  if (!hostHeader) return true;
+  return /^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(hostHeader.trim());
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  return /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin.trim());
+}
+
+function checkCsrfToken(req, res) {
+  const tok = req.headers['x-mc-token'];
+  if (tok !== SESSION_TOKEN) {
+    sendJSON(res, 403, { error: 'Forbidden: invalid or missing local session token' });
+    return false;
+  }
+  return true;
 }
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (!isAllowedLocalHost(req.headers.host)) {
+      return sendJSON(res, 403, { error: 'Forbidden Host header' });
+    }
+    const origin = req.headers.origin;
+    if (origin) {
+      if (!isAllowedOrigin(origin)) {
+        return sendJSON(res, 403, { error: 'Forbidden cross-origin request' });
+      }
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Filename,X-MC-Token,X-Source-Tag');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
     const p = url.pathname;
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Filename');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-    // ── Library & Media Management ─────────────────────────────────────────
-    if (p === '/api/library' && req.method === 'GET') {
-      return sendJSON(res, 200, { items: [...mediaMap.values()], exportsDir: EXPORTS_DIR });
+    // ── Health & Library ───────────────────────────────────────────────────
+    if (p === '/api/health' && req.method === 'GET') {
+      return sendJSON(res, 200, { ok: true, version: '3.0', assets: mediaMap.size, activeExports: exportJobs.size });
     }
 
+    if (p === '/api/library' && req.method === 'GET') {
+      const items = [...mediaMap.values()].map(toPublicMedia).filter(i => !i.missing);
+      const missingCount = [...mediaMap.values()].filter(m => !fs.existsSync(m.filePath)).length;
+      return sendJSON(res, 200, { items, missingCount, exportsDirName: path.basename(EXPORTS_DIR) });
+    }
+
+    // ── Mutating APIs (Token-Protected) ────────────────────────────────────
     if (p === '/api/upload' && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const rawName = decodeURIComponent(req.headers['x-filename'] || `clip_${Date.now()}.mp4`);
-      const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
-      const outPath = path.join(UPLOADS_DIR, `${Date.now()}_${safeName}`);
-      fs.writeFileSync(outPath, await readBodyBuffer(req));
-      const item = await registerMedia(outPath, rawName);
-      if (!item) return sendJSON(res, 400, { error: 'Unsupported media file' });
-      return sendJSON(res, 200, { item });
+      const sourceTag = String(req.headers['x-source-tag'] || 'upload').replace(/[^a-zA-Z0-9_-]/g, '');
+      const safeName = path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (detectKind(safeName) === 'unknown') {
+        return sendJSON(res, 400, { error: `Unsupported file extension: ${path.extname(safeName)}` });
+      }
+      const outPath = path.join(UPLOADS_DIR, `${Date.now()}_${crypto.randomBytes(3).toString('hex')}_${safeName}`);
+      await streamRequestToFile(req, outPath);
+      const item = await registerMedia(outPath, rawName, { sourceTag, userAdded: true });
+      if (!item) {
+        try { fs.unlinkSync(outPath); } catch {}
+        return sendJSON(res, 400, { error: 'Unsupported or unreadable media file' });
+      }
+      return sendJSON(res, 200, { item: toPublicMedia(item) });
     }
 
     if (p === '/api/import-path' && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const body = JSON.parse((await readBodyBuffer(req, 65536)).toString('utf8'));
-      const rawPath = (body.path || '').replace(/^~/, process.env.HOME || '');
-      if (!fs.existsSync(rawPath)) return sendJSON(res, 404, { error: `File not found: ${rawPath}` });
-      const item = await registerMedia(rawPath);
-      if (!item) return sendJSON(res, 400, { error: 'Unsupported media format' });
-      return sendJSON(res, 200, { item });
+      const rawPath = String(body.path || '').trim().replace(/^~(?=\/|$)/, process.env.HOME || '');
+      if (!rawPath) return sendJSON(res, 400, { error: 'Path is required' });
+      const resolved = path.resolve(rawPath);
+      if (!fs.existsSync(resolved)) return sendJSON(res, 404, { error: `File not found: ${path.basename(resolved)}` });
+      const st = fs.statSync(resolved);
+      if (!st.isFile()) return sendJSON(res, 400, { error: 'Path must be a regular file' });
+      if (detectKind(resolved) === 'unknown') return sendJSON(res, 400, { error: 'Unsupported media format' });
+      const item = await registerMedia(resolved, body.name || null, { sourceTag: 'imported', userAdded: true });
+      if (!item) return sendJSON(res, 400, { error: 'Failed to probe media file' });
+      return sendJSON(res, 200, { item: toPublicMedia(item) });
     }
 
     if (p.startsWith('/api/media/') && req.method === 'DELETE') {
-      const id = p.split('/').pop();
-      mediaMap.delete(id);
-      return sendJSON(res, 200, { ok: true });
+      if (!checkCsrfToken(req, res)) return;
+      const id = decodeURIComponent(p.split('/').pop() || '');
+      const existed = mediaMap.delete(id);
+      if (existed) saveCatalog();
+      return sendJSON(res, existed ? 200 : 404, { ok: existed });
     }
 
-    if (p.startsWith('/api/filmstrip/') && req.method === 'GET') {
+    // ── Project Save / Load on Server (Optional Backup) ────────────────────
+    if (p === '/api/projects' && req.method === 'GET') {
+      const files = fs.readdirSync(PROJECTS_DIR).filter(f => f.endsWith('.json')).sort().reverse();
+      return sendJSON(res, 200, { projects: files });
+    }
+    if (p === '/api/projects' && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
+      const body = JSON.parse((await readBodyBuffer(req, 8 * 1024 * 1024)).toString('utf8'));
+      const safe = String(body.title || 'project').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const fp = path.join(PROJECTS_DIR, `${safe}.mcut.json`);
+      fs.writeFileSync(fp, JSON.stringify(body, null, 2));
+      return sendJSON(res, 200, { ok: true, fileName: path.basename(fp) });
+    }
+
+    // ── Analysis & Media Helper Endpoints ──────────────────────────────────
+    if (p.startsWith('/api/filmstrip/') && (req.method === 'GET' || req.method === 'HEAD')) {
       const id = p.split('/').pop();
       const item = mediaMap.get(id);
-      if (!item || item.type !== 'video') { res.writeHead(404); res.end('Not found'); return; }
+      if (!item || item.type !== 'video' || !fs.existsSync(item.filePath)) {
+        res.writeHead(404); res.end('Not found'); return;
+      }
       const sp = await generateFilmstrip(item);
       return streamFileWithRange(req, res, sp);
     }
@@ -382,50 +766,65 @@ const server = http.createServer(async (req, res) => {
     if (p.startsWith('/api/waveform/') && req.method === 'GET') {
       const id = p.split('/').pop();
       const item = mediaMap.get(id);
-      if (!item) return sendJSON(res, 404, { error: 'Media not found' });
+      if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Media not found' });
       if (!item.hasAudio) return sendJSON(res, 200, { peaks: [], beats: [] });
-      return sendJSON(res, 200, await computeWaveform(item.filePath, Number(url.searchParams.get('bins') || 120)));
+      const rawBins = url.searchParams.get('bins');
+      const bins = rawBins ? Number(rawBins) : 180;
+      if (!Number.isFinite(bins) || bins < 16 || bins > 1000) {
+        return sendJSON(res, 400, { error: 'bins must be between 16 and 1000' });
+      }
+      return sendJSON(res, 200, await computeWaveform(item.id, item.filePath, bins));
     }
 
     if (p.startsWith('/api/cropdetect/') && req.method === 'GET') {
       const id = p.split('/').pop();
       const item = mediaMap.get(id);
-      if (!item) return sendJSON(res, 404, { error: 'Media not found' });
-      return sendJSON(res, 200, { crop: await detectCrop(item.filePath), width: item.width, height: item.height });
+      if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Media not found' });
+      const crop = await detectCrop(item.filePath);
+      const hasBars = Boolean(crop && (crop.w < item.width - 8 || crop.h < item.height - 8));
+      return sendJSON(res, 200, { crop, width: item.width, height: item.height, hasBars });
     }
 
     if (p.startsWith('/api/cutout/') && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const id = p.split('/').pop();
       const item = mediaMap.get(id);
-      if (!item) return sendJSON(res, 404, { error: 'Media not found' });
+      if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Media not found' });
       const cutoutBin = path.join(process.env.HOME || '', 'tools', 'cutout');
       if (!fs.existsSync(cutoutBin)) return sendJSON(res, 400, { error: 'Local cutout tool not found' });
       const body = JSON.parse((await readBodyBuffer(req, 65536)).toString('utf8') || '{}');
-      const atSec = Number(body.time || 0);
+      const atSec = Math.max(0, Number(body.time || 0));
       const tmpIn = path.join(UPLOADS_DIR, `cut_in_${Date.now()}.png`);
       const outPng = path.join(UPLOADS_DIR, `cutout_${Date.now()}.png`);
-      if (item.type === 'video') {
-        await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-ss', String(atSec), '-i', item.filePath, '-vframes', '1', tmpIn]);
-      } else {
-        fs.copyFileSync(item.filePath, tmpIn);
+      try {
+        if (item.type === 'video') {
+          await execFileAsync('ffmpeg', ['-y', '-v', 'error', '-ss', String(atSec), '-i', item.filePath, '-vframes', '1', tmpIn]);
+        } else {
+          fs.copyFileSync(item.filePath, tmpIn);
+        }
+        await execFileAsync(cutoutBin, [tmpIn, outPng]);
+      } finally {
+        try { if (fs.existsSync(tmpIn)) fs.unlinkSync(tmpIn); } catch {}
       }
-      await execFileAsync(cutoutBin, [tmpIn, outPng]);
-      try { fs.unlinkSync(tmpIn); } catch {}
-      const newItem = await registerMedia(outPng, `${path.parse(item.name).name} (Cutout)`);
-      return sendJSON(res, 200, { item: newItem });
+      const newItem = await registerMedia(outPng, `${path.parse(item.name).name} (Cutout)`, { sourceTag: 'cutout', userAdded: true });
+      return sendJSON(res, 200, { item: toPublicMedia(newItem) });
     }
 
-    // ── Deterministic Frame-Accurate FFmpeg Pipe Export (Zero Dropped Frames!) ──
+    // ── Deterministic Frame-Accurate FFmpeg Pipe Export ─────────────────────
     if (p === '/api/export-frames/start' && req.method === 'POST') {
-      const body = JSON.parse((await readBodyBuffer(req, 262144)).toString('utf8'));
-      const width = Math.round(Number(body.width || 1920) / 2) * 2;
-      const height = Math.round(Number(body.height || 1080) / 2) * 2;
+      if (!checkCsrfToken(req, res)) return;
+      const body = JSON.parse((await readBodyBuffer(req, 512 * 1024)).toString('utf8'));
+      const width = Math.max(160, Math.min(4096, Math.round(Number(body.width || 1920) / 2) * 2));
+      const height = Math.max(160, Math.min(4096, Math.round(Number(body.height || 1080) / 2) * 2));
       const fps = Number(body.fps || 30);
-      const crf = Number(body.crf || 16);
-      const name = (body.name || `motioncut_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const crf = Number(body.crf || 17);
+      if (!Number.isFinite(fps) || fps < 1 || fps > 120) return sendJSON(res, 400, { error: 'Invalid FPS (1..120)' });
+      if (!Number.isFinite(crf) || crf < 10 || crf > 40) return sendJSON(res, 400, { error: 'Invalid CRF (10..40)' });
+      const totalDuration = Math.max(1 / fps, Number(body.totalDuration || 1));
+
       const jobId = 'job_' + crypto.randomBytes(6).toString('hex');
+      const { fileName, fullPath: finalPath } = uniqueExportPath(body.name || `motioncut_${Date.now()}`);
       const videoOnlyPath = path.join(EXPORTS_DIR, `_vid_${jobId}.mp4`);
-      const finalPath = path.join(EXPORTS_DIR, `${name}.mp4`);
 
       const proc = spawn('ffmpeg', [
         '-y', '-v', 'error',
@@ -438,49 +837,122 @@ const server = http.createServer(async (req, res) => {
       ], { stdio: ['pipe', 'ignore', 'pipe'] });
 
       let stderr = '';
+      const job = {
+        proc, videoOnlyPath, finalPath, fileName,
+        width, height, fps, crf,
+        totalDuration,
+        audioClips: Array.isArray(body.audioClips) ? body.audioClips : [],
+        framesWritten: 0,
+        lastActivity: Date.now(),
+        failed: false,
+        failError: null,
+        cancelled: false,
+        donePromise: null,
+      };
+
       proc.stderr.on('data', d => { stderr += d.toString(); });
-      const donePromise = new Promise((resolve, reject) => {
-        proc.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg exit ${code}: ${stderr}`)));
-        proc.on('error', reject);
+      proc.stdin.on('error', (err) => {
+        job.failed = true;
+        job.failError = err;
       });
 
-      exportJobs.set(jobId, {
-        proc, videoOnlyPath, finalPath, fileName: `${name}.mp4`,
-        width, height, fps, crf,
-        totalDuration: Number(body.totalDuration || 5),
-        audioClips: body.audioClips || [],
-        donePromise,
+      const donePromise = new Promise((resolve, reject) => {
+        proc.on('close', (code) => {
+          if (job.cancelled) return resolve({ cancelled: true });
+          if (code === 0) return resolve({ ok: true });
+          const err = new Error(`FFmpeg exit ${code}: ${stderr.trim() || 'encoder failure'}`);
+          job.failed = true;
+          job.failError = err;
+          reject(err);
+        });
+        proc.on('error', (err) => {
+          job.failed = true;
+          job.failError = err;
+          reject(err);
+        });
       });
-      return sendJSON(res, 200, { ok: true, jobId });
+      // Prevent unhandled rejection if FFmpeg fails before /finish is called
+      donePromise.catch(() => {});
+      job.donePromise = donePromise;
+
+      exportJobs.set(jobId, job);
+      return sendJSON(res, 200, { ok: true, jobId, fileName });
     }
 
     if (p.startsWith('/api/export-frames/push/') && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const jobId = p.split('/').pop();
       const job = exportJobs.get(jobId);
       if (!job) return sendJSON(res, 404, { error: 'Export job not found' });
-      const buf = await readBodyBuffer(req, 64 * 1024 * 1024);
-      if (!job.proc.stdin.write(buf)) {
-        await new Promise(r => job.proc.stdin.once('drain', r));
+      if (job.cancelled) return sendJSON(res, 409, { error: 'Export was cancelled' });
+      if (job.failed || job.proc.killed || job.proc.exitCode !== null) {
+        const msg = job.failError?.message || 'FFmpeg encoder stopped unexpectedly';
+        cleanupExportJob(jobId, true);
+        return sendJSON(res, 500, { error: msg });
       }
-      return sendJSON(res, 200, { ok: true });
+      job.lastActivity = Date.now();
+      const buf = await readBodyBuffer(req, 32 * 1024 * 1024);
+      if (buf.length < 100) return sendJSON(res, 400, { error: 'Empty or corrupt frame buffer' });
+
+      try {
+        const ok = job.proc.stdin.write(buf);
+        if (!ok) {
+          await new Promise((resolve, reject) => {
+            const onDrain = () => { cleanup(); resolve(); };
+            const onErr = (e) => { cleanup(); reject(e); };
+            const onClose = () => { cleanup(); reject(new Error('FFmpeg closed pipe during push')); };
+            const cleanup = () => {
+              job.proc.stdin.off('drain', onDrain);
+              job.proc.stdin.off('error', onErr);
+              job.proc.off('close', onClose);
+            };
+            job.proc.stdin.once('drain', onDrain);
+            job.proc.stdin.once('error', onErr);
+            job.proc.once('close', onClose);
+          });
+        }
+        job.framesWritten++;
+      } catch (err) {
+        cleanupExportJob(jobId, true);
+        return sendJSON(res, 500, { error: err.message });
+      }
+      return sendJSON(res, 200, { ok: true, framesWritten: job.framesWritten });
+    }
+
+    if (p.startsWith('/api/export-frames/cancel/') && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
+      const jobId = p.split('/').pop();
+      const existed = cleanupExportJob(jobId, true);
+      return sendJSON(res, 200, { ok: true, cancelled: existed });
     }
 
     if (p.startsWith('/api/export-frames/finish/') && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const jobId = p.split('/').pop();
       const job = exportJobs.get(jobId);
       if (!job) return sendJSON(res, 404, { error: 'Export job not found' });
       exportJobs.delete(jobId);
-      job.proc.stdin.end();
-      await job.donePromise;
-      await muxAudioWithVideo(job.videoOnlyPath, job.finalPath, job.totalDuration, job.audioClips);
+      if (job.cancelled) return sendJSON(res, 409, { error: 'Export cancelled' });
+      if (job.framesWritten === 0) {
+        cleanupExportJob(jobId, true);
+        return sendJSON(res, 400, { error: 'No frames were pushed to export job' });
+      }
+      try {
+        job.proc.stdin.end();
+        await job.donePromise;
+        await muxAudioWithVideo(job.videoOnlyPath, job.finalPath, job.totalDuration, job.audioClips);
+      } catch (err) {
+        try { if (fs.existsSync(job.videoOnlyPath)) fs.unlinkSync(job.videoOnlyPath); } catch {}
+        try { if (fs.existsSync(job.finalPath)) fs.unlinkSync(job.finalPath); } catch {}
+        return sendJSON(res, 500, { error: String(err.message || err) });
+      }
       const stat = fs.statSync(job.finalPath);
       const meta = await probeFile(job.finalPath);
-      await registerMedia(job.finalPath, job.fileName);
+      await registerMedia(job.finalPath, job.fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
         ok: true,
         fileName: job.fileName,
-        filePath: job.finalPath,
-        downloadUrl: `/exports/${job.fileName}`,
+        downloadUrl: `/exports/${encodeURIComponent(job.fileName)}`,
         size: stat.size,
         duration: meta.duration,
         width: meta.width,
@@ -489,32 +961,33 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ── Fast Direct FFmpeg 1-Click Reframe / Trim Export ───────────────────
+    // ── Fast Direct FFmpeg 1-Click Source Reframe ──────────────────────────
     if (p === '/api/quick-export' && req.method === 'POST') {
+      if (!checkCsrfToken(req, res)) return;
       const body = JSON.parse((await readBodyBuffer(req, 262144)).toString('utf8'));
       const item = mediaMap.get(body.mediaId);
-      if (!item) return sendJSON(res, 404, { error: 'Clip not found' });
-      const w = Math.round(Number(body.width || 1920) / 2) * 2;
-      const h = Math.round(Number(body.height || 1080) / 2) * 2;
-      const fps = Number(body.fps || 30);
-      const crf = Number(body.crf || 15);
+      if (!item || !fs.existsSync(item.filePath)) return sendJSON(res, 404, { error: 'Clip not found' });
+      const w = Math.max(160, Math.min(4096, Math.round(Number(body.width || 1920) / 2) * 2));
+      const h = Math.max(160, Math.min(4096, Math.round(Number(body.height || 1080) / 2) * 2));
+      const fps = Math.max(1, Math.min(120, Number(body.fps || 30)));
+      const crf = Math.max(10, Math.min(40, Number(body.crf || 15)));
       const start = Math.max(0, Number(body.trimStart || 0));
-      const dur = Math.max(0.2, Number(body.duration || item.duration));
-      const mode = body.fitMode || 'cover';
-      const name = (body.name || `${path.parse(item.name).name}_${w}x${h}`).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const outMp4 = path.join(EXPORTS_DIR, `${name}.mp4`);
+      const dur = Math.max(0.1, Number(body.duration || item.duration));
+      const mode = ['cover', 'contain', 'blur'].includes(body.fitMode) ? body.fitMode : 'cover';
+      const { fileName, fullPath: outMp4 } = uniqueExportPath(body.name || `${path.parse(item.name).name}_${w}x${h}`);
 
       let vf = '';
       if (body.cropRect && body.cropRect.w > 0 && body.cropRect.h > 0) {
         const c = body.cropRect;
-        vf += `crop=${c.w}:${c.h}:${c.x}:${c.y},`;
+        vf += `crop=${Math.round(c.w)}:${Math.round(c.h)}:${Math.round(c.x)}:${Math.round(c.y)},`;
       }
       if (mode === 'cover') {
         vf += `scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},setsar=1`;
       } else if (mode === 'contain') {
         vf += `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
       } else {
-        const prefix = (body.cropRect && body.cropRect.w > 0) ? `crop=${body.cropRect.w}:${body.cropRect.h}:${body.cropRect.x}:${body.cropRect.y},` : '';
+        const prefix = (body.cropRect && body.cropRect.w > 0)
+          ? `crop=${Math.round(body.cropRect.w)}:${Math.round(body.cropRect.h)}:${Math.round(body.cropRect.x)}:${Math.round(body.cropRect.y)},` : '';
         vf = `${prefix}split[bg][fg];[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},boxblur=28:4[b];[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[f];[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1`;
       }
 
@@ -524,47 +997,74 @@ const server = http.createServer(async (req, res) => {
         '-r', String(fps), '-c:v', 'libx264', '-profile:v', 'high', '-level', '4.1',
         '-crf', String(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
         '-c:a', 'aac', '-b:a', '192k', outMp4,
-      ], { maxBuffer: 16 * 1024 * 1024 });
+      ], { maxBuffer: 24 * 1024 * 1024 });
 
       const stat = fs.statSync(outMp4);
       const meta = await probeFile(outMp4);
-      await registerMedia(outMp4, `${name}.mp4`);
+      await registerMedia(outMp4, fileName, { sourceTag: 'export', userAdded: true, refresh: true });
       return sendJSON(res, 200, {
-        ok: true, fileName: `${name}.mp4`, filePath: outMp4,
-        downloadUrl: `/exports/${name}.mp4`, size: stat.size,
+        ok: true, fileName,
+        downloadUrl: `/exports/${encodeURIComponent(fileName)}`, size: stat.size,
         duration: meta.duration, width: meta.width, height: meta.height, fps: meta.fps,
       });
     }
 
     // ── Stream Media / Thumbs / Exports ────────────────────────────────────
-    if (p.startsWith('/media/')) {
-      const item = mediaMap.get(p.split('/').pop());
-      if (!item) { res.writeHead(404); res.end('Not found'); return; }
+    if (p.startsWith('/media/') && (req.method === 'GET' || req.method === 'HEAD')) {
+      const id = decodeURIComponent(p.split('/').pop() || '');
+      const item = mediaMap.get(id);
+      if (!item || !fs.existsSync(item.filePath)) { res.writeHead(404); res.end('Not found'); return; }
       return streamFileWithRange(req, res, item.filePath);
     }
-    if (p.startsWith('/thumbs/')) return streamFileWithRange(req, res, path.join(THUMBS_DIR, path.basename(p)));
-    if (p.startsWith('/exports/')) {
-      const fp = path.join(EXPORTS_DIR, path.basename(p));
+    if (p.startsWith('/thumbs/') && (req.method === 'GET' || req.method === 'HEAD')) {
+      return streamFileWithRange(req, res, path.join(THUMBS_DIR, path.basename(p)));
+    }
+    if (p.startsWith('/exports/') && (req.method === 'GET' || req.method === 'HEAD')) {
+      const fname = path.basename(decodeURIComponent(p));
+      const fp = path.join(EXPORTS_DIR, fname);
       if (url.searchParams.get('download') === '1') {
-        res.setHeader('Content-Disposition', `attachment; filename="${path.basename(p)}"`);
+        res.setHeader('Content-Disposition', `attachment; filename="${fname.replace(/"/g, '')}"`);
       }
       return streamFileWithRange(req, res, fp);
     }
 
-    // ── Static Frontend ────────────────────────────────────────────────────
+    // ── Static Frontend (Inject Per-Boot Session Token into index.html) ───
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return sendJSON(res, 405, { error: 'Method not allowed' });
+    }
     const rel = p === '/' ? 'index.html' : p.replace(/^\/+/, '');
-    const filePath = path.join(PUBLIC_DIR, rel);
-    if (!filePath.startsWith(PUBLIC_DIR) || !fs.existsSync(filePath)) { res.writeHead(404); res.end('Not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+    const filePath = path.resolve(PUBLIC_DIR, rel);
+    if (!filePath.startsWith(PUBLIC_DIR + path.sep) && filePath !== PUBLIC_DIR) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      res.writeHead(404); res.end('Not found'); return;
+    }
+    if (rel === 'index.html') {
+      const html = fs.readFileSync(filePath, 'utf8')
+        .replace('</head>', `  <script>window.__MC_TOKEN__=${JSON.stringify(SESSION_TOKEN)};</script>\n</head>`);
+      const buf = Buffer.from(html, 'utf8');
+      res.writeHead(200, { 'Content-Type': MIME['.html'], 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+      res.end(req.method === 'HEAD' ? undefined : buf);
+      return;
+    }
+    const st = fs.statSync(filePath);
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
+      'Content-Length': st.size,
+      'Cache-Control': 'no-store',
+    });
+    if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(filePath).pipe(res);
   } catch (err) {
-    console.error('[MotionCut Error]', err);
-    sendJSON(res, 500, { error: String(err.message || err) });
+    console.error('[MotionCut Error]', err?.message || err);
+    const code = Number(err?.statusCode) || 500;
+    sendJSON(res, code, { error: String(err?.message || err) });
   }
 });
 
 seedDefaultLibrary().then(() => {
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`MotionCut Pro v2 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
+    console.log(`MotionCut Pro v3 running at http://127.0.0.1:${PORT} (${mediaMap.size} assets)`);
   });
 });
