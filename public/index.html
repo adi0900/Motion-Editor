@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MotionCut Pro — Local CapCut-Style Video Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- TOP HEADER BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span class="brand-mark">M</span>
+        <span class="brand-name">MotionCut</span>
+        <span class="brand-badge">PRO</span>
+      </div>
+      <div class="project-name-wrap">
+        <input id="projectTitle" class="project-title" value="Scanner_16x9_Edit" spellcheck="false" />
+        <span id="saveIndicator" class="save-ind">Saved</span>
+      </div>
+    </div>
+
+    <div class="topbar-center">
+      <div class="aspect-pill-group" id="aspectGroup" title="Canvas Aspect Ratio">
+        <button class="aspect-btn active" data-ratio="16:9" data-w="1920" data-h="1080">16:9</button>
+        <button class="aspect-btn" data-ratio="9:16" data-w="1080" data-h="1920">9:16</button>
+        <button class="aspect-btn" data-ratio="1:1" data-w="1080" data-h="1080">1:1</button>
+        <button class="aspect-btn" data-ratio="4:5" data-w="1080" data-h="1350">4:5</button>
+        <button class="aspect-btn" data-ratio="21:9" data-w="1920" data-h="822">21:9</button>
+      </div>
+      <select id="fpsSelect" class="top-select" title="Project FPS">
+        <option value="24">24 fps</option>
+        <option value="30" selected>30 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+    </div>
+
+    <div class="topbar-right">
+      <button id="btnShortcutsOpen" class="btn-ghost" title="Keyboard Shortcuts (?)">? Keys</button>
+      <button id="btnSaveProj" class="btn-ghost" title="Save Project JSON">Save</button>
+      <button id="btnLoadProj" class="btn-ghost" title="Load Project JSON">Load</button>
+      <input type="file" id="projFileInput" accept=".json,.mcut.json" hidden />
+      <button id="btnExportOpen" class="btn-export">Export MP4</button>
+    </div>
+  </header>
+
+  <!-- MAIN 3-PANE WORKSPACE -->
+  <main class="workspace" id="mainWorkspace">
+    <!-- LEFT SIDEBAR: CapCut Tool Rail + Asset Drawer -->
+    <aside class="left-panel">
+      <nav class="tool-rail" id="toolRail">
+        <button class="rail-btn active" data-tab="media">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><polygon points="10,9 16,12 10,15"/></svg>
+          <span>Media</span>
+        </button>
+        <button class="rail-btn" data-tab="audio">
+          <svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          <span>Audio</span>
+        </button>
+        <button class="rail-btn" data-tab="text">
+          <svg viewBox="0 0 24 24"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+          <span>Text</span>
+        </button>
+        <button class="rail-btn" data-tab="captions">
+          <svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 13h4M13 13h4M7 16h7"/></svg>
+          <span>Captions</span>
+        </button>
+        <button class="rail-btn" data-tab="graphics">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="1.5"/><circle cx="17" cy="7" r="4"/><polygon points="7,14 12,21 2,21"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          <span>Stickers</span>
+        </button>
+        <button class="rail-btn" data-tab="effects">
+          <svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          <span>Effects</span>
+        </button>
+        <button class="rail-btn" data-tab="transitions">
+          <svg viewBox="0 0 24 24"><rect x="2" y="5" width="9" height="14" rx="1"/><rect x="13" y="5" width="9" height="14" rx="1"/><path d="M9 12h6"/></svg>
+          <span>Trans</span>
+        </button>
+        <button class="rail-btn" data-tab="filters">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 8l6-3"/><path d="M12 13l6-3"/></svg>
+          <span>Filters</span>
+        </button>
+        <button class="rail-btn" data-tab="smart">
+          <svg viewBox="0 0 24 24"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          <span>AI Tools</span>
+        </button>
+      </nav>
+
+      <div class="asset-drawer">
+        <!-- MEDIA -->
+        <section class="drawer-pane active" id="pane-media">
+          <div class="drawer-head">
+            <h3>Media Library</h3>
+            <button id="btnUploadTrigger" class="btn-mini">+ Import</button>
+            <input type="file" id="mediaUploadInput" multiple accept="video/*,audio/*,image/*" hidden />
+          </div>
+          <div class="filter-chips" id="mediaFilterChips">
+            <button class="chip active" data-filter="all">All</button>
+            <button class="chip" data-filter="video">Video</button>
+            <button class="chip" data-filter="audio">Audio</button>
+            <button class="chip" data-filter="image">Image</button>
+          </div>
+          <div id="dropZone" class="dropzone">
+            <span>Drop files here or drag clips onto timeline</span>
+            <div class="path-import-row">
+              <input id="localPathInput" type="text" placeholder="~/MotionViz/videos/.../clip.mp4" />
+              <button id="btnImportPath" class="btn-mini">Load</button>
+            </div>
+          </div>
+          <div id="mediaGrid" class="media-grid"></div>
+        </section>
+
+        <!-- AUDIO -->
+        <section class="drawer-pane" id="pane-audio">
+          <div class="drawer-head"><h3>Audio &amp; Studio SFX</h3></div>
+          <div class="drawer-subhead">Project Audio</div>
+          <div id="audioList" class="card-list"></div>
+          <div class="drawer-subhead">Procedural SFX (Click to Add at Playhead)</div>
+          <div id="sfxGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- TEXT -->
+        <section class="drawer-pane" id="pane-text">
+          <div class="drawer-head">
+            <h3>Text Templates</h3>
+            <button id="btnAddDefaultText" class="btn-mini">+ Add Text</button>
+          </div>
+          <p class="drawer-tip">Tip: Double-click any text directly on the player to edit inline.</p>
+          <div id="textPresetGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- CAPTIONS (CC / SRT) -->
+        <section class="drawer-pane" id="pane-captions">
+          <div class="drawer-head">
+            <h3>Captions (CC / SRT)</h3>
+            <button id="btnAddCaptionAtPlayhead" class="btn-mini">+ Line</button>
+          </div>
+          <div class="row-2">
+            <button id="btnImportSrt" class="btn-mini">Import .SRT</button>
+            <button id="btnExportSrt" class="btn-mini">Export .SRT</button>
+            <input type="file" id="srtFileInput" accept=".srt,.txt" hidden />
+          </div>
+          <div class="drawer-subhead">Caption Style Preset</div>
+          <div class="row-2" id="captionStyleRow">
+            <button class="btn-mini active" data-cstyle="hormozi">Hormozi Pop</button>
+            <button class="btn-mini" data-cstyle="clean">Minimal Clean</button>
+            <button class="btn-mini" data-cstyle="pill">CapCut Pill</button>
+          </div>
+          <div id="captionList" class="caption-list"></div>
+        </section>
+
+        <!-- STICKERS / GRAPHICS -->
+        <section class="drawer-pane" id="pane-graphics">
+          <div class="drawer-head"><h3>Overlays &amp; Stickers</h3></div>
+          <div id="graphicsGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- EFFECTS -->
+        <section class="drawer-pane" id="pane-effects">
+          <div class="drawer-head">
+            <h3>Stackable Video VFX</h3>
+            <button id="btnClearEffects" class="btn-micro">Clear</button>
+          </div>
+          <p class="drawer-tip">Click to toggle multiple effects on the selected clip. Tune intensity below.</p>
+          <div id="effectIntensityWrap" class="fx-intensity-box"></div>
+          <div id="effectsGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- TRANSITIONS -->
+        <section class="drawer-pane" id="pane-transitions">
+          <div class="drawer-head"><h3>Transitions</h3></div>
+          <div class="trans-target-row">
+            <button class="seg-btn active" data-trans-side="in">Intro (In)</button>
+            <button class="seg-btn" data-trans-side="out">Outro (Out)</button>
+          </div>
+          <div id="transitionsGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- FILTERS -->
+        <section class="drawer-pane" id="pane-filters">
+          <div class="drawer-head"><h3>Color LUTs &amp; Filters</h3></div>
+          <div id="filtersGrid" class="preset-grid"></div>
+        </section>
+
+        <!-- SMART / AI TOOLS -->
+        <section class="drawer-pane" id="pane-smart">
+          <div class="drawer-head"><h3>Local Smart Tools ($0)</h3></div>
+          <div class="smart-stack">
+            <div class="smart-card">
+              <div class="smart-title">Auto-Crop Letterbox Bars</div>
+              <p>Runs real FFmpeg cropdetect on the selected clip to strip black bars and cleanly fill 16:9 or 9:16.</p>
+              <button id="btnAutoCrop" class="btn-accent full">Auto-Crop Selected Clip</button>
+            </div>
+            <div class="smart-card">
+              <div class="smart-title">Apple Vision Cutout (Remove BG)</div>
+              <p>Isolates the foreground subject at the current playhead using macOS Vision Neural Engine as a transparent PNG overlay.</p>
+              <button id="btnVisionCutout" class="btn-accent full">Cutout Subject at Playhead</button>
+            </div>
+            <div class="smart-card">
+              <div class="smart-title">Auto Beat-Sync Markers</div>
+              <p>Detects audio transients via FFmpeg and drops magnetic snap markers along the timeline ruler.</p>
+              <button id="btnAutoBeats" class="btn-accent full">Detect Audio Beats</button>
+            </div>
+            <div class="smart-card">
+              <div class="smart-title">Canvas Backdrop Fill</div>
+              <p>Fill space behind non-matching aspect clips (CapCut blurred pillars, black, or white).</p>
+              <div class="row-2">
+                <button class="btn-mini bg-mode-btn active" data-bg="black">Black</button>
+                <button class="btn-mini bg-mode-btn" data-bg="blur">CapCut Blur</button>
+                <button class="btn-mini bg-mode-btn" data-bg="white">White</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <!-- CENTER VIEWPORT: Player + Interactive Gizmo + Inline Text Edit + VU Meter -->
+    <section class="player-panel">
+      <div class="player-header">
+        <div class="player-head-left">
+          <span class="player-label">Player</span>
+          <span id="canvasResBadge" class="res-badge">1920 × 1080 · 16:9</span>
+        </div>
+        <div class="player-head-right">
+          <div class="vu-meter" title="Live Stereo Output Level">
+            <div class="vu-bar"><div id="vuL" class="vu-fill"></div></div>
+            <div class="vu-bar"><div id="vuR" class="vu-fill"></div></div>
+          </div>
+          <button id="btnFitPreview" class="btn-micro" title="Toggle Safe Guides & Rule of Thirds">Guides</button>
+          <button id="btnSnapshot" class="btn-micro" title="Save Frame PNG">Snapshot</button>
+        </div>
+      </div>
+
+      <div class="viewport-stage" id="viewportStage">
+        <div class="canvas-shell" id="canvasShell">
+          <canvas id="previewCanvas" width="1920" height="1080"></canvas>
+          <canvas id="overlayCanvas" width="1920" height="1080"></canvas>
+          <textarea id="inlineTextEditor" class="inline-text-editor hidden" spellcheck="false"></textarea>
+        </div>
+      </div>
+
+      <div class="transport-bar">
+        <div class="transport-left">
+          <span id="timecodeDisplay" class="timecode">00:00.00</span>
+          <span class="timecode-sep">/</span>
+          <span id="durationDisplay" class="timecode muted">00:00.00</span>
+        </div>
+        <div class="transport-center">
+          <button id="btnJumpStart" class="icon-btn" title="Start (Home)">⏮</button>
+          <button id="btnStepBack" class="icon-btn" title="Prev Frame (←)">◂</button>
+          <button id="btnPlayPause" class="play-btn" title="Play / Pause (Space)">▶</button>
+          <button id="btnStepFwd" class="icon-btn" title="Next Frame (→)">▸</button>
+          <button id="btnJumpEnd" class="icon-btn" title="End (End)">⏭</button>
+        </div>
+        <div class="transport-right">
+          <button id="btnLoop" class="icon-btn active" title="Loop Playback">↻</button>
+          <button id="btnMasterMute" class="icon-btn" title="Mute Master">🔊</button>
+          <button id="btnFullscreen" class="icon-btn" title="Fullscreen">⛶</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT INSPECTOR -->
+    <aside class="inspector-panel">
+      <div class="inspector-tabs" id="inspectorTabs">
+        <button class="insp-tab active" data-itab="basic">Video</button>
+        <button class="insp-tab" data-itab="mask">Mask</button>
+        <button class="insp-tab" data-itab="audio">Audio</button>
+        <button class="insp-tab" data-itab="speed">Speed</button>
+        <button class="insp-tab" data-itab="color">Adjust</button>
+        <button class="insp-tab" data-itab="text">Text</button>
+      </div>
+      <div id="inspectorBody" class="inspector-body">
+        <div class="empty-inspector">
+          <div class="empty-icon">◆</div>
+          <p>Select a clip on the timeline or click directly on the player to adjust transform, masks, chroma key, keyframes, speed, color, audio, or text.</p>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- DRAGGABLE VERTICAL SPLITTER -->
+  <div id="timelineSplitter" class="splitter" title="Drag to resize timeline"></div>
+
+  <!-- BOTTOM MULTI-TRACK TIMELINE DOCK -->
+  <section class="timeline-dock" id="timelineDock">
+    <div class="timeline-toolbar">
+      <div class="tl-tools-left">
+        <button id="btnToolSelect" class="tl-btn active" title="Select Tool (V)">↖ Select</button>
+        <button id="btnToolRazor" class="tl-btn" title="Razor / Blade Split Tool (B)">✂ Blade</button>
+        <span class="tl-div"></span>
+        <button id="btnUndo" class="tl-btn" title="Undo (Cmd+Z)">↶</button>
+        <button id="btnRedo" class="tl-btn" title="Redo (Cmd+Shift+Z)">↷</button>
+        <span class="tl-div"></span>
+        <button id="btnSplit" class="tl-btn" title="Split at Playhead (S / Cmd+B)">Split</button>
+        <button id="btnDuplicate" class="tl-btn" title="Duplicate (Cmd+D)">Dup</button>
+        <button id="btnFreeze" class="tl-btn" title="Freeze Frame at Playhead">Freeze</button>
+        <button id="btnDetachAudio" class="tl-btn" title="Detach Audio">Detach</button>
+        <button id="btnRippleDelete" class="tl-btn" title="Ripple Delete (Shift+Del)">Ripple Del</button>
+        <button id="btnDelete" class="tl-btn danger" title="Delete (Del)">✕</button>
+        <span class="tl-div"></span>
+        <button id="btnAddMarker" class="tl-btn" title="Add Beat Marker (M)">⚑</button>
+        <button id="btnToggleSnap" class="tl-btn active" title="Magnetic Snap">🧲</button>
+      </div>
+
+      <div class="tl-tools-right">
+        <button id="btnAddTrackV" class="tl-btn">+ Video</button>
+        <button id="btnAddTrackA" class="tl-btn">+ Audio</button>
+        <span class="tl-div"></span>
+        <button id="btnZoomOut" class="tl-btn">−</button>
+        <input id="zoomSlider" type="range" min="20" max="240" value="72" class="zoom-slider" />
+        <button id="btnZoomIn" class="tl-btn">+</button>
+        <button id="btnZoomFit" class="tl-btn">Fit</button>
+      </div>
+    </div>
+
+    <div class="timeline-body">
+      <div class="track-headers" id="trackHeaders">
+        <div class="ruler-corner">TRACKS</div>
+        <div id="trackHeaderList"></div>
+      </div>
+
+      <div class="timeline-scroll" id="timelineScroll">
+        <div class="timeline-canvas-wrap" id="timelineWrap">
+          <div class="ruler" id="timelineRuler">
+            <canvas id="rulerCanvas" height="28"></canvas>
+            <div id="markerLayer" class="marker-layer"></div>
+          </div>
+          <div class="tracks-container" id="tracksContainer"></div>
+          <div id="snapGuide" class="snap-guide hidden"></div>
+          <div class="playhead" id="playhead">
+            <div class="playhead-cap"></div>
+            <div class="playhead-line"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RIGHT-CLICK CONTEXT MENU -->
+  <div id="clipContextMenu" class="ctx-menu hidden">
+    <button data-act="split">✂ Split at Playhead <kbd>S</kbd></button>
+    <button data-act="duplicate">⧉ Duplicate Clip <kbd>⌘D</kbd></button>
+    <button data-act="copyAttrs">📋 Copy Style &amp; Color</button>
+    <button data-act="pasteAttrs">📌 Paste Style &amp; Color</button>
+    <div class="ctx-sep"></div>
+    <button data-act="autoCrop">⊞ Auto-Crop Black Bars</button>
+    <button data-act="freeze">❄ Freeze Frame Here</button>
+    <button data-act="detach">♫ Detach Audio</button>
+    <div class="ctx-sep"></div>
+    <button data-act="rippleDelete">⇥ Ripple Delete <kbd>⇧⌫</kbd></button>
+    <button data-act="delete" class="danger">✕ Delete Clip <kbd>⌫</kbd></button>
+  </div>
+
+  <!-- EXPORT MODAL -->
+  <div id="exportModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Export Studio MP4</h2>
+        <button id="btnExportClose" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <label>File Name</label>
+          <input id="expName" type="text" value="motioncut_export" />
+        </div>
+        <div class="form-grid-2">
+          <div class="form-row">
+            <label>Aspect Ratio</label>
+            <select id="expAspect">
+              <option value="current" selected>Match Canvas</option>
+              <option value="16:9">16:9 Landscape (1920×1080)</option>
+              <option value="9:16">9:16 Vertical (1080×1920)</option>
+              <option value="1:1">1:1 Square (1080×1080)</option>
+              <option value="4:5">4:5 Portrait (1080×1350)</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Resolution</label>
+            <select id="expRes">
+              <option value="1080" selected>1080p Full HD</option>
+              <option value="720">720p Fast</option>
+              <option value="2160">4K Ultra HD</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Frame Rate</label>
+            <select id="expFps">
+              <option value="24">24 fps (Cinema)</option>
+              <option value="30" selected>30 fps (Social)</option>
+              <option value="60">60 fps (Smooth)</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>Quality (H.264 CRF)</label>
+            <select id="expCrf">
+              <option value="14">Studio Master (CRF 14)</option>
+              <option value="17" selected>Recommended (CRF 17)</option>
+              <option value="22">Compact Web (CRF 22)</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>Export Engine</label>
+          <select id="expEngine">
+            <option value="deterministic" selected>Frame-Accurate FFmpeg MP4 (Zero Dropped Frames · All Layers/VFX/Masks/Captions + Multi-Track Audio)</option>
+            <option value="quick">Instant FFmpeg Direct Reframe (Selected Video Clip Only · ~2s)</option>
+          </select>
+        </div>
+
+        <div id="exportProgressWrap" class="export-progress hidden">
+          <div class="prog-bar"><div id="exportProgressBar" class="prog-fill"></div></div>
+          <div id="exportStatusText" class="prog-text">Preparing render...</div>
+        </div>
+        <div id="exportResultBox" class="export-result hidden"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="btnExportCancel" class="btn-ghost">Close</button>
+        <button id="btnExportStart" class="btn-export">Start Export</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- KEYBOARD SHORTCUTS MODAL -->
+  <div id="shortcutsModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Keyboard Shortcuts</h2>
+        <button id="btnShortcutsClose" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body shortcuts-grid">
+        <div class="sc-item"><span>Play / Pause</span><kbd>Space</kbd></div>
+        <div class="sc-item"><span>Select Tool</span><kbd>V</kbd></div>
+        <div class="sc-item"><span>Razor Blade Tool</span><kbd>B</kbd></div>
+        <div class="sc-item"><span>Split at Playhead</span><kbd>S</kbd> / <kbd>⌘B</kbd></div>
+        <div class="sc-item"><span>Step Frame Back / Fwd</span><kbd>←</kbd> / <kbd>→</kbd></div>
+        <div class="sc-item"><span>Undo / Redo</span><kbd>⌘Z</kbd> / <kbd>⌘⇧Z</kbd></div>
+        <div class="sc-item"><span>Duplicate Clip</span><kbd>⌘D</kbd></div>
+        <div class="sc-item"><span>Delete / Ripple Delete</span><kbd>⌫</kbd> / <kbd>⇧⌫</kbd></div>
+        <div class="sc-item"><span>Add Beat Marker</span><kbd>M</kbd></div>
+        <div class="sc-item"><span>Zoom Timeline</span><kbd>-</kbd> / <kbd>=</kbd></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

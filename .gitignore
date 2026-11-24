@@ -1,0 +1,10 @@
+# Runtime & generated artifacts
+uploads/
+thumbs/
+exports/
+projects/
+*.log
+server.log
+.DS_Store
+node_modules/
+tmp/
